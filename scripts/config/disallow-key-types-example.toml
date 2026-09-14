@@ -1,0 +1,34 @@
+# Sample simple-migration.sh config: migrate everything key-types' own default list would
+# (string/hash/set/zset/list/stream/ReJSON-RL), EXCEPT streams and Cuckoo Filter keys - a
+# subtractive filter, instead of key-types' own additive "list exactly these types" approach
+# (see key-filter-example.toml for that instead).
+#
+# Use: ./simple-migration.sh --toml-file disallow-key-types-example.toml
+# (looked up here, in scripts/config/, automatically - see simple-migration.sh --help)
+#
+# Every key below corresponds 1:1 to a simple-migration.sh flag (same name, minus "--"); any
+# flag also passed on the command line overrides the value loaded from this file. Unset
+# keys/sections fall back to simple-migration.sh's own defaults - you don't need to list every
+# key below in your own configs, only the ones you want to set.
+
+[source]
+connection-string = "redis://source-host.example.internal:6379"
+connection-mode = "standalone"
+require-tls = false
+
+[target]
+connection-string = "redis://target-dragonfly.example.internal:6379"
+connection-mode = "standalone"
+require-tls = false
+
+[migration]
+# disallow-key-types accepts the exact same real type strings/aliases as key-types (including
+# "all") and is applied as a final subtraction AFTER key-types' own default/"all" expansion and
+# the --topk-mode/--dfly-to-dfly auto-additions - regardless of how a type ended up
+# in the list, not just what key-types itself named. "cf" here is the same cuckoofilter alias
+# key-types accepts (MBbloomCF); left unset, key-types itself defaults to run-r2dfly.sh's own
+# default list, which disallow-key-types then subtracts these two from.
+disallow-key-types = "stream,cf"
+
+[run]
+defaults = true

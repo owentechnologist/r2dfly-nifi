@@ -1,0 +1,18 @@
+[source]
+connection-string = "rediss://default:zzzzzzz@r9827zzxw.dragonflydb.cloud:6385"
+connection-mode = "standalone"
+
+[target]
+connection-string = "rediss://default:aaaaaaa@626eq8eha.dragonflydb.cloud:6385"
+connection-mode = "cluster"
+
+[migration]
+topk-mode = "exact"
+prefix-deny-list = "domain"
+batch-size-string = 500
+
+[resources]
+cpus = 14
+memory = "26g"
+parallelism = 8
+writer-concurrency = 14

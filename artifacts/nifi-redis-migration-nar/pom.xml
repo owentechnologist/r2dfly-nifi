@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.dragonfly.nifi.redis</groupId>
+    <artifactId>nifi-redis-migration</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>nifi-redis-migration-nar</artifactId>
+  <packaging>nar</packaging>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.dragonfly.nifi.redis</groupId>
+      <artifactId>nifi-redis-migration-processors</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <!-- NAR parent: makes the provided-scope nifi-ssl-context-service-api and
+         nifi-distributed-cache-client-service-api classes (referenced by
+         AbstractRedisConnectionPoolService and RedisScanReader) visible at
+         runtime. Without this, this NAR has no NAR parent at all and those
+         classes are absent from its classloader, which fails their static
+         initializers with NoClassDefFoundError as soon as NiFi touches them. -->
+    <dependency>
+      <groupId>org.apache.nifi</groupId>
+      <artifactId>nifi-standard-services-api-nar</artifactId>
+      <version>${nifi.version}</version>
+      <type>nar</type>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.nifi</groupId>
+        <artifactId>nifi-nar-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

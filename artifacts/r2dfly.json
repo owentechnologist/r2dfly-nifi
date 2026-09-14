@@ -1,0 +1,1025 @@
+{
+  "flowContents": {
+    "identifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+    "instanceIdentifier": "5e53896a-01a0-1000-2749-ed3d10eeecd8",
+    "name": "R2Dfly Migration",
+    "comments": "",
+    "position": {
+      "x": 0.0,
+      "y": 0.0
+    },
+    "processGroups": [],
+    "remoteProcessGroups": [],
+    "processors": [
+      {
+        "identifier": "b8dba330-42ab-3c25-a4fd-0959f879b9de",
+        "instanceIdentifier": "5eed6c1d-01a0-1000-6228-77b3e59c4c18",
+        "name": "ModuleTypeHandler",
+        "comments": "",
+        "position": {
+          "x": 400.0,
+          "y": 300.0
+        },
+        "type": "io.dragonfly.nifi.redis.processors.ModuleTypeHandler",
+        "bundle": {
+          "group": "io.dragonfly.nifi.redis",
+          "artifact": "nifi-redis-migration-nar",
+          "version": "1.0.0-SNAPSHOT"
+        },
+        "properties": {
+          "source-connection-pool": "75de38ab-51b2-3ab6-a5b6-f2d9d92862be",
+          "key-prefix-separator": ":",
+          "target-connection-pool": "d17a8dbb-f7c7-3347-977a-063290bbd4bc",
+          "key-prefix": null
+        },
+        "propertyDescriptors": {
+          "source-connection-pool": {
+            "name": "source-connection-pool",
+            "displayName": "Source Connection Pool",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "key-prefix-separator": {
+            "name": "key-prefix-separator",
+            "displayName": "Key Prefix Separator",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "target-connection-pool": {
+            "name": "target-connection-pool",
+            "displayName": "Target Connection Pool",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "key-prefix": {
+            "name": "key-prefix",
+            "displayName": "Key Prefix",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 0,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [
+          "success",
+          "failure"
+        ],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "40f9a69b-858c-37d2-8a3b-9e2e472aafde",
+        "instanceIdentifier": "29dbf585-d920-33bf-b02b-0373492af3f6",
+        "name": "RedisScanReader",
+        "comments": "",
+        "position": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "type": "io.dragonfly.nifi.redis.processors.RedisScanReader",
+        "bundle": {
+          "group": "io.dragonfly.nifi.redis",
+          "artifact": "nifi-redis-migration-nar",
+          "version": "1.0.0-SNAPSHOT"
+        },
+        "properties": {
+          "database-index-override": null,
+          "emit-ttl": "true",
+          "skip-volatile-keys": "false",
+          "volatile-key-ttl-threshold-ms": "1000",
+          "redis-connection-pool": "75de38ab-51b2-3ab6-a5b6-f2d9d92862be",
+          "key-type-filter": "string,hash,list,set,zset,stream,ReJSON-RL,TopK-TYPE",
+          "key-pattern": "*",
+          "cursor-state-cache": "19b908b8-fc5d-3ded-b595-c558f79a0045",
+          "scan-count": "200",
+          "partition-count": "1",
+          "migration-id": "r2dfly-1788299114"
+        },
+        "propertyDescriptors": {
+          "database-index-override": {
+            "name": "database-index-override",
+            "displayName": "Database Index",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "emit-ttl": {
+            "name": "emit-ttl",
+            "displayName": "Emit TTL",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "skip-volatile-keys": {
+            "name": "skip-volatile-keys",
+            "displayName": "Skip Volatile Keys",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "volatile-key-ttl-threshold-ms": {
+            "name": "volatile-key-ttl-threshold-ms",
+            "displayName": "Volatile Key TTL Threshold (ms)",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "redis-connection-pool": {
+            "name": "redis-connection-pool",
+            "displayName": "Redis Connection Pool",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "key-type-filter": {
+            "name": "key-type-filter",
+            "displayName": "Key Type Filter",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "key-pattern": {
+            "name": "key-pattern",
+            "displayName": "Key Pattern",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "cursor-state-cache": {
+            "name": "cursor-state-cache",
+            "displayName": "Cursor State Cache",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "scan-count": {
+            "name": "scan-count",
+            "displayName": "Scan Count",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "partition-count": {
+            "name": "partition-count",
+            "displayName": "Partition Count",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "migration-id": {
+            "name": "migration-id",
+            "displayName": "Migration ID",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 0,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [
+          "failure"
+        ],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "3d1e8a19-d603-3d5d-bd8a-daf2f4edcc70",
+        "instanceIdentifier": "7a782c41-8c7b-3e63-e3d2-6f387456cdd2",
+        "name": "RedisTypeDeserializer",
+        "comments": "",
+        "position": {
+          "x": 400.0,
+          "y": 0.0
+        },
+        "type": "io.dragonfly.nifi.redis.processors.RedisTypeDeserializer",
+        "bundle": {
+          "group": "io.dragonfly.nifi.redis",
+          "artifact": "nifi-redis-migration-nar",
+          "version": "1.0.0-SNAPSHOT"
+        },
+        "properties": {
+          "include-consumer-groups": "true",
+          "redis-connection-pool": "75de38ab-51b2-3ab6-a5b6-f2d9d92862be",
+          "stream-read-count": "1000",
+          "hash-field-batch-size": "10000",
+          "list-chunk-size": "5000"
+        },
+        "propertyDescriptors": {
+          "include-consumer-groups": {
+            "name": "include-consumer-groups",
+            "displayName": "Include Consumer Groups",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "redis-connection-pool": {
+            "name": "redis-connection-pool",
+            "displayName": "Redis Connection Pool",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "stream-read-count": {
+            "name": "stream-read-count",
+            "displayName": "Stream Read Count",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "hash-field-batch-size": {
+            "name": "hash-field-batch-size",
+            "displayName": "Hash Field Batch Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "list-chunk-size": {
+            "name": "list-chunk-size",
+            "displayName": "List Chunk Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 0,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [
+          "key_missing",
+          "module_type",
+          "failure"
+        ],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "20ee6727-0fe2-3a0b-8c3a-f3525c04f480",
+        "instanceIdentifier": "0fbaec2b-24d2-360a-c727-bcfb2669ae57",
+        "name": "RedisBatchWriter",
+        "comments": "",
+        "position": {
+          "x": 800.0,
+          "y": 0.0
+        },
+        "type": "io.dragonfly.nifi.redis.processors.RedisBatchWriter",
+        "bundle": {
+          "group": "io.dragonfly.nifi.redis",
+          "artifact": "nifi-redis-migration-nar",
+          "version": "1.0.0-SNAPSHOT"
+        },
+        "properties": {
+          "dragonfly-connection-pool": "d17a8dbb-f7c7-3347-977a-063290bbd4bc",
+          "batch-size": "50",
+          "max-pipeline-depth": "2000",
+          "key-prefix-separator": ":",
+          "ttl-strategy": "PRESERVE",
+          "batch-timeout-ms": "30000",
+          "conflict-strategy": "OVERWRITE",
+          "key-prefix": null,
+          "ttl-reset-offset-ms": "0",
+          "write-confirmation": "true"
+        },
+        "propertyDescriptors": {
+          "dragonfly-connection-pool": {
+            "name": "dragonfly-connection-pool",
+            "displayName": "Dragonfly Connection Pool",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "batch-size": {
+            "name": "batch-size",
+            "displayName": "Batch Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "max-pipeline-depth": {
+            "name": "max-pipeline-depth",
+            "displayName": "Max Pipeline Depth",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "key-prefix-separator": {
+            "name": "key-prefix-separator",
+            "displayName": "Key Prefix Separator",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "ttl-strategy": {
+            "name": "ttl-strategy",
+            "displayName": "TTL Strategy",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "batch-timeout-ms": {
+            "name": "batch-timeout-ms",
+            "displayName": "Batch Timeout (ms)",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "conflict-strategy": {
+            "name": "conflict-strategy",
+            "displayName": "Conflict Strategy",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "key-prefix": {
+            "name": "key-prefix",
+            "displayName": "Key Prefix",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "ttl-reset-offset-ms": {
+            "name": "ttl-reset-offset-ms",
+            "displayName": "TTL Reset Offset (ms)",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "write-confirmation": {
+            "name": "write-confirmation",
+            "displayName": "Write Confirmation",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 0,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [
+          "success",
+          "failure",
+          "retry",
+          "skipped"
+        ],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "b39bc8f7-284f-4734-917b-14fb38e263d6",
+        "instanceIdentifier": "0a896592-c31f-463f-9a3c-0f7cdffd8064",
+        "name": "SearchIndexExporter",
+        "comments": "",
+        "position": {
+          "x": 0.0,
+          "y": 600.0
+        },
+        "type": "io.dragonfly.nifi.redis.processors.SearchIndexExporter",
+        "bundle": {
+          "group": "io.dragonfly.nifi.redis",
+          "artifact": "nifi-redis-migration-nar",
+          "version": "1.0.0-SNAPSHOT"
+        },
+        "properties": {
+          "source-connection-pool": "75de38ab-51b2-3ab6-a5b6-f2d9d92862be",
+          "cursor-state-cache": "19b908b8-fc5d-3ded-b595-c558f79a0045",
+          "migration-id": null,
+          "batch-timeout-ms": "30000"
+        },
+        "propertyDescriptors": {
+          "source-connection-pool": {
+            "name": "source-connection-pool",
+            "displayName": "Source Connection Pool",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "cursor-state-cache": {
+            "name": "cursor-state-cache",
+            "displayName": "Cursor State Cache",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "migration-id": {
+            "name": "migration-id",
+            "displayName": "Migration ID",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "batch-timeout-ms": {
+            "name": "batch-timeout-ms",
+            "displayName": "Batch Timeout (ms)",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 0,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "9ae23f88-1e04-4eea-ac07-1df303bed4f0",
+        "instanceIdentifier": "2b0c43f5-8ced-4f19-b091-6de104a14805",
+        "name": "SearchIndexRehydrator",
+        "comments": "",
+        "position": {
+          "x": 400.0,
+          "y": 600.0
+        },
+        "type": "io.dragonfly.nifi.redis.processors.SearchIndexRehydrator",
+        "bundle": {
+          "group": "io.dragonfly.nifi.redis",
+          "artifact": "nifi-redis-migration-nar",
+          "version": "1.0.0-SNAPSHOT"
+        },
+        "properties": {
+          "target-connection-pool": "d17a8dbb-f7c7-3347-977a-063290bbd4bc",
+          "cursor-state-cache": "19b908b8-fc5d-3ded-b595-c558f79a0045",
+          "migration-id": null,
+          "ft-create-timeout-ms": "30000"
+        },
+        "propertyDescriptors": {
+          "target-connection-pool": {
+            "name": "target-connection-pool",
+            "displayName": "Target Connection Pool",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "cursor-state-cache": {
+            "name": "cursor-state-cache",
+            "displayName": "Cursor State Cache",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "migration-id": {
+            "name": "migration-id",
+            "displayName": "Migration ID",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "ft-create-timeout-ms": {
+            "name": "ft-create-timeout-ms",
+            "displayName": "FT.CREATE Timeout (ms)",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 0,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      }
+    ],
+    "inputPorts": [],
+    "outputPorts": [],
+    "connections": [
+      {
+        "identifier": "b380287d-342d-3d22-8e6e-7645040a0ab9",
+        "instanceIdentifier": "5eed6eb7-01a0-1000-27c5-80baeaf101db",
+        "source": {
+          "id": "40f9a69b-858c-37d2-8a3b-9e2e472aafde",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisScanReader",
+          "comments": "",
+          "instanceIdentifier": "29dbf585-d920-33bf-b02b-0373492af3f6"
+        },
+        "destination": {
+          "id": "b8dba330-42ab-3c25-a4fd-0959f879b9de",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "ModuleTypeHandler",
+          "comments": "",
+          "instanceIdentifier": "5eed6c1d-01a0-1000-6228-77b3e59c4c18"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "unknown"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "5ecee5b8-56be-3304-a3fd-fbe8b0416080",
+        "instanceIdentifier": "4a51ee26-1a9c-38cd-f118-e638d50e82db",
+        "source": {
+          "id": "40f9a69b-858c-37d2-8a3b-9e2e472aafde",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisScanReader",
+          "comments": "",
+          "instanceIdentifier": "29dbf585-d920-33bf-b02b-0373492af3f6"
+        },
+        "destination": {
+          "id": "3d1e8a19-d603-3d5d-bd8a-daf2f4edcc70",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisTypeDeserializer",
+          "comments": "",
+          "instanceIdentifier": "7a782c41-8c7b-3e63-e3d2-6f387456cdd2"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "zset",
+          "set",
+          "string",
+          "stream",
+          "list",
+          "hash"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "e2805b50-96a1-3e13-b9f6-a033b6368bc2",
+        "instanceIdentifier": "623bd958-4644-31ab-b974-01f8d1367bc1",
+        "source": {
+          "id": "3d1e8a19-d603-3d5d-bd8a-daf2f4edcc70",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisTypeDeserializer",
+          "comments": "",
+          "instanceIdentifier": "7a782c41-8c7b-3e63-e3d2-6f387456cdd2"
+        },
+        "destination": {
+          "id": "20ee6727-0fe2-3a0b-8c3a-f3525c04f480",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisBatchWriter",
+          "comments": "",
+          "instanceIdentifier": "0fbaec2b-24d2-360a-c727-bcfb2669ae57"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "success"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      }
+    ],
+    "labels": [],
+    "funnels": [],
+    "controllerServices": [
+      {
+        "identifier": "d17a8dbb-f7c7-3347-977a-063290bbd4bc",
+        "instanceIdentifier": "0cd481c2-7846-3e1f-bc59-642bbac5026c",
+        "name": "Target Dragonfly Pool",
+        "comments": "",
+        "type": "io.dragonfly.nifi.redis.services.StandardDragonflyConnectionPoolService",
+        "bundle": {
+          "group": "io.dragonfly.nifi.redis",
+          "artifact": "nifi-redis-migration-nar",
+          "version": "1.0.0-SNAPSHOT"
+        },
+        "properties": {
+          "max-pool-size": "8",
+          "command-timeout-ms": "10000",
+          "ssl-context-service": null,
+          "require-tls": "false",
+          "connection-mode": "STANDALONE",
+          "database-index": "0",
+          "connection-timeout-ms": "5000"
+        },
+        "propertyDescriptors": {
+          "max-pool-size": {
+            "name": "max-pool-size",
+            "displayName": "Max Pool Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "command-timeout-ms": {
+            "name": "command-timeout-ms",
+            "displayName": "Command Timeout (ms)",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "connection-string": {
+            "name": "connection-string",
+            "displayName": "Connection String",
+            "identifiesControllerService": false,
+            "sensitive": true,
+            "dynamic": false
+          },
+          "ssl-context-service": {
+            "name": "ssl-context-service",
+            "displayName": "SSL Context Service",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "require-tls": {
+            "name": "require-tls",
+            "displayName": "Require TLS",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "connection-mode": {
+            "name": "connection-mode",
+            "displayName": "Connection Mode",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "database-index": {
+            "name": "database-index",
+            "displayName": "Database Index",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "connection-timeout-ms": {
+            "name": "connection-timeout-ms",
+            "displayName": "Connection Timeout (ms)",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "controllerServiceApis": [
+          {
+            "type": "io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService",
+            "bundle": {
+              "group": "io.dragonfly.nifi.redis",
+              "artifact": "nifi-redis-migration-nar",
+              "version": "1.0.0-SNAPSHOT"
+            }
+          },
+          {
+            "type": "io.dragonfly.nifi.redis.services.RedisConnectionPoolService",
+            "bundle": {
+              "group": "io.dragonfly.nifi.redis",
+              "artifact": "nifi-redis-migration-nar",
+              "version": "1.0.0-SNAPSHOT"
+            }
+          }
+        ],
+        "scheduledState": "DISABLED",
+        "bulletinLevel": "WARN",
+        "componentType": "CONTROLLER_SERVICE",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "f7db0bc7-94f5-3067-89b0-f9f6974a8e67",
+        "instanceIdentifier": "43df184b-5fd2-3350-f473-f8f4bb2fd652",
+        "name": "Cursor State Cache Server",
+        "comments": "",
+        "type": "org.apache.nifi.distributed.cache.server.map.MapCacheServer",
+        "bundle": {
+          "group": "org.apache.nifi",
+          "artifact": "nifi-distributed-cache-services-nar",
+          "version": "2.11.0"
+        },
+        "properties": {
+          "Eviction Strategy": "Least Frequently Used",
+          "SSL Context Service": null,
+          "Persistence Directory": null,
+          "Port": "4557",
+          "Maximum Cache Entries": "10000",
+          "Maximum Read Size": "1 MB"
+        },
+        "propertyDescriptors": {
+          "Eviction Strategy": {
+            "name": "Eviction Strategy",
+            "displayName": "Eviction Strategy",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "SSL Context Service": {
+            "name": "SSL Context Service",
+            "displayName": "SSL Context Service",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Persistence Directory": {
+            "name": "Persistence Directory",
+            "displayName": "Persistence Directory",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Port": {
+            "name": "Port",
+            "displayName": "Port",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false,
+            "listenPortDefinition": {
+              "transportProtocol": "TCP",
+              "applicationProtocols": [
+                "nifi.apache.org/cache"
+              ]
+            }
+          },
+          "Maximum Cache Entries": {
+            "name": "Maximum Cache Entries",
+            "displayName": "Maximum Cache Entries",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Maximum Read Size": {
+            "name": "Maximum Read Size",
+            "displayName": "Maximum Read Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "controllerServiceApis": [],
+        "scheduledState": "DISABLED",
+        "bulletinLevel": "WARN",
+        "componentType": "CONTROLLER_SERVICE",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "19b908b8-fc5d-3ded-b595-c558f79a0045",
+        "instanceIdentifier": "4497fa37-9c29-3df4-cac0-d1c73148b05c",
+        "name": "Cursor State Cache",
+        "comments": "",
+        "type": "org.apache.nifi.distributed.cache.client.MapCacheClientService",
+        "bundle": {
+          "group": "org.apache.nifi",
+          "artifact": "nifi-distributed-cache-services-nar",
+          "version": "2.11.0"
+        },
+        "properties": {
+          "SSL Context Service": null,
+          "Server Port": "4557",
+          "Server Hostname": "localhost",
+          "Communications Timeout": "30 secs"
+        },
+        "propertyDescriptors": {
+          "SSL Context Service": {
+            "name": "SSL Context Service",
+            "displayName": "SSL Context Service",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Server Port": {
+            "name": "Server Port",
+            "displayName": "Server Port",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Server Hostname": {
+            "name": "Server Hostname",
+            "displayName": "Server Hostname",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "Communications Timeout": {
+            "name": "Communications Timeout",
+            "displayName": "Communications Timeout",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "controllerServiceApis": [
+          {
+            "type": "org.apache.nifi.distributed.cache.client.AtomicDistributedMapCacheClient",
+            "bundle": {
+              "group": "org.apache.nifi",
+              "artifact": "nifi-standard-services-api-nar",
+              "version": "2.11.0"
+            }
+          },
+          {
+            "type": "org.apache.nifi.distributed.cache.client.DistributedMapCacheClient",
+            "bundle": {
+              "group": "org.apache.nifi",
+              "artifact": "nifi-standard-services-api-nar",
+              "version": "2.11.0"
+            }
+          }
+        ],
+        "scheduledState": "DISABLED",
+        "bulletinLevel": "WARN",
+        "componentType": "CONTROLLER_SERVICE",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "75de38ab-51b2-3ab6-a5b6-f2d9d92862be",
+        "instanceIdentifier": "5f5cec99-307b-3d00-0d76-1065f7e3ff2a",
+        "name": "Source Redis Pool",
+        "comments": "",
+        "type": "io.dragonfly.nifi.redis.services.StandardRedisConnectionPoolService",
+        "bundle": {
+          "group": "io.dragonfly.nifi.redis",
+          "artifact": "nifi-redis-migration-nar",
+          "version": "1.0.0-SNAPSHOT"
+        },
+        "properties": {
+          "max-pool-size": "8",
+          "command-timeout-ms": "10000",
+          "ssl-context-service": null,
+          "require-tls": "false",
+          "connection-mode": "STANDALONE",
+          "database-index": "0",
+          "connection-timeout-ms": "5000"
+        },
+        "propertyDescriptors": {
+          "max-pool-size": {
+            "name": "max-pool-size",
+            "displayName": "Max Pool Size",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "command-timeout-ms": {
+            "name": "command-timeout-ms",
+            "displayName": "Command Timeout (ms)",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "connection-string": {
+            "name": "connection-string",
+            "displayName": "Connection String",
+            "identifiesControllerService": false,
+            "sensitive": true,
+            "dynamic": false
+          },
+          "ssl-context-service": {
+            "name": "ssl-context-service",
+            "displayName": "SSL Context Service",
+            "identifiesControllerService": true,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "require-tls": {
+            "name": "require-tls",
+            "displayName": "Require TLS",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "connection-mode": {
+            "name": "connection-mode",
+            "displayName": "Connection Mode",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "database-index": {
+            "name": "database-index",
+            "displayName": "Database Index",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "connection-timeout-ms": {
+            "name": "connection-timeout-ms",
+            "displayName": "Connection Timeout (ms)",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "controllerServiceApis": [
+          {
+            "type": "io.dragonfly.nifi.redis.services.RedisConnectionPoolService",
+            "bundle": {
+              "group": "io.dragonfly.nifi.redis",
+              "artifact": "nifi-redis-migration-nar",
+              "version": "1.0.0-SNAPSHOT"
+            }
+          }
+        ],
+        "scheduledState": "DISABLED",
+        "bulletinLevel": "WARN",
+        "componentType": "CONTROLLER_SERVICE",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      }
+    ],
+    "defaultFlowFileExpiration": "0 sec",
+    "defaultBackPressureObjectThreshold": 10000,
+    "defaultBackPressureDataSizeThreshold": "1 GB",
+    "scheduledState": "ENABLED",
+    "executionEngine": "INHERITED",
+    "maxConcurrentTasks": 1,
+    "statelessFlowTimeout": "1 min",
+    "flowFileConcurrency": "UNBOUNDED",
+    "flowFileOutboundPolicy": "STREAM_WHEN_AVAILABLE",
+    "componentType": "PROCESS_GROUP"
+  },
+  "externalControllerServices": {},
+  "parameterContexts": {},
+  "flowEncodingVersion": "1.0",
+  "parameterProviders": {},
+  "latest": false
+}

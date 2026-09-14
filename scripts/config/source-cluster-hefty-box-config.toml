@@ -1,0 +1,42 @@
+# Sample simple-migration.sh config: a real Redis Cluster source, migrated onto a single
+# beefy NiFi host with parallelism/resources turned up to actually use it.
+#
+# Use: ./simple-migration.sh --toml-file source-cluster-hefty-box-config.toml
+# (looked up here, in scripts/config/, automatically - see simple-migration.sh --help)
+#
+# Every key below corresponds 1:1 to a simple-migration.sh flag (same name, minus "--"); any
+# flag also passed on the command line overrides the value loaded from this file. Unset
+# keys/sections fall back to simple-migration.sh's own defaults - you don't need to list every
+# key below in your own configs, only the ones you want to set.
+
+[source]
+# cluster mode - source-connection-string becomes a comma-separated seed-node list rather than
+# a single host:port. simple-migration.sh runs a pre-flight topology health check (full
+# 16384-slot coverage, no failed/mid-migration nodes) before configuring or starting anything.
+connection-string = "redis://node1.example.internal:6379,redis://node2.example.internal:6379,redis://node3.example.internal:6379"
+connection-mode = "cluster"
+require-tls = false
+
+[target]
+connection-string = "redis://target-dragonfly.example.internal:6379"
+connection-mode = "standalone"
+require-tls = false
+
+[nifi]
+container = "nifi-redis-migration"
+# user/password intentionally left unset - either pass --nifi-user/--nifi-password on the
+# command line, or let simple-migration.sh read the auto-generated credentials from the
+# container's own logs on first run.
+
+[resources]
+# "hefty box" - a source cluster means more concurrent scan overhead per RedisScanReader task
+# (each task scans the whole keyspace and filters to its own hash-slot partition), so a bigger
+# host and higher parallelism pays off more here than on a small single-node migration.
+cpus = 8
+memory = "16g"
+parallelism = 4
+writer-concurrency = 4
+
+[run]
+# skips the interactive resource/parallelism prompt (STAGE 2) - both already set above.
+defaults = true

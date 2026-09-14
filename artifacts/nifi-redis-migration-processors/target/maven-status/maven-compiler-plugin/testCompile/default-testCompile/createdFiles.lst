@@ -1,0 +1,10 @@
+io/dragonfly/nifi/redis/util/RetryPolicyTest.class
+io/dragonfly/nifi/redis/it/ScanPhaseIT.class
+io/dragonfly/nifi/redis/processors/RedisKeyspaceEventConsumerTest.class
+io/dragonfly/nifi/redis/services/StandardRedisConnectionPoolServiceTest.class
+io/dragonfly/nifi/redis/util/FakeDistributedMapCacheClient.class
+io/dragonfly/nifi/redis/util/ChunkReassemblerTest.class
+io/dragonfly/nifi/redis/processors/RedisScanReaderTest.class
+io/dragonfly/nifi/redis/util/PartitionAssignerTest.class
+io/dragonfly/nifi/redis/util/RedisTypeSerializerTest.class
+io/dragonfly/nifi/redis/it/RedisConnectionPoolServiceIT.class

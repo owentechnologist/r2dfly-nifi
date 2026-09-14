@@ -1,0 +1,10 @@
+/workspace/nifi-redis-migration-processors/src/test/java/io/dragonfly/nifi/redis/it/RedisConnectionPoolServiceIT.java
+/workspace/nifi-redis-migration-processors/src/test/java/io/dragonfly/nifi/redis/it/ScanPhaseIT.java
+/workspace/nifi-redis-migration-processors/src/test/java/io/dragonfly/nifi/redis/processors/RedisKeyspaceEventConsumerTest.java
+/workspace/nifi-redis-migration-processors/src/test/java/io/dragonfly/nifi/redis/processors/RedisScanReaderTest.java
+/workspace/nifi-redis-migration-processors/src/test/java/io/dragonfly/nifi/redis/services/StandardRedisConnectionPoolServiceTest.java
+/workspace/nifi-redis-migration-processors/src/test/java/io/dragonfly/nifi/redis/util/ChunkReassemblerTest.java
+/workspace/nifi-redis-migration-processors/src/test/java/io/dragonfly/nifi/redis/util/FakeDistributedMapCacheClient.java
+/workspace/nifi-redis-migration-processors/src/test/java/io/dragonfly/nifi/redis/util/PartitionAssignerTest.java
+/workspace/nifi-redis-migration-processors/src/test/java/io/dragonfly/nifi/redis/util/RedisTypeSerializerTest.java
+/workspace/nifi-redis-migration-processors/src/test/java/io/dragonfly/nifi/redis/util/RetryPolicyTest.java

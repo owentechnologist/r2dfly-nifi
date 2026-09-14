@@ -1,0 +1,30 @@
+# Sample simple-migration.sh config: migrate only hash/json/string keys, and only those under
+# the accounting:shelter:123, pet:detail, and geo prefixes - everything else in the keyspace is
+# left on the source untouched.
+#
+# Use: ./simple-migration.sh --toml-file key-filter-example.toml
+# (looked up here, in scripts/config/, automatically - see simple-migration.sh --help)
+#
+# Every key below corresponds 1:1 to a simple-migration.sh flag (same name, minus "--"); any
+# flag also passed on the command line overrides the value loaded from this file. Unset
+# keys/sections fall back to simple-migration.sh's own defaults - you don't need to list every
+# key below in your own configs, only the ones you want to set.
+
+[source]
+connection-string = "redis://source-host.example.internal:6379"
+connection-mode = "standalone"
+require-tls = false
+
+[target]
+connection-string = "redis://target-dragonfly.example.internal:6379"
+connection-mode = "standalone"
+require-tls = false
+
+[migration]
+# "json" is the case-insensitive alias run-r2dfly.sh accepts for Redis's actual ReJSON-RL type.
+key-types = "hash,json,string"
+# Only keys starting with one of these prefixes are migrated; everything else is skipped.
+prefix-only-list = "accounting:shelter:123,pet:detail,geo"
+
+[run]
+defaults = true

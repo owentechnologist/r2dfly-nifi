@@ -1,0 +1,31 @@
+# Sample simple-migration.sh config: shrink batch sizes for a couple of expensive types
+# (zset keys with huge sorted sets, and TopK keys under --topk-mode exact, the default, each
+# needing more per-key work than a plain string/hash write) while leaving everything else at
+# the tool's own default (50).
+#
+# Use: ./simple-migration.sh --toml-file per-type-batch-size-example.toml
+# (looked up here, in scripts/config/, automatically - see simple-migration.sh --help)
+#
+# Every key below corresponds 1:1 to a simple-migration.sh flag (same name, minus "--"); any
+# flag also passed on the command line overrides the value loaded from this file. Unset
+# keys/sections fall back to simple-migration.sh's own defaults - you don't need to list every
+# key below in your own configs, only the ones you want to set.
+
+[source]
+connection-string = "redis://source-host.example.internal:6379"
+connection-mode = "standalone"
+require-tls = false
+
+[target]
+connection-string = "redis://target-dragonfly.example.internal:6379"
+connection-mode = "standalone"
+require-tls = false
+
+[migration]
+# batch-size (RedisBatchWriter, string/hash/list/set/zset/stream) and module-batch-size
+# (ModuleTypeHandler, json/topk/bloom-cms under --dfly-to-dfly) are each the DEFAULT for any
+# type/category without its own override right below - not a combined cap across the ones that
+# do have one. Leaving both unset here keeps the tool's own default (50) for string/hash/list/
+# set/stream and json.
+batch-size-zset = 10
+batch-size-topk = 5
