@@ -763,5 +763,5 @@ The provenance record for each FlowFile will show: which `RedisScanReader` task 
 | zset | listpack, skiplist | `ZADD key s1 m1 s2 m2 ...` |  |
 | stream | stream | `XADD key id f v; XGROUP CREATE ...` | PEL reconstruction required |
 | ReJSON-RL | (module) | `JSON.SET key . <json>` | Via ModuleTypeHandler |
-| TopK | (module) | `TOPK.RESERVE; TOPK.ADD` | Approximate reconstruction only |
+| TopK | (module) | `TOPK.RESERVE; TOPK.ADD` | Default: Approximate reconstruction only, Exact Mode Available  |
 
