@@ -8,6 +8,7 @@ A migration tool from Redis/Valkey to Dragonfly leveraging Apache NiFi
 * Support search index migration
 * Support Clustered sources and targets
 * Allow filtering on keytype and prefix
+* Handle large keys
 * Require only normal client read/write access to source and target
 
 [QuickStart](./docs/quickstart.md)
