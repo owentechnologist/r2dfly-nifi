@@ -12,6 +12,12 @@ public interface RedisPubSubHandle extends AutoCloseable {
     /** Subscribes to {@code pattern}; {@code onMessage} is invoked with (channel, message) for each event. */
     void psubscribe(String pattern, BiConsumer<byte[], byte[]> onMessage);
 
+    /**
+     * Registers callbacks for connection loss and recovery. Both fire on the connection's own
+     * IO thread, not a NiFi processing thread.
+     */
+    void onConnectionStateChange(Runnable onDisconnected, Runnable onReconnected);
+
     @Override
     void close();
 }

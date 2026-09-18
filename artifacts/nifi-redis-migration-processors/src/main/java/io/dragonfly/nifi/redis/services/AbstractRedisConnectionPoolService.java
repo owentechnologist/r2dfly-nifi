@@ -294,6 +294,11 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
             }
 
             @Override
+            public void onConnectionStateChange(Runnable onDisconnected, Runnable onReconnected) {
+                addConnectionStateListener(connection, onDisconnected, onReconnected);
+            }
+
+            @Override
             public void close() {
                 connection.close();
             }
@@ -317,10 +322,36 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
             }
 
             @Override
+            public void onConnectionStateChange(Runnable onDisconnected, Runnable onReconnected) {
+                addConnectionStateListener(connection, onDisconnected, onReconnected);
+            }
+
+            @Override
             public void close() {
                 connection.close();
             }
         };
+    }
+
+    private static void addConnectionStateListener(StatefulConnection<byte[], byte[]> connection, Runnable onDisconnected, Runnable onReconnected) {
+        connection.addListener(new io.lettuce.core.RedisConnectionStateListener() {
+            @Override
+            public void onRedisDisconnected(io.lettuce.core.RedisChannelHandler<?, ?> handler) {
+                onDisconnected.run();
+            }
+
+            // Lettuce may invoke either onRedisConnected overload on reconnect; both are wired
+            // because the handler is idempotent under a double call.
+            @Override
+            public void onRedisConnected(io.lettuce.core.RedisChannelHandler<?, ?> handler) {
+                onReconnected.run();
+            }
+
+            @Override
+            public void onRedisConnected(io.lettuce.core.RedisChannelHandler<?, ?> handler, java.net.SocketAddress socketAddress) {
+                onReconnected.run();
+            }
+        });
     }
 
     private static <T extends StatefulConnection<byte[], byte[]>> T borrow(GenericObjectPool<T> pool) {

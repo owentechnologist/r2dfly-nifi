@@ -16,6 +16,7 @@ import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -23,6 +24,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -65,8 +67,12 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
     public static final PropertyDescriptor RECONNECT_BACKOFF_MS = new PropertyDescriptor.Builder()
             .name("reconnect-backoff-ms")
             .displayName("Reconnect Backoff (ms)")
-            .description("Lettuce auto-reconnects the underlying connection on its own; this value only "
-                    + "throttles how often disconnect warnings are logged/bulletined.")
+            .description("Lettuce auto-reconnects the underlying connection and re-issues its "
+                    + "subscriptions on its own; this value only throttles how often the "
+                    + "\"connection lost\" and \"connection restored\" warnings are logged/bulletined, "
+                    + "so a flapping connection cannot flood the bulletin board. Each of the two "
+                    + "warnings is throttled against repeats of itself. Disconnects and total "
+                    + "downtime are always counted, whether or not the warning is logged.")
             .required(true)
             .addValidator(StandardValidators.POSITIVE_INTEGER_VALIDATOR)
             .defaultValue("1000")
@@ -91,6 +97,21 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
     private RedisPubSubHandle pubSubHandle;
     private Set<String> eventTypeFilter;
 
+    // Written from Lettuce's IO thread and read/drained from the onTrigger thread.
+    private final AtomicLong droppedEvents = new AtomicLong();
+    private final AtomicLong disconnectCount = new AtomicLong();
+    private final AtomicLong downtimeMs = new AtomicLong();
+    /** Epoch millis the current outage started, or 0 when connected. */
+    private final AtomicLong disconnectedSinceMs = new AtomicLong();
+    // Separate throttle timestamps: one shared timestamp would suppress the "restored" warning -
+    // the one carrying the outage duration - whenever recovery is faster than the backoff, which
+    // is the common case. Two fields throttle each warning against repeats of itself only.
+    private final AtomicLong lastDisconnectLogAtMs = new AtomicLong();
+    private final AtomicLong lastReconnectLogAtMs = new AtomicLong();
+    private final AtomicLong lastEventAtMs = new AtomicLong();
+
+    private volatile int reconnectBackoffMs;
+
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
         return PROPERTY_DESCRIPTORS;
@@ -103,6 +124,14 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
 
     @OnScheduled
     public void onScheduled(ProcessContext context) {
+        droppedEvents.set(0L);
+        disconnectCount.set(0L);
+        downtimeMs.set(0L);
+        disconnectedSinceMs.set(0L);
+        lastDisconnectLogAtMs.set(0L);
+        lastReconnectLogAtMs.set(0L);
+        lastEventAtMs.set(0L);
+
         RedisConnectionPoolService redisPool = context.getProperty(REDIS_CONNECTION_POOL).asControllerService(RedisConnectionPoolService.class);
         Map<String, String> config = redisPool.withConnection(cmds -> {
             try {
@@ -120,19 +149,56 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
         }
 
         int maxQueueDepth = context.getProperty(MAX_QUEUE_DEPTH).asInteger();
+        reconnectBackoffMs = context.getProperty(RECONNECT_BACKOFF_MS).asInteger();
         eventQueue = new LinkedBlockingQueue<>(maxQueueDepth);
         eventTypeFilter = context.getProperty(EVENT_TYPES).isSet()
                 ? Arrays.stream(context.getProperty(EVENT_TYPES).getValue().split(",")).map(String::trim).map(String::toLowerCase).filter(s -> !s.isEmpty()).collect(Collectors.toSet())
                 : Set.of();
 
         pubSubHandle = redisPool.openPubSub();
+        pubSubHandle.onConnectionStateChange(this::recordDisconnect, this::recordReconnect);
         pubSubHandle.psubscribe(context.getProperty(KEYSPACE_PATTERN).getValue(), (channel, message) -> {
+            lastEventAtMs.set(System.currentTimeMillis());
             boolean accepted = eventQueue.offer(new RawEvent(
                     new String(channel, StandardCharsets.UTF_8), new String(message, StandardCharsets.UTF_8), System.currentTimeMillis()));
             if (!accepted) {
-                getLogger().warn("Keyspace event queue is full (max {}); dropping event", maxQueueDepth);
+                droppedEvents.incrementAndGet();
             }
         });
+    }
+
+    private void recordDisconnect() {
+        long now = System.currentTimeMillis();
+        if (!disconnectedSinceMs.compareAndSet(0L, now)) {
+            return;
+        }
+        disconnectCount.incrementAndGet();
+        if (shouldLog(lastDisconnectLogAtMs, now)) {
+            long lastEvent = lastEventAtMs.get();
+            getLogger().warn("Keyspace pub/sub connection lost; last event received at {}",
+                    lastEvent == 0L ? "never" : Instant.ofEpochMilli(lastEvent));
+        }
+    }
+
+    private void recordReconnect() {
+        long now = System.currentTimeMillis();
+        long since = disconnectedSinceMs.getAndSet(0L);
+        // Lettuce fires both onRedisConnected overloads on one reconnect; the second finds 0 here.
+        if (since == 0L) {
+            return;
+        }
+        downtimeMs.addAndGet(now - since);
+        if (shouldLog(lastReconnectLogAtMs, now)) {
+            getLogger().warn("Keyspace pub/sub connection restored after {} ms", now - since);
+        }
+    }
+
+    private boolean shouldLog(AtomicLong lastLoggedAt, long now) {
+        if (now - lastLoggedAt.get() < reconnectBackoffMs) {
+            return false;
+        }
+        lastLoggedAt.set(now);
+        return true;
     }
 
     @OnStopped
@@ -147,6 +213,10 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
 
     @Override
     public void onTrigger(ProcessContext context, ProcessSession session) throws ProcessException {
+        reportCounter(session, "Keyspace Events Dropped (Queue Full)", droppedEvents);
+        reportCounter(session, "Keyspace Pub/Sub Disconnects", disconnectCount);
+        reportCounter(session, "Keyspace Pub/Sub Downtime (ms)", downtimeMs);
+
         if (eventQueue == null) {
             context.yield();
             return;
@@ -177,6 +247,14 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
         FlowFile flowFile = session.create();
         flowFile = session.putAllAttributes(flowFile, attrs);
         session.transfer(flowFile, relationshipFor(parsed.eventType));
+    }
+
+    /** getAndSet so the drain is atomic against concurrent IO-thread increments and nothing is reported twice. */
+    private void reportCounter(ProcessSession session, String name, AtomicLong counter) {
+        long value = counter.getAndSet(0L);
+        if (value != 0L) {
+            session.adjustCounter(name, value, true);
+        }
     }
 
     private Relationship relationshipFor(String eventType) {
