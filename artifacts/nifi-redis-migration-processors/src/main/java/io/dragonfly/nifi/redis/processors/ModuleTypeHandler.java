@@ -340,7 +340,12 @@ public class ModuleTypeHandler extends AbstractProcessor {
 
         Map<Item, CompletableFuture<String>> reserveFutures = targetPool.withRawConnection(conn -> {
             Map<Item, CompletableFuture<String>> futures = new LinkedHashMap<>();
+            // TOPK.RESERVE errors on an already-existing key, so a per-item DEL must land on the
+            // wire first - dispatched inside the same loop iteration so Lettuce's call-order wire
+            // ordering keeps DEL ahead of RESERVE for that key.
+            List<CompletableFuture<?>> delFutures = new ArrayList<>();
             for (Item item : toWrite) {
+                delFutures.add(RawModuleCommands.del(conn, item.targetKey));
                 Map<String, String> info = infoByItem.get(item);
                 long k = Long.parseLong(info.getOrDefault("k", "50"));
                 long width = Long.parseLong(info.getOrDefault("width", "8"));
@@ -348,7 +353,9 @@ public class ModuleTypeHandler extends AbstractProcessor {
                 double decay = Double.parseDouble(info.getOrDefault("decay", "0.9"));
                 futures.put(item, RawModuleCommands.topkReserve(conn, item.targetKey, k, width, depth, decay));
             }
-            awaitAll(futures.values(), batchTimeoutMs);
+            List<CompletableFuture<?>> allDispatched = new ArrayList<>(delFutures);
+            allDispatched.addAll(futures.values());
+            awaitAll(allDispatched, batchTimeoutMs);
             return futures;
         });
 

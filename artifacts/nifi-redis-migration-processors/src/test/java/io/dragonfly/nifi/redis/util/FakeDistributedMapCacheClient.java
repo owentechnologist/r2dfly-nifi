@@ -20,6 +20,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class FakeDistributedMapCacheClient implements DistributedMapCacheClient {
 
     private final Map<String, byte[]> store = new ConcurrentHashMap<>();
+    private String identifier = "fake-cache";
 
     @Override
     public synchronized <K, V> boolean putIfAbsent(K key, V value, Serializer<K> keySerializer, Serializer<V> valueSerializer) throws IOException {
@@ -73,6 +74,7 @@ public class FakeDistributedMapCacheClient implements DistributedMapCacheClient 
 
     @Override
     public void initialize(ControllerServiceInitializationContext context) throws InitializationException {
+        identifier = context.getIdentifier();
     }
 
     @Override
@@ -96,6 +98,6 @@ public class FakeDistributedMapCacheClient implements DistributedMapCacheClient 
 
     @Override
     public String getIdentifier() {
-        return "fake-cache";
+        return identifier;
     }
 }

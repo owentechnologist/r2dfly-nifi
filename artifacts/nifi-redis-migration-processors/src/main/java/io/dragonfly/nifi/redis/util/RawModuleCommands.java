@@ -4,12 +4,14 @@ import io.lettuce.core.api.StatefulConnection;
 import io.lettuce.core.codec.ByteArrayCodec;
 import io.lettuce.core.output.ArrayOutput;
 import io.lettuce.core.output.CommandOutput;
+import io.lettuce.core.output.IntegerOutput;
 import io.lettuce.core.output.NestedMultiOutput;
 import io.lettuce.core.output.StatusOutput;
 import io.lettuce.core.output.ValueListOutput;
 import io.lettuce.core.protocol.AsyncCommand;
 import io.lettuce.core.protocol.Command;
 import io.lettuce.core.protocol.CommandArgs;
+import io.lettuce.core.protocol.CommandType;
 import io.lettuce.core.protocol.ProtocolKeyword;
 
 import java.nio.charset.StandardCharsets;
@@ -85,6 +87,11 @@ public final class RawModuleCommands {
                     }
                     return result;
                 });
+    }
+
+    public static CompletableFuture<Long> del(StatefulConnection<byte[], byte[]> conn, byte[] key) {
+        CommandArgs<byte[], byte[]> args = new CommandArgs<>(ByteArrayCodec.INSTANCE).addKey(key);
+        return dispatch(conn, CommandType.DEL, new IntegerOutput<>(ByteArrayCodec.INSTANCE), args);
     }
 
     public static CompletableFuture<String> topkReserve(StatefulConnection<byte[], byte[]> conn, byte[] key, long k, long width, long depth, double decay) {

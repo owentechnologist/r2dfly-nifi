@@ -141,6 +141,7 @@ public final class CommandBuilder {
     private static CompletableFuture<Void> writeHash(
             RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, KeyRecord record, Long ttlMs, int writeChunkSize) {
         List<CompletableFuture<?>> futures = new ArrayList<>();
+        futures.add(toCf(target.del(key)));
         Map<byte[], byte[]> chunk = new LinkedHashMap<>();
         for (Map.Entry<String, Object> entry : asMap(record.value).entrySet()) {
             chunk.put(entry.getKey().getBytes(StandardCharsets.UTF_8), String.valueOf(entry.getValue()).getBytes(StandardCharsets.UTF_8));

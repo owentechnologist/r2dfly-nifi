@@ -111,6 +111,28 @@ class ScanPhaseIT {
     }
 
     @Test
+    void rewritesHashExactlyOnRerunAfterASourceFieldIsRemoved() throws Exception {
+        Map<String, String> fields = new LinkedHashMap<>();
+        for (int i = 0; i < 25; i++) {
+            fields.put("field" + i, "value" + i);
+        }
+        seedRedis(cmds -> cmds.hset("it:bighash-rewrite", fields));
+
+        runFullPipeline(1, runner -> runner.setProperty(RedisTypeDeserializer.HASH_FIELD_BATCH_SIZE, "10"));
+        assertEquals(fields, dragonflyCheck().hgetall("it:bighash-rewrite"));
+
+        seedRedis(cmds -> cmds.hdel("it:bighash-rewrite", "field7"));
+        Map<String, String> expectedAfterRemoval = new LinkedHashMap<>(fields);
+        expectedAfterRemoval.remove("field7");
+
+        // Same HASH_FIELD_BATCH_SIZE boundary (now 10/10/4 chunks) - a stale HSET-only rewrite
+        // would leave field7 behind instead of removing it, without losing any of the other 24.
+        runFullPipeline(1, runner -> runner.setProperty(RedisTypeDeserializer.HASH_FIELD_BATCH_SIZE, "10"));
+
+        assertEquals(expectedAfterRemoval, dragonflyCheck().hgetall("it:bighash-rewrite"));
+    }
+
+    @Test
     void preservesTtlByDefault() throws Exception {
         seedRedis(cmds -> cmds.set("it:ttlkey", "v", io.lettuce.core.SetArgs.Builder.ex(3600)));
 
@@ -126,6 +148,10 @@ class ScanPhaseIT {
 
     private void runFullPipeline(int partitionCount, Consumer<TestRunner> deserializerCustomizer) throws Exception {
         TestRunner scanRunner = TestRunners.newTestRunner(RedisScanReader.class);
+        // RedisScanReader/RedisTypeDeserializer/RedisBatchWriter all call session.commit()
+        // directly, which MockProcessSession rejects by default since nifi-mock 1.14.0 unless
+        // opted into explicitly.
+        scanRunner.setAllowSynchronousSessionCommits(true);
         StandardRedisConnectionPoolService sourcePool = new StandardRedisConnectionPoolService();
         scanRunner.addControllerService("source-pool", sourcePool);
         scanRunner.setProperty(sourcePool, AbstractRedisConnectionPoolService.CONNECTION_STRING,
@@ -144,7 +170,12 @@ class ScanPhaseIT {
         scanRunner.run();
 
         TestRunner deserializerRunner = TestRunners.newTestRunner(RedisTypeDeserializer.class);
+        deserializerRunner.setAllowSynchronousSessionCommits(true);
         deserializerRunner.addControllerService("source-pool", sourcePool);
+        deserializerRunner.setProperty(sourcePool, AbstractRedisConnectionPoolService.CONNECTION_STRING,
+                "redis://" + redis.getHost() + ":" + redis.getMappedPort(6379));
+        deserializerRunner.setProperty(sourcePool, AbstractRedisConnectionPoolService.REQUIRE_TLS, "false");
+        deserializerRunner.enableControllerService(sourcePool);
         deserializerRunner.setProperty(RedisTypeDeserializer.REDIS_CONNECTION_POOL, "source-pool");
         deserializerCustomizer.accept(deserializerRunner);
 
@@ -157,6 +188,7 @@ class ScanPhaseIT {
         deserializerRunner.run(Math.max(1, deserializerRunner.getQueueSize().getObjectCount()));
 
         TestRunner writerRunner = TestRunners.newTestRunner(RedisBatchWriter.class);
+        writerRunner.setAllowSynchronousSessionCommits(true);
         StandardDragonflyConnectionPoolService targetPool = new StandardDragonflyConnectionPoolService();
         writerRunner.addControllerService("target-pool", targetPool);
         writerRunner.setProperty(targetPool, AbstractRedisConnectionPoolService.CONNECTION_STRING,
