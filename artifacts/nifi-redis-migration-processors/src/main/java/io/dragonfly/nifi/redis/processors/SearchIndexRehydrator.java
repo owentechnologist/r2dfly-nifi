@@ -23,8 +23,10 @@ import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
@@ -32,14 +34,21 @@ import java.util.concurrent.TimeUnit;
  * Runs once, when started: reads back the search index definitions {@link SearchIndexExporter}
  * cached for this migration id and rebuilds each one on the target via {@code FT.CREATE},
  * removing it from the cache once successfully created (or already existing) - a failure leaves
- * it in the cache for a retry on the next start, instead of losing the definition.
+ * it in the cache for a retry on the next start, instead of losing the definition. An index the
+ * target already has is left as-is, or dropped and recreated from the source's definition under
+ * {@link #INDEX_OVERWRITE}; either way the conflict is logged at error level, since it means the
+ * source and target definitions may differ.
  *
- * <p>run-r2dfly.sh starts this only after confirming the main scan/write flow has actually
- * finished (DBSIZE polling + NiFi idle, same signal the original script-based rehydration step
- * waited for) - unlike export, "the migration is done" isn't something this processor (or NiFi
- * generally) can determine on its own for a filtered/partial migration, so it has to stay an
- * externally-triggered action. {@link #onTrigger} never does anything; all the work happens in
- * {@code @OnScheduled}, exactly once per start.
+ * <p>run-r2dfly.sh starts this before the main scan/write flow starts, not after it finishes -
+ * unlike the original script-based rehydration step, which had to wait for DBSIZE polling + NiFi
+ * idle to confirm the migration was done first. This processor's definitions come from {@link
+ * SearchIndexExporter}'s own hand-off in the Cursor State Cache, not from the migrated keyspace
+ * itself, so it has no such dependency: the index just starts out empty (or partially populated)
+ * and gets kept current by the search module's own normal indexing as matching documents are
+ * written during the migration. It still has to be triggered externally rather than run as part
+ * of the scan/write pipeline, since NiFi has no "start after import" automation of its own.
+ * {@link #onTrigger} never does anything; all the work happens in {@code @OnScheduled}, exactly
+ * once per start.
  *
  * <p>In cluster mode, {@code FT.CREATE} is broadcast to every master node (via {@link
  * StatefulRedisClusterConnection#getConnection(String)} per {@link
@@ -49,8 +58,8 @@ import java.util.concurrent.TimeUnit;
 @Tags({"redis", "dragonfly", "migration", "search", "ft.create"})
 @CapabilityDescription("Runs once when started: rebuilds every search index SearchIndexExporter cached for "
         + "this migration id on the target via FT.CREATE (including VECTOR fields), broadcasting to every "
-        + "master node in cluster mode. Not part of the per-key scan/write pipeline - start this only after "
-        + "confirming the main flow has finished.")
+        + "master node in cluster mode. Not part of the per-key scan/write pipeline - run-r2dfly.sh starts "
+        + "this before the main flow starts, not after it finishes.")
 public class SearchIndexRehydrator extends AbstractProcessor {
 
     public static final PropertyDescriptor TARGET_CONNECTION_POOL = new PropertyDescriptor.Builder()
@@ -86,8 +95,20 @@ public class SearchIndexRehydrator extends AbstractProcessor {
             .defaultValue("30000")
             .build();
 
+    public static final PropertyDescriptor INDEX_OVERWRITE = new PropertyDescriptor.Builder()
+            .name("index-overwrite")
+            .displayName("Overwrite Existing Indexes")
+            .description("When true, an index that already exists on the target is dropped via FT.DROPINDEX "
+                    + "and recreated from the source's cached definition, instead of being left as-is "
+                    + "(the default). Either way, an 'already exists' conflict is logged as an error.")
+            .required(true)
+            .allowableValues("true", "false")
+            .defaultValue("false")
+            .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
+            .build();
+
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS =
-            List.of(TARGET_CONNECTION_POOL, CURSOR_STATE_CACHE, MIGRATION_ID, FT_CREATE_TIMEOUT_MS);
+            List.of(TARGET_CONNECTION_POOL, CURSOR_STATE_CACHE, MIGRATION_ID, FT_CREATE_TIMEOUT_MS, INDEX_OVERWRITE);
 
     // No FlowFiles are ever produced - this processor's only effect is FT.CREATE calls issued,
     // and cache entries removed, in @OnScheduled.
@@ -109,6 +130,7 @@ public class SearchIndexRehydrator extends AbstractProcessor {
         DistributedMapCacheClient cache = context.getProperty(CURSOR_STATE_CACHE).asControllerService(DistributedMapCacheClient.class);
         String migrationId = context.getProperty(MIGRATION_ID).getValue();
         long timeoutMs = context.getProperty(FT_CREATE_TIMEOUT_MS).asLong();
+        boolean overwrite = context.getProperty(INDEX_OVERWRITE).asBoolean();
         ComponentLog logger = getLogger();
 
         List<String> names;
@@ -146,8 +168,8 @@ public class SearchIndexRehydrator extends AbstractProcessor {
             }
 
             boolean ok = targetPool.isClusterMode()
-                    ? createOnEveryMaster(targetPool, args, name, timeoutMs, logger)
-                    : targetPool.withRawConnection(conn -> issueFtCreate(conn, args, name, "target", timeoutMs, logger));
+                    ? createOnEveryMaster(targetPool, args, name, timeoutMs, overwrite, logger)
+                    : targetPool.withRawConnection(conn -> issueFtCreate(conn, args, name, "target", timeoutMs, overwrite, logger));
             if (!ok) {
                 remaining.add(name);
             }
@@ -171,7 +193,7 @@ public class SearchIndexRehydrator extends AbstractProcessor {
                 remaining.isEmpty() ? "" : " (" + remaining.size() + " left for retry)");
     }
 
-    private boolean createOnEveryMaster(DragonflyConnectionPoolService targetPool, List<byte[]> args, String name, long timeoutMs, ComponentLog logger) {
+    private boolean createOnEveryMaster(DragonflyConnectionPoolService targetPool, List<byte[]> args, String name, long timeoutMs, boolean overwrite, ComponentLog logger) {
         return targetPool.withRawConnection(conn -> {
             if (!(conn instanceof StatefulRedisClusterConnection<byte[], byte[]> clusterConn)) {
                 logger.warn("Target connection pool reports cluster mode but its raw connection isn't a cluster connection - cannot broadcast FT.CREATE for index {}", name);
@@ -190,7 +212,7 @@ public class SearchIndexRehydrator extends AbstractProcessor {
                     allOk = false;
                     continue;
                 }
-                if (!issueFtCreate(nodeConn, args, name, node.getNodeId(), timeoutMs, logger)) {
+                if (!issueFtCreate(nodeConn, args, name, node.getNodeId(), timeoutMs, overwrite, logger)) {
                     allOk = false;
                 }
             }
@@ -199,10 +221,27 @@ public class SearchIndexRehydrator extends AbstractProcessor {
     }
 
     /** Issues one FT.CREATE and interprets the reply/exception - "OK" and "Index already exists"
-     * both count as success (the latter leaves the pre-existing index as-is, matching the
-     * original script's behavior), anything else is a real failure. */
+     * both count as success, anything else is a real failure. Under {@code overwrite} the index
+     * is dropped first so the source's definition wins; otherwise the pre-existing target index
+     * is left as-is. Either way an "already exists" conflict is logged at error level: it means
+     * the source and target definitions may now differ, which needs an operator's eyes, not a
+     * retry loop. */
     private static boolean issueFtCreate(StatefulConnection<byte[], byte[]> conn, List<byte[]> args, String name,
-                                          String nodeLabel, long timeoutMs, ComponentLog logger) {
+                                          String nodeLabel, long timeoutMs, boolean overwrite, ComponentLog logger) {
+        if (overwrite) {
+            try {
+                RawModuleCommands.ftDropIndex(conn, name.getBytes(StandardCharsets.UTF_8)).get(timeoutMs, TimeUnit.MILLISECONDS);
+            } catch (Exception e) {
+                Throwable cause = e.getCause() != null ? e.getCause() : e;
+                String message = cause.getMessage() == null ? "" : cause.getMessage();
+                // Nothing to drop is the common case, not a problem. Any other drop failure still
+                // falls through to FT.CREATE - if the index really is still there, the "already
+                // exists" handling below reports it.
+                if (!message.toLowerCase(Locale.ROOT).contains("unknown index")) {
+                    logger.warn("Could not drop index '{}' on {} before recreating it: {}", name, nodeLabel, message, cause);
+                }
+            }
+        }
         try {
             String reply = RawModuleCommands.ftCreate(conn, args).get(timeoutMs, TimeUnit.MILLISECONDS);
             if (reply != null && reply.startsWith("OK")) {
@@ -214,7 +253,15 @@ public class SearchIndexRehydrator extends AbstractProcessor {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             String message = cause.getMessage() == null ? "" : cause.getMessage();
             if (message.contains("Index already exists")) {
-                logger.info("Index '{}' already exists on {} - leaving it as-is", name, nodeLabel);
+                // Reported, not retried: a conflict that survives the write is an operator
+                // decision, and re-queueing it would just repeat the same failure every start.
+                if (overwrite) {
+                    logger.error("Index '{}' still reports 'already exists' on {} after attempting to overwrite it - "
+                            + "the drop may have failed; the target index may not match the source definition", name, nodeLabel);
+                } else {
+                    logger.error("Index '{}' already exists on {} and Overwrite Existing Indexes is disabled - "
+                            + "leaving the existing index as-is; the source and target index definitions may now differ", name, nodeLabel);
+                }
                 return true;
             }
             logger.warn("FAILED to create index '{}' on {}: {}", name, nodeLabel, message, cause);

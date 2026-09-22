@@ -1,5 +1,6 @@
 package io.dragonfly.nifi.redis.services;
 
+import io.dragonfly.nifi.redis.util.ClusterTopologySnapshot;
 import io.lettuce.core.api.StatefulConnection;
 import io.lettuce.core.cluster.PipelinedRedisFuture;
 import io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands;
@@ -7,7 +8,9 @@ import org.apache.nifi.controller.AbstractControllerService;
 
 import java.lang.reflect.Proxy;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 
 /**
@@ -22,8 +25,15 @@ public class FakeRedisConnectionPoolService extends AbstractControllerService im
 
     private final FakeRedisPubSubHandle handle = new FakeRedisPubSubHandle();
 
+    /** Unset until a test calls {@link #setTopology}, so the fake reports as non-cluster by default. */
+    private volatile ClusterTopologySnapshot topology;
+
     public FakeRedisPubSubHandle handle() {
         return handle;
+    }
+
+    public void setTopology(ClusterTopologySnapshot topology) {
+        this.topology = topology;
     }
 
     /**
@@ -52,6 +62,11 @@ public class FakeRedisConnectionPoolService extends AbstractControllerService im
     }
 
     @Override
+    public <T> T withConnectionAndRaw(BiFunction<RedisClusterAsyncCommands<byte[], byte[]>, StatefulConnection<byte[], byte[]>, T> fn) {
+        throw new UnsupportedOperationException("withConnectionAndRaw");
+    }
+
+    @Override
     public boolean isClusterMode() {
         return false;
     }
@@ -59,5 +74,10 @@ public class FakeRedisConnectionPoolService extends AbstractControllerService im
     @Override
     public RedisPubSubHandle openPubSub() {
         return handle;
+    }
+
+    @Override
+    public Optional<ClusterTopologySnapshot> currentTopology() {
+        return Optional.ofNullable(topology);
     }
 }

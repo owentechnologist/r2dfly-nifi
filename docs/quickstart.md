@@ -30,6 +30,12 @@ while you wait.
 
 ## Run a migration
 
+`simple-migration.sh` runs a snapshot migration: it scans the source once and makes the target
+match that scan, then exits. It does not track changes made on the source after the scan
+starts - that's `--mode snapshot`, the default and (for now) only value. A continuous mode -
+an ongoing sync that keeps applying source changes until you stop it - is planned as a
+separate `continuous-migration.sh`, not this script.
+
 ```bash
 ./simple-migration.sh \
   --source-connection-string redis://source-host:6379 \
@@ -53,7 +59,45 @@ This single command:
 6. Configures and starts the migration
 7. Prints a summary of keys migrated
 
+## Run a continuous migration
+
+`continuous-migration.sh` does everything `simple-migration.sh` does, and also subscribes to the
+source's keyspace notifications so changes made after the scan keep flowing to the target.
+
+```bash
+./continuous-migration.sh \
+  --source-connection-string redis://source-host:6379 \
+  --target-connection-string rediss://default:password@target-host:6385
+```
+
+The source must have keyspace notifications on (`CONFIG SET notify-keyspace-events AE`). The
+script checks this before it changes anything and stops with that instruction if the setting is
+missing.
+
+The script starts the flow and exits. NiFi keeps running unsupervised and keeps applying source
+changes until you stop it:
+
+```bash
+./stop-continuous-migration.sh --nifi-container nifi-redis-migration \
+  --nifi-user USER --nifi-password PASSWORD
+```
+
+Continuous mode captures ongoing changes but does not yet self-heal a dropped connection's gap.
+If the keyspace pub/sub connection drops, the changes made during the outage are lost. The stop
+script prints the `Keyspace Pub/Sub Disconnects` and `Keyspace Pub/Sub Downtime (ms)` counters so
+you can see that it happened, but nothing repairs it. There is no reconciliation pass yet.
+`--reconciliation-signals` routes the consumer's `topology_drift` signal to a NiFi queue you can
+read over the REST API instead of discarding it, but no reconciliation trigger reads that queue,
+so nothing acts on the signal yet either. Run `./continuous-migration.sh --help` for the other
+limitations, including what happens when the consumer's queue fills and what the initial scan can
+overwrite.
+
 ## Options
+
+These options apply to `simple-migration.sh` and `continuous-migration.sh` alike.
+`continuous-migration.sh` takes no `--mode` and adds `--keyspace-pattern`, `--event-types`,
+`--max-queue-depth`, `--skip-keyspace-check` and `--reconciliation-signals` on top; see its
+`--help`.
 
 ```
 --source-connection-string S  redis://[:password@]host:port[/db] (or rediss:// for TLS -
@@ -82,7 +126,7 @@ This single command:
 --disable-provenance           cap NiFi's provenance repository to a small fixed footprint
                                (default: on) - see [Disk space and
                                --disable-provenance](#disk-space-and---disable-provenance) below
---no-disable-provenance        restore NiFi's own provenance defaults (10GB, full lineage/audit
+--no-disable-provenance        restore this project's own provenance defaults (1GB, full lineage/audit
                                history) instead, if you actually want that and have the disk
 --defaults                    skip the resource/parallelism prompt and use the defaults above
 --verbose                     show real container image pull/build/download output instead of
@@ -179,9 +223,9 @@ outright, restarting the NiFi container to apply it if it isn't already set (a n
 pass on every run, once it is).
 
 Pass `--no-disable-provenance` instead if you actually want NiFi's fine-grained lineage/audit
-history for the migration and the host has the disk for it (NiFi's own default is a 10GB cap) -
-this also restarts the container if a previous default-on run already capped it, restoring
-NiFi's own defaults.
+history for the migration and the host has the disk for it (this project's own default is a 1GB
+cap, well under NiFi's own 10GB shipped default) - this also restarts the container if a
+previous default-on run already capped it, restoring this project's own defaults.
 
 ## Re-running against a container with leftover queued data
 
@@ -296,3 +340,34 @@ control, etc. - use `run-r2dfly.sh` directly:
 ```bash
 ./run-r2dfly.sh --help
 ```
+
+## Bringing in other datasources (Postgres, files, Kafka, MongoDB, ...)
+
+Everything above is Redis-as-source. The NAR also ships two processors for bringing
+non-Redis data into Dragonfly as a hash or a native JSON document, so search indexes
+(`FT.CREATE`) can be built on top of it:
+
+- **`RecordToKeyRecord`** converts any NiFi Record stream - from a DB query, Kafka, files, a
+  Mongo document, anything with a matching NiFi Record Reader - into the same envelope
+  `RedisBatchWriter` already writes to Dragonfly. `Target Type` picks `hash` (flat, nested
+  fields get stringified) or `json` (full nested structure preserved). `Key Format` plus
+  per-record RecordPath dynamic properties build the Dragonfly key, e.g. `orders:${id}` with
+  a dynamic property `id` set to RecordPath `/id`.
+- **`ExecuteSQLIncremental`** runs an arbitrary SQL query against any JDBC source on NiFi's
+  own schedule, optionally tracking a cursor across runs so only new rows come back (e.g.
+  `SELECT * FROM orders WHERE id > ${cursor} ORDER BY id`). Unlike the bundled
+  `QueryDatabaseTableRecord`, this isn't limited to one whole table - any query shape works,
+  including joins. Set `Cursor Column` to enable cursor tracking; leave it unset to just
+  rerun the same query on a schedule. **The processor persists the last fetched row's value
+  for that column, not a computed maximum, so the query itself must `ORDER BY` that column
+  ascending** or rows get silently skipped. A numeric cursor also needs a guard against the
+  empty string it starts as, e.g. `CAST(COALESCE(NULLIF('${cursor}', ''), '0') AS INT)`.
+
+Wire them as `ExecuteSQLIncremental` (or `ConsumeKafka`/`FetchFile`/`GetMongoRecord`/any other
+NiFi source with a Record Reader) → `RecordToKeyRecord` → the existing `RedisBatchWriter`.
+
+**There is no one-command script for this yet** - no `--source-connection-string`-style
+wrapper, and `r2dfly.json` doesn't include these processors. Build the flow by hand in the
+NiFi canvas or via its REST API today; `deploy-to-nifi.sh` still builds and loads the NAR
+containing both processors, so they're available to drag onto the canvas as soon as NiFi is
+up.

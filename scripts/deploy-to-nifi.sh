@@ -28,7 +28,7 @@ M2_CACHE_VOLUME="${M2_CACHE_VOLUME:-nifi-redis-migration-m2-cache}"
 # --verbose shows real pull/build/download output instead of a progress bar (see
 # run_with_progress in toolbox-lib.sh). Provenance repository capping (see further down for
 # why - it's the confirmed root cause of a real stuck migration on a small-disk host) is on by
-# default; --no-disable-provenance restores NiFi's own default (10GB, full lineage/audit
+# default; --no-disable-provenance restores this project's own default (1GB, full lineage/audit
 # history) for anyone who actually wants that and has the disk for it. No other flags are
 # accepted - every other setting here is env-var driven (see the block above and below).
 VERBOSE="${VERBOSE:-false}"
@@ -306,10 +306,11 @@ echo "==> the NAR is placed in nar_extensions/ and reloaded (via restart, if the
 PROVENANCE_CAP_SIZE="8 MB"
 PROVENANCE_ROLLOVER_SIZE="1 MB"
 PROVENANCE_MAX_STORAGE_TIME="5 mins"
-# NiFi's own shipped defaults (see nifi.properties) - restored by --no-disable-provenance on a
-# container a previous default-on run already capped; otherwise this project would have no way
-# back to full tracking short of recreating the container from scratch.
-PROVENANCE_DEFAULT_SIZE="10 GB"
+# This project's own default (NiFi itself ships max.storage.size=10 GB; capped here to 1 GB) -
+# restored by --no-disable-provenance on a container a previous default-on run already capped;
+# otherwise this project would have no way back to full tracking short of recreating the
+# container from scratch.
+PROVENANCE_DEFAULT_SIZE="1 GB"
 PROVENANCE_DEFAULT_ROLLOVER_SIZE="100 MB"
 PROVENANCE_DEFAULT_MAX_STORAGE_TIME="30 days"
 
@@ -353,9 +354,9 @@ if [[ "$DISABLE_PROVENANCE" == "true" ]]; then
   fi
 else
   if [[ "$CURRENT_PROVENANCE_CAP" == "$PROVENANCE_DEFAULT_SIZE" ]]; then
-    echo "==> provenance repository already at NiFi's own defaults - skipping"
+    echo "==> provenance repository already at this project's own defaults - skipping"
   else
-    apply_provenance_settings "--no-disable-provenance: restoring NiFi's own provenance repository defaults" \
+    apply_provenance_settings "--no-disable-provenance: restoring this project's own provenance repository defaults" \
       "$PROVENANCE_DEFAULT_SIZE" "$PROVENANCE_DEFAULT_ROLLOVER_SIZE" "$PROVENANCE_DEFAULT_MAX_STORAGE_TIME"
   fi
 fi

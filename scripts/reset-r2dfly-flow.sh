@@ -103,9 +103,12 @@ fi
 # pg-stop/pg-disable-services return as soon as NiFi *accepts* the request, not once every
 # processor/service has actually finished transitioning - poll actual state before deleting,
 # since NiFi refuses to delete a process group containing a running processor or enabled
-# service (see run-r2dfly.sh, which hit this exact race first).
+# service (see run-r2dfly.sh, which hit this exact race first). runStatus alone is not enough:
+# it flips to Stopped as soon as the scheduler stops issuing new triggers, but a processor
+# mid-onTrigger() keeps its activeThreadCount above 0 for a while after - and NiFi rejects
+# deletes/PUTs against a group with any active threads, independent of runStatus.
 wait_for_processors_stopped() {
-  local pgid="$1" timeout="${2:-30}" waited=0 running rc
+  local pgid="$1" timeout="${2:-30}" waited=0 running threads rc
   while true; do
     # rc is checked explicitly rather than `|| true`'d away: a failed API call must not be
     # indistinguishable from "confirmed nothing running" (empty $running), or a transient hiccup
@@ -118,12 +121,17 @@ import json, sys
 d = json.load(sys.stdin)
 print(','.join(p['component']['name'] for p in d['processors'] if p.get('status', {}).get('runStatus') == 'Running'))
 ")" || rc=$?
-    [[ $rc -eq 0 && -z "$running" ]] && return 0
+    threads="$(nifi_api_get "flow/process-groups/$pgid/status" | py3 "
+import json, sys
+d = json.load(sys.stdin)
+print(d['processGroupStatus']['aggregateSnapshot']['activeThreadCount'])
+")" || rc=$?
+    [[ $rc -eq 0 && -z "$running" && "$threads" == "0" ]] && return 0
     if [[ "$waited" -ge "$timeout" ]]; then
       if [[ $rc -ne 0 ]]; then
         echo "warning: could not confirm processor status after ${timeout}s (NiFi API call failing) - proceeding anyway" >&2
       else
-        echo "warning: still running after ${timeout}s: $running - proceeding anyway" >&2
+        echo "warning: still running after ${timeout}s: running=[$running] activeThreadCount=$threads - proceeding anyway" >&2
       fi
       return 1
     fi

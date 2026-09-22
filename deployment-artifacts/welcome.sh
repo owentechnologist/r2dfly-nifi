@@ -61,16 +61,18 @@ cat <<EXAMPLE
 
 Here's what running a full migration looks like once this is unpacked - e.g. tuned for a
 larger keyspace with some CPU/memory headroom and extra parallelism, source and target
-pointed at their own instances:
+pointed at their own instances. Once you're setting more than a couple of options, it's
+easiest to edit a TOML config file once rather than retyping a long flag list every run:
 
   cd $TARGET_DIR/scripts
-  ./simple-migration.sh \\
-    --cpus 4 \\
-    --memory 8g \\
-    --parallelism 2 \\
-    --writer-concurrency 5 \\
-    --source-connection-string redis://192.168.1.22:6379 \\
-    --target-connection-string rediss://default:password@my.dragonflydb.cloud:6385
+  cp config/simple-config.toml my-migration.toml
+  \$EDITOR my-migration.toml    # set your real source/target connection strings and settings
+  ./simple-migration.sh --toml-file my-migration.toml
+
+Any flag you also pass on the command line overrides the matching TOML setting, so you can
+keep the connection strings out of your shell history and still override e.g. --parallelism
+for a one-off run. See scripts/config/*.toml for more starting points (prefix filters,
+per-type batch sizes, a cluster-source example).
 
 EXAMPLE
 
@@ -122,5 +124,8 @@ configures and starts the migration, and prints a summary of keys migrated.
 Every run also writes a full settings/activity log to logs/<migration-id>.log (alongside
 scripts/) - check there if you need a record of exactly what a past migration run did.
 
-See docs/quickstart.md for options and examples, or docs/TUTORIAL.md for a full walkthrough.
+For anything beyond this bare minimum, edit a copy of scripts/config/simple-config.toml and
+pass it with --toml-file instead of building up a long flag list - see the example above,
+docs/quickstart.md's "Using a TOML config file" section for the full key reference, or
+docs/TUTORIAL.md for a full walkthrough.
 EOF

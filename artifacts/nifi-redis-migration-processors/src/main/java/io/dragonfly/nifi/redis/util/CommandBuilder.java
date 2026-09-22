@@ -1,5 +1,6 @@
 package io.dragonfly.nifi.redis.util;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.lettuce.core.RedisFuture;
 import io.lettuce.core.RestoreArgs;
 import io.lettuce.core.ScoredValue;
@@ -7,8 +8,10 @@ import io.lettuce.core.SetArgs;
 import io.lettuce.core.XAddArgs;
 import io.lettuce.core.XGroupCreateArgs;
 import io.lettuce.core.XReadArgs;
+import io.lettuce.core.api.StatefulConnection;
 import io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands;
 
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -39,6 +42,8 @@ public final class CommandBuilder {
     private CommandBuilder() {
     }
 
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
     /** Default cap on elements/fields/members sent in a single RPUSH/SADD/ZADD/HSET call - a
      * key with more than this many entries is written across several smaller commands instead
      * of one command whose argument count scales with the key's own size. Protects the target
@@ -48,18 +53,20 @@ public final class CommandBuilder {
 
     public static CompletableFuture<WriteOutcome> write(
             RedisClusterAsyncCommands<byte[], byte[]> target,
+            StatefulConnection<byte[], byte[]> rawConn,
             KeyRecord record,
             String keyPrefix,
             String keyPrefixSeparator,
             TtlStrategy ttlStrategy,
             long ttlResetOffsetMs,
             ConflictStrategy conflictStrategy) {
-        return write(target, record, keyPrefix, keyPrefixSeparator, ttlStrategy, ttlResetOffsetMs,
+        return write(target, rawConn, record, keyPrefix, keyPrefixSeparator, ttlStrategy, ttlResetOffsetMs,
                 conflictStrategy, DEFAULT_WRITE_CHUNK_SIZE);
     }
 
     public static CompletableFuture<WriteOutcome> write(
             RedisClusterAsyncCommands<byte[], byte[]> target,
+            StatefulConnection<byte[], byte[]> rawConn,
             KeyRecord record,
             String keyPrefix,
             String keyPrefixSeparator,
@@ -76,19 +83,20 @@ public final class CommandBuilder {
         }
 
         if (conflictStrategy == ConflictStrategy.OVERWRITE) {
-            return dispatchWrite(target, record, targetKey, effectiveTtl, writeChunkSize).thenApply(v -> WriteOutcome.SUCCESS);
+            return dispatchWrite(target, rawConn, record, targetKey, effectiveTtl, writeChunkSize).thenApply(v -> WriteOutcome.SUCCESS);
         }
         return toCf(target.exists(targetKey)).thenCompose(count -> {
             if (count != null && count > 0) {
                 WriteOutcome outcome = conflictStrategy == ConflictStrategy.SKIP ? WriteOutcome.SKIPPED : WriteOutcome.CONFLICT;
                 return CompletableFuture.completedFuture(outcome);
             }
-            return dispatchWrite(target, record, targetKey, effectiveTtl, writeChunkSize).thenApply(v -> WriteOutcome.SUCCESS);
+            return dispatchWrite(target, rawConn, record, targetKey, effectiveTtl, writeChunkSize).thenApply(v -> WriteOutcome.SUCCESS);
         });
     }
 
     private static CompletableFuture<Void> dispatchWrite(
-            RedisClusterAsyncCommands<byte[], byte[]> target, KeyRecord record, byte[] key, Long ttlMs, int writeChunkSize) {
+            RedisClusterAsyncCommands<byte[], byte[]> target, StatefulConnection<byte[], byte[]> rawConn,
+            KeyRecord record, byte[] key, Long ttlMs, int writeChunkSize) {
         return switch (record.type) {
             case "string" -> writeString(target, key, record, ttlMs);
             case "hash" -> writeHash(target, key, record, ttlMs, writeChunkSize);
@@ -96,8 +104,25 @@ public final class CommandBuilder {
             case "set" -> writeSet(target, key, record, ttlMs, writeChunkSize);
             case "zset" -> writeZset(target, key, record, ttlMs, writeChunkSize);
             case "stream" -> writeStream(target, key, record, ttlMs);
+            case "json" -> writeJson(target, rawConn, key, record, ttlMs);
             default -> CompletableFuture.failedFuture(new IllegalArgumentException("Unsupported type: " + record.type));
         };
+    }
+
+    /** No leading DEL, unlike {@link #writeHash}/{@link #writeList}/{@link #writeSet}/
+     * {@link #writeZset} - {@code JSON.SET key . <value>} already replaces the whole document,
+     * so a DEL first would be redundant work rather than a correctness requirement. */
+    private static CompletableFuture<Void> writeJson(
+            RedisClusterAsyncCommands<byte[], byte[]> target, StatefulConnection<byte[], byte[]> rawConn,
+            byte[] key, KeyRecord record, Long ttlMs) {
+        byte[] json;
+        try {
+            json = OBJECT_MAPPER.writeValueAsBytes(record.value);
+        } catch (java.io.IOException e) {
+            return CompletableFuture.failedFuture(new UncheckedIOException(
+                    "Failed to serialize JSON value for key " + new String(key, StandardCharsets.UTF_8), e));
+        }
+        return RawModuleCommands.jsonSet(rawConn, key, json).thenCompose(v -> applyTtl(target, key, ttlMs));
     }
 
     /** --dfly-to-dfly path: a RESTORE's argument count is fixed (key, ttl, one payload bulk

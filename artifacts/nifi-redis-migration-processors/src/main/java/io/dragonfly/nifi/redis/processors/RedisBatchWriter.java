@@ -6,6 +6,7 @@ import io.dragonfly.nifi.redis.util.CommandBuilder;
 import io.dragonfly.nifi.redis.util.KeyRecord;
 import io.dragonfly.nifi.redis.util.RedisTypeSerializer;
 import io.dragonfly.nifi.redis.util.RetryPolicy;
+import io.lettuce.core.api.StatefulConnection;
 import io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
@@ -127,6 +128,7 @@ public class RedisBatchWriter extends AbstractProcessor {
             .name("key-prefix")
             .displayName("Key Prefix")
             .required(false)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
 
     public static final PropertyDescriptor KEY_PREFIX_SEPARATOR = new PropertyDescriptor.Builder()
@@ -261,13 +263,13 @@ public class RedisBatchWriter extends AbstractProcessor {
             outcomes = new ArrayList<>(ready.size());
             for (int start = 0; start < ready.size(); start += maxPipelineDepth) {
                 List<PendingWrite> group = ready.subList(start, Math.min(start + maxPipelineDepth, ready.size()));
-                outcomes.addAll(dragonflyPool.withConnection(cmds -> dispatchAndAwait(
-                        cmds, group, keyPrefix, keyPrefixSeparator, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize, batchTimeoutMs, getLogger())));
+                outcomes.addAll(dragonflyPool.withConnectionAndRaw((cmds, rawConn) -> dispatchAndAwait(
+                        cmds, rawConn, group, keyPrefix, keyPrefixSeparator, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize, batchTimeoutMs, getLogger())));
             }
         } else {
-            dragonflyPool.withConnection(cmds -> {
+            dragonflyPool.withConnectionAndRaw((cmds, rawConn) -> {
                 for (PendingWrite pending : ready) {
-                    CommandBuilder.write(cmds, pending.record, keyPrefix, keyPrefixSeparator, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize);
+                    CommandBuilder.write(cmds, rawConn, pending.record, keyPrefix, keyPrefixSeparator, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize);
                 }
                 return null;
             });
@@ -294,12 +296,12 @@ public class RedisBatchWriter extends AbstractProcessor {
     }
 
     private static List<CommandBuilder.WriteOutcome> dispatchAndAwait(
-            RedisClusterAsyncCommands<byte[], byte[]> cmds, List<PendingWrite> ready, String keyPrefix,
+            RedisClusterAsyncCommands<byte[], byte[]> cmds, StatefulConnection<byte[], byte[]> rawConn, List<PendingWrite> ready, String keyPrefix,
             String keyPrefixSeparator, CommandBuilder.TtlStrategy ttlStrategy, long ttlResetOffsetMs,
             CommandBuilder.ConflictStrategy conflictStrategy, int writeChunkSize, long batchTimeoutMs, ComponentLog logger) {
         List<CompletableFuture<CommandBuilder.WriteOutcome>> futures = new ArrayList<>(ready.size());
         for (PendingWrite pending : ready) {
-            futures.add(CommandBuilder.write(cmds, pending.record, keyPrefix, keyPrefixSeparator, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize));
+            futures.add(CommandBuilder.write(cmds, rawConn, pending.record, keyPrefix, keyPrefixSeparator, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize));
         }
         try {
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(batchTimeoutMs, TimeUnit.MILLISECONDS);

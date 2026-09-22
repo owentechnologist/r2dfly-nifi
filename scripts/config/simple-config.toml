@@ -1,18 +1,27 @@
 [source]
-connection-string = "rediss://default:zzzzzzz@r9827zzxw.dragonflydb.cloud:6385"
-connection-mode = "standalone"
+connection-string ="redis://localhost:10000"
+#connection-string = "rediss://default:zzzzzzz@r9827zzxw.dragonflydb.cloud:6385"
+# default is standalone
+#connection-mode = "standalone"
 
 [target]
-connection-string = "rediss://default:aaaaaaa@626eq8eha.dragonflydb.cloud:6385"
-connection-mode = "cluster"
+connection-string = "redis://localhost:6385"
+#connection-string = "rediss://default:aaaaaaa@626eq8eha.dragonflydb.cloud:6385"
+#connection-mode = "cluster"
 
 [migration]
-topk-mode = "exact"
-prefix-deny-list = "domain"
-batch-size-string = 500
+#topk-mode = "exact"
+#prefix-deny-list = "domain"
+batch-size-string = 1000
+#if, for instance, some hashes have 2k entries
+batch-size-hash = 75
 
 [resources]
 cpus = 14
-memory = "26g"
-parallelism = 8
-writer-concurrency = 14
+#memory = "26g"
+#parallelism = 8
+#writer-concurrency = 14
+
+memory = "16g"
+parallelism = 6
+writer-concurrency = 12

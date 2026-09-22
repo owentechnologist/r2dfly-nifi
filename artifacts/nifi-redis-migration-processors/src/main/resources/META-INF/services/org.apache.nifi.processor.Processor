@@ -4,6 +4,9 @@ io.dragonfly.nifi.redis.processors.RedisBatchWriter
 io.dragonfly.nifi.redis.processors.RedisKeyspaceEventConsumer
 io.dragonfly.nifi.redis.processors.RedisSingleKeyFetch
 io.dragonfly.nifi.redis.processors.DeleteRedisKey
+io.dragonfly.nifi.redis.processors.RedisKeyExistenceRouter
 io.dragonfly.nifi.redis.processors.RedisDeadLetterWriter
 io.dragonfly.nifi.redis.processors.ModuleTypeHandler
 io.dragonfly.nifi.redis.processors.MigrationValidationProcessor
+io.dragonfly.nifi.redis.processors.RecordToKeyRecord
+io.dragonfly.nifi.redis.processors.ExecuteSQLIncremental

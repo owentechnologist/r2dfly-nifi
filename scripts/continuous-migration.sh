@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# One-command Redis -> Dragonfly migration: validates source/target connectivity, reports each
-# side's product and version (INFO SERVER) - which also decides whether to enable the
-# --dfly-to-dfly fast path - warns about module/data types the source holds that this tool can't
-# land on this particular target, builds and deploys the processor NAR, starts NiFi if needed,
-# and runs the standard migration via run-r2dfly.sh. For anything beyond the
-# default migration (custom key-type filters, TopK modes, batch tuning, prefix filters, etc.),
-# use run-r2dfly.sh directly - see ./run-r2dfly.sh --help.
+# One-command Redis -> Dragonfly continuous migration: validates source/target connectivity,
+# reports each side's product and version (INFO SERVER) - which also decides whether to enable the
+# --dfly-to-dfly fast path - confirms the source actually emits keyspace notifications, builds and
+# deploys the processor NAR, starts NiFi if needed, wires a keyspace-notification-driven Live
+# Phase into the flow, and then runs the same initial snapshot simple-migration.sh runs - which is
+# what starts the whole flow, Live Phase included. It exits with NiFi still running: the Live
+# Phase keeps applying source changes to the target until stop-continuous-migration.sh stops it.
 #
-# This script only ever runs a snapshot migration: it scans the source once and makes the
-# target match that scan, then exits - it does not track changes made after the scan starts.
-# --mode exists now so that stays an explicit, named choice rather than an unstated assumption;
-# continuous-migration.sh is the separate tool for an ongoing sync that keeps applying source
-# changes until you stop it.
+# simple-migration.sh is the snapshot-only tool - use that one when a single one-time copy is all
+# you want and nothing should keep running afterward.
+#
+# "Continuous" here means "keeps applying changes", not "guaranteed to lose nothing". If the
+# keyspace pub/sub connection drops, or the consumer's internal queue fills, the events in that
+# window are counted but never replayed, and nothing repairs the gap - the reconciliation pass
+# that would repair it is not built. Read the LIMITATIONS section in --help before planning a
+# cutover around this.
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,6 +28,11 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") --source-connection-string S --target-connection-string S [options]
 
+Runs an initial snapshot AND leaves a keyspace-notification-driven Live Phase running, so
+changes made on the source after the snapshot keep landing on the target. Stop it with
+stop-continuous-migration.sh. For a one-time copy that exits when it's done, use
+simple-migration.sh instead.
+
 Required:
   --source-connection-string S  redis://[:password@]host:port[/db] (or rediss:// for TLS -
                                  a rediss:// scheme automatically enables TLS to that side,
@@ -33,13 +41,34 @@ Required:
                                  redis://host1:port1,redis://host2:port2
   --target-connection-string S  same format, for the Dragonfly target
 
+Live Phase options:
+  --keyspace-pattern P           pub/sub channel pattern the keyspace-event consumer subscribes
+                                 to (env KEYSPACE_PATTERN, default: the processor's own default,
+                                 __keyevent@*__:*, which covers every database on the source).
+                                 Narrow it only if you know exactly which keyevent channels you
+                                 need - anything it doesn't match is never seen at all.
+  --event-types LIST             comma-separated keyspace event types to act on, e.g. set,del,expired
+                                 (env EVENT_TYPES, default: unset - every event type the pattern
+                                 delivers)
+  --max-queue-depth N            how many events the consumer buffers internally before it starts
+                                 dropping them (env MAX_QUEUE_DEPTH, default: the processor's own
+                                 default, 10000). Dropped events are counted as "Keyspace Events
+                                 Dropped (Queue Full)" and are NOT replayed later.
+  --skip-keyspace-check          skip STAGE 1's notify-keyspace-events pre-flight on the source
+                                 (env SKIP_KEYSPACE_CHECK, default: false). The check is the only
+                                 thing that turns a misconfigured source into a clear error here
+                                 rather than a processor that never starts - skipping it means
+                                 the consumer fails at schedule time in STAGE 8 instead, which
+                                 surfaces only as a NiFi bulletin.
+  --reconciliation-signals       route the consumer's topology_drift relationship to a NiFi funnel
+                                 queue instead of auto-terminating it (env RECONCILIATION_SIGNALS,
+                                 default: false). The queue is durable and can be read back over
+                                 NiFi's REST API, but nothing consumes it - limitation 4 below is
+                                 still open - so this keeps the drift signals for inspection and
+                                 nothing more. Re-running without the flag deletes the queue,
+                                 which NiFi refuses while FlowFiles are still sitting in it.
+
 Optional:
-  --mode MODE                   snapshot (env MODE, default and the only value this script
-                                 accepts - scans the source once and makes the target match that
-                                 scan, then exits; does not track changes made after the scan
-                                 starts). For an ongoing sync that keeps applying source changes
-                                 until you stop it, use ./continuous-migration.sh instead - it
-                                 takes every option below and adds the Live Phase ones.
   --toml-file FILE               load settings from a TOML config file instead of/alongside
                                  flags (env TOML_FILE). FILE is looked up as given first (a
                                  path relative to the current directory, or absolute); if
@@ -50,7 +79,8 @@ Optional:
                                  where --toml-file appears among the other flags. See
                                  scripts/config/*.toml for annotated examples (a hefty-box
                                  cluster-source config, a prefix-filtered one) and
-                                 docs/quickstart.md for the full key reference.
+                                 docs/quickstart.md for the full key reference. The Live Phase
+                                 settings above live in a [live] section of that file.
   --source-connection-mode M    standalone, sentinel, or cluster (env SOURCE_CONNECTION_MODE,
                                  default: standalone). cluster runs a pre-flight topology
                                  health check and cluster-aware key-count reconciliation
@@ -151,10 +181,12 @@ Optional:
                                  out of room) and every write path in NiFi started failing with
                                  "No space left on device" in a loop, silently, with the target
                                  sitting at 0 keys/0 bytes written the whole time and no clearer
-                                 error surfaced anywhere else. Restarts the NiFi container to
-                                 apply the cap if it isn't already set (skipped if it already
-                                 is - safe to pass on every run). See deploy-to-nifi.sh for the
-                                 exact properties this changes.
+                                 error surfaced anywhere else. Matters more here than for a
+                                 snapshot run: the Live Phase keeps producing FlowFiles for as
+                                 long as it's left running. Restarts the NiFi container to apply
+                                 the cap if it isn't already set (skipped if it already is -
+                                 safe to pass on every run). See deploy-to-nifi.sh for the exact
+                                 properties this changes.
   --no-disable-provenance        restore this project's own provenance repository defaults (1GB, full
                                  lineage/audit history) instead - only worth it if you actually
                                  want that history and the migration host has the disk for it
@@ -165,6 +197,33 @@ Optional:
   -y, --yes                     don't prompt before stopping/clearing a pre-existing migration
   -h, --help                    this help
 
+LIMITATIONS - read these before planning a cutover around continuous mode:
+  1. Continuous mode captures ongoing changes but does not yet self-heal a dropped connection's
+     gap. If the keyspace pub/sub connection drops, events during the outage are lost; the
+     consumer records "Keyspace Pub/Sub Disconnects" and "Keyspace Pub/Sub Downtime (ms)"
+     counters so the gap is visible, but nothing repairs it. The reconciliation/repair pass
+     this would depend on is not built.
+  2. If the consumer's internal queue fills (--max-queue-depth), events are dropped and counted
+     as "Keyspace Events Dropped (Queue Full)". Also not repaired.
+  3. During the initial snapshot the Live Phase and the scanner both write to the target. The
+     live path fetches the key's CURRENT value, so a live update can be overwritten by the
+     scanner's older in-flight batch for the same key. That key stays stale until it changes
+     again. This is a known narrow window in this first wiring pass.
+  4. Cluster topology drift is detected and counted, but nothing acts on it. The topology_drift
+     relationship is auto-terminated by default; --reconciliation-signals queues it at a funnel
+     instead, which keeps the signals but still leaves nothing reading them.
+  5. The Live Phase starts together with the initial scan, when run-r2dfly.sh starts the flow,
+     so changes made on the source between this script starting and that moment are not captured
+     by the Live Phase (the initial snapshot covers whatever is on the source when it scans).
+     Additionally, run-r2dfly.sh stops and starts the whole process group to apply
+     configuration, so re-running a migration against a flow whose Live Phase was already
+     running tears the pub/sub subscription down for that reconfigure window, and events during
+     it are lost.
+  6. RedisBatchWriter batches its writes: its deployed defaults are batch-size 50 and
+     batch-timeout-ms 30000, so a single live change can wait up to 30 seconds on the target
+     before it lands. That is throughput tuning, not a correctness bug, but it means
+     "continuous" is not "immediate".
+
 Example:
   $(basename "$0") \\
     --source-connection-string redis://source-host:6379 \\
@@ -172,7 +231,6 @@ Example:
 EOF
 }
 
-MODE="${MODE:-snapshot}"
 SOURCE_CONNECTION_STRING=""
 TARGET_CONNECTION_STRING=""
 SOURCE_CONNECTION_MODE="${SOURCE_CONNECTION_MODE:-standalone}"
@@ -208,6 +266,14 @@ MODULE_BATCH_SIZE="${MODULE_BATCH_SIZE:-}"
 BATCH_SIZE_JSON="${BATCH_SIZE_JSON:-}"
 BATCH_SIZE_TOPK="${BATCH_SIZE_TOPK:-}"
 BATCH_SIZE_BLOOM_CMS="${BATCH_SIZE_BLOOM_CMS:-}"
+# Unset means "leave the RedisKeyspaceEventConsumer processor's own default in place" - STAGE 7
+# sends JSON null for each of these, which is how the NiFi API explicitly clears an optional
+# property back to its default rather than inheriting a previous run's value.
+KEYSPACE_PATTERN="${KEYSPACE_PATTERN:-}"
+EVENT_TYPES="${EVENT_TYPES:-}"
+MAX_QUEUE_DEPTH="${MAX_QUEUE_DEPTH:-}"
+SKIP_KEYSPACE_CHECK="${SKIP_KEYSPACE_CHECK:-false}"
+RECONCILIATION_SIGNALS="${RECONCILIATION_SIGNALS:-false}"
 ASSUME_DEFAULTS="${ASSUME_DEFAULTS:-false}"
 DISABLE_PROVENANCE="${DISABLE_PROVENANCE:-true}"
 RESOURCE_FLAGS_GIVEN="false"
@@ -281,7 +347,11 @@ MAPPING = {
     ("migration", "batch-size-json"): "BATCH_SIZE_JSON",
     ("migration", "batch-size-topk"): "BATCH_SIZE_TOPK",
     ("migration", "batch-size-bloom-cms"): "BATCH_SIZE_BLOOM_CMS",
-    ("run", "mode"): "MODE",
+    ("live", "keyspace-pattern"): "KEYSPACE_PATTERN",
+    ("live", "event-types"): "EVENT_TYPES",
+    ("live", "max-queue-depth"): "MAX_QUEUE_DEPTH",
+    ("live", "skip-keyspace-check"): "SKIP_KEYSPACE_CHECK",
+    ("live", "reconciliation-signals"): "RECONCILIATION_SIGNALS",
     ("run", "defaults"): "ASSUME_DEFAULTS",
     ("run", "verbose"): "VERBOSE",
     ("run", "yes"): "ASSUME_YES",
@@ -370,7 +440,6 @@ fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --mode) require_value "$@"; MODE="$2"; shift 2 ;;
     --source-connection-string) require_value "$@"; SOURCE_CONNECTION_STRING="$2"; shift 2 ;;
     --target-connection-string) require_value "$@"; TARGET_CONNECTION_STRING="$2"; shift 2 ;;
     --source-connection-mode) require_value "$@"; SOURCE_CONNECTION_MODE="$2"; shift 2 ;;
@@ -403,6 +472,11 @@ while [[ $# -gt 0 ]]; do
     --batch-size-json) require_value "$@"; BATCH_SIZE_JSON="$2"; shift 2 ;;
     --batch-size-topk) require_value "$@"; BATCH_SIZE_TOPK="$2"; shift 2 ;;
     --batch-size-bloom-cms) require_value "$@"; BATCH_SIZE_BLOOM_CMS="$2"; shift 2 ;;
+    --keyspace-pattern) require_value "$@"; KEYSPACE_PATTERN="$2"; shift 2 ;;
+    --event-types) require_value "$@"; EVENT_TYPES="$2"; shift 2 ;;
+    --max-queue-depth) require_value "$@"; MAX_QUEUE_DEPTH="$2"; shift 2 ;;
+    --skip-keyspace-check) SKIP_KEYSPACE_CHECK="true"; shift ;;
+    --reconciliation-signals) RECONCILIATION_SIGNALS="true"; shift ;;
     --defaults) ASSUME_DEFAULTS="true"; shift ;;
     --disable-provenance) DISABLE_PROVENANCE="true"; shift ;;
     --no-disable-provenance) DISABLE_PROVENANCE="false"; shift ;;
@@ -413,18 +487,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-MODE="$(tr '[:upper:]' '[:lower:]' <<< "$MODE")"
-case "$MODE" in
-  snapshot) ;;
-  continuous)
-    echo "error: this script only runs snapshot migrations. Use ./continuous-migration.sh for an" >&2
-    echo "       ongoing sync that keeps applying source changes until you stop it - it takes the" >&2
-    echo "       same options this script does, with no --mode flag. See its --help for what" >&2
-    echo "       continuous mode does and does not guarantee." >&2
-    exit 1 ;;
-  *) echo "error: --mode must be 'snapshot' (got '$MODE')" >&2; usage; exit 1 ;;
-esac
-echo "==> mode: snapshot (one-time copy - the target will be made to match the source as of this scan; it will not track changes made afterward)"
+echo "==> mode: continuous (initial snapshot, then an ongoing keyspace-notification sync that keeps running after this script exits - stop it with stop-continuous-migration.sh)"
 if [[ -z "$SOURCE_CONNECTION_STRING" || -z "$TARGET_CONNECTION_STRING" ]]; then
   echo "error: --source-connection-string and --target-connection-string are required" >&2
   usage; exit 1
@@ -437,6 +500,14 @@ if ! [[ "$WRITER_CONCURRENCY" =~ ^[0-9]+$ ]] || [[ "$WRITER_CONCURRENCY" -lt 1 ]
   echo "error: --writer-concurrency must be a positive integer (got '$WRITER_CONCURRENCY')" >&2
   usage; exit 1
 fi
+if [[ -n "$MAX_QUEUE_DEPTH" ]]; then
+  if ! [[ "$MAX_QUEUE_DEPTH" =~ ^[0-9]+$ ]] || [[ "$MAX_QUEUE_DEPTH" -lt 1 ]]; then
+    echo "error: --max-queue-depth must be a positive integer (got '$MAX_QUEUE_DEPTH')" >&2
+    usage; exit 1
+  fi
+fi
+SKIP_KEYSPACE_CHECK="$(tr '[:upper:]' '[:lower:]' <<< "$SKIP_KEYSPACE_CHECK")"
+RECONCILIATION_SIGNALS="$(tr '[:upper:]' '[:lower:]' <<< "$RECONCILIATION_SIGNALS")"
 SOURCE_CONNECTION_MODE="$(tr '[:upper:]' '[:lower:]' <<< "$SOURCE_CONNECTION_MODE")"
 TARGET_CONNECTION_MODE="$(tr '[:upper:]' '[:lower:]' <<< "$TARGET_CONNECTION_MODE")"
 case "$SOURCE_CONNECTION_MODE" in
@@ -477,7 +548,7 @@ redis_dbsize() {
 }
 
 echo "=================================================="
-echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 1/8: Validating source and target connectivity, detecting server type"
+echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 1/9: Validating source and target connectivity, detecting server type, checking keyspace notifications"
 echo "=================================================="
 # Retried rather than one-shot because a single PING is too thin a thread to hang the whole
 # migration on: this exact check has failed against a healthy remote host and then succeeded
@@ -579,9 +650,31 @@ fi
 echo "  source currently has $SOURCE_DBSIZE_START keys"
 echo "  target currently has $TARGET_DBSIZE_START keys"
 
+if [[ "$SKIP_KEYSPACE_CHECK" != "true" ]]; then
+  KEYSPACE_CHECK_RC=0
+  KEYSPACE_EVENTS_VALUE="$(redis_lib_check_keyspace_events "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")" || KEYSPACE_CHECK_RC=$?
+  if [[ $KEYSPACE_CHECK_RC -eq 0 ]]; then
+    echo "  source keyspace notifications: OK"
+  else
+    echo "error: the source's notify-keyspace-events is '${KEYSPACE_EVENTS_VALUE:-<empty>}' - the Live Phase needs it to contain both 'A' (every key-event class) and 'E' (keyevent channels), or it sees nothing at all" >&2
+    echo "       Enable it with: CONFIG SET notify-keyspace-events AE" >&2
+    echo "       Managed services (ElastiCache, MemoryDB and friends) reject CONFIG SET - set the" >&2
+    echo "       equivalent parameter-group value there instead and wait for it to apply." >&2
+    echo "       The setting must also persist across restarts (redis.conf / the parameter group," >&2
+    echo "       not just a runtime CONFIG SET): a source that loses it on a failover silently" >&2
+    echo "       stops feeding the Live Phase, with no error on either side." >&2
+    echo "       --skip-keyspace-check bypasses this check, but it doesn't make the requirement go" >&2
+    echo "       away - it just moves the failure to STAGE 8, where a misconfigured source shows up" >&2
+    echo "       only as a NiFi bulletin on a processor that never reaches RUNNING." >&2
+    exit 1
+  fi
+else
+  echo "warning: --skip-keyspace-check given - the source's notify-keyspace-events setting was not verified. If it doesn't contain both 'A' and 'E', RedisKeyspaceEventConsumer will fail at schedule time in STAGE 8 instead." >&2
+fi
+
 echo
 echo "=================================================="
-echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 2/8: Container resources and migration parallelism"
+echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 2/9: Container resources and migration parallelism"
 echo "=================================================="
 if [[ "$RESOURCE_FLAGS_GIVEN" != "true" && "$ASSUME_DEFAULTS" != "true" ]]; then
   if [[ -t 0 ]]; then
@@ -609,7 +702,7 @@ echo "  cpus=${NIFI_CPUS:-<none>}  memory=${NIFI_MEMORY:-<none>}  parallelism=$P
 
 echo
 echo "=================================================="
-echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 3/8: Starting NiFi and deploying the processor NAR"
+echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 3/9: Starting NiFi and deploying the processor NAR"
 echo "=================================================="
 "$PROJECT_ROOT/scripts/deploy-to-nifi.sh"
 
@@ -690,7 +783,7 @@ nifi_lib_save_state "$NIFI_CONTAINER_NAME" "$NIFI_STATE_FILE_PATH" \
 
 echo
 echo "=================================================="
-echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 4/8: Adapting localhost URLs for the NiFi container"
+echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 4/9: Adapting localhost URLs for the NiFi container"
 echo "=================================================="
 # NiFi runs in its own container with its own network namespace, so "localhost"/"127.0.0.1"
 # in a connection string means "the host machine" from where this script runs, but means
@@ -790,7 +883,7 @@ TARGET_CONNECTION_STRING="$(adapt_connection_string_for_nifi target "$TARGET_CON
 
 echo
 echo "=================================================="
-echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 5/8: Authenticating with NiFi"
+echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 5/9: Authenticating with NiFi"
 echo "=================================================="
 echo "  authenticated as $NIFI_USER"
 CONTAINER_NAME="$NIFI_CONTAINER_NAME"
@@ -798,8 +891,13 @@ nifi_lib_init
 
 echo
 echo "=================================================="
-echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 6/8: Checking for a pre-existing migration"
+echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 6/9: Checking for a pre-existing migration"
 echo "=================================================="
+# This has to happen BEFORE the Live Phase is wired and started (STAGES 7 and 8): clearing a
+# pre-existing migration drops every queued FlowFile in the process group, and the Live Phase's
+# captured keyspace events sit in those same queues. Run it afterwards and it would throw away
+# exactly the events the Live Phase exists to collect.
+#
 # `|| true` throughout STAGE 6: under set -e/pipefail, a transient NiFi API hiccup would
 # otherwise abort the script silently at whichever assignment hit it, before the deliberate
 # error checks below (or the equally deliberate "no queue" fallback) ever get a chance to run.
@@ -889,7 +987,100 @@ fi
 
 echo
 echo "=================================================="
-echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 7/8: Configuring and starting the migration"
+echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 7/9: Wiring the Live Phase"
+echo "=================================================="
+# --no-export-baseline: the builder can write the project's own artifacts/r2dfly.json baseline as
+# a side effect, and a user's migration run has no business rewriting a checked-in project
+# artifact. An export taken mid-run would also have this run's connection strings, parallelism and
+# Live Phase tuning baked into it, which is not what that baseline is supposed to represent.
+BUILD_LIVE_ARGS=()
+[[ "$RECONCILIATION_SIGNALS" == "true" ]] && BUILD_LIVE_ARGS+=(--reconciliation-signals)
+# ${arr+"${arr[@]}"}: expanding an empty array as "${arr[@]}" is an unbound-variable error under
+# set -u on bash 3.2, the same trap the --toml-file filtering above guards against.
+"$PROJECT_ROOT/scripts/build-live-phase-flow.sh" \
+  --nifi-container "$NIFI_CONTAINER_NAME" \
+  --nifi-user "$NIFI_USER" --nifi-password "$NIFI_PASS" \
+  --no-export-baseline ${BUILD_LIVE_ARGS+"${BUILD_LIVE_ARGS[@]}"}
+
+# One pass over the processor list for all three ids (instead of three separate py3 invocations
+# re-parsing the same JSON) - each py3 call is a container exec via the toolbox, not free.
+# Pre-seeding every name to '' keeps the '|'-joined field count constant, so the read below
+# always lands each id in the right variable even when one processor is missing.
+LIVE_PROC_LIST_JSON="$(nifi_api_get "process-groups/$PG_ID/processors")" || true
+LIVE_PROC_IDS="$(echo "$LIVE_PROC_LIST_JSON" | py3 "
+import json, sys
+d = json.load(sys.stdin)
+order = ['RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'DeleteRedisKey']
+ids = {name: '' for name in order}
+for p in d['processors']:
+    t = p['component']['type']
+    for name in order:
+        if not ids[name] and t.endswith(name):
+            ids[name] = p['component']['id']
+            break
+print('|'.join(ids[name] for name in order))
+")" || true
+IFS='|' read -r PROC_KEYSPACE PROC_FETCH PROC_DELETE <<< "$LIVE_PROC_IDS"
+if [[ -z "$PROC_KEYSPACE" ]]; then
+  echo "error: could not find the RedisKeyspaceEventConsumer processor in $PG_ID - build-live-phase-flow.sh should have created it" >&2; exit 1
+fi
+if [[ -z "$PROC_FETCH" ]]; then
+  echo "error: could not find the RedisSingleKeyFetch processor in $PG_ID - build-live-phase-flow.sh should have created it" >&2; exit 1
+fi
+if [[ -z "$PROC_DELETE" ]]; then
+  echo "error: could not find the DeleteRedisKey processor in $PG_ID - build-live-phase-flow.sh should have created it" >&2; exit 1
+fi
+
+# json_or_null <value> - "null" (unquoted, NiFi's way of explicitly clearing an optional property
+# back to its own default) or the value quoted as a JSON string. NiFi's processor-property PUT is
+# a partial merge, not a full replace: a key simply absent from the body leaves whatever value a
+# PREVIOUS run left there untouched. All three Live Phase properties below are optional, so each
+# one goes into every PUT body one way or the other - otherwise an unset --keyspace-pattern would
+# silently inherit a narrow pattern some earlier run set, and the Live Phase would quietly see
+# only part of the keyspace with nothing logged as wrong.
+json_or_null() {
+  if [[ -n "$1" ]]; then echo "\"$1\""; else echo "null"; fi
+}
+
+# nifi_api_put_checked <path> <body> - like nifi_api_put, but treats a non-JSON response (NiFi
+# returns a plain-text body, not JSON, for some rejections - e.g. "Cannot modify configuration
+# of ... because it is currently not disabled") as a hard failure instead of silently discarding
+# it.
+nifi_api_put_checked() {
+  local path="$1" body="$2" resp
+  # `|| true`: a bare connectivity failure here (as opposed to a non-JSON rejection body, which
+  # this function exists to catch) would otherwise abort the script via set -e before ever
+  # reaching this function's own check below - an empty $resp fails that same json.load check
+  # anyway, so it cascades into the same "PUT ... was rejected" error correctly.
+  resp="$(nifi_api_put "$path" "$body")" || true
+  if ! echo "$resp" | py3 "import json,sys; json.load(sys.stdin)" >/dev/null 2>&1; then
+    echo "error: PUT $path was rejected: $resp" >&2
+    exit 1
+  fi
+  echo "$resp"
+}
+
+echo "  keyspace-pattern=${KEYSPACE_PATTERN:-<processor default>}  event-types=${EVENT_TYPES:-<all>}  max-queue-depth=${MAX_QUEUE_DEPTH:-<processor default>}"
+CONSUMER_VER="$(nifi_current_version "processors/$PROC_KEYSPACE")" || true
+LIVE_PROPS="\"keyspace-pattern\":$(json_or_null "$KEYSPACE_PATTERN")"
+LIVE_PROPS="$LIVE_PROPS,\"event-types\":$(json_or_null "$EVENT_TYPES")"
+LIVE_PROPS="$LIVE_PROPS,\"max-queue-depth\":$(json_or_null "$MAX_QUEUE_DEPTH")"
+LIVE_BODY="{\"revision\":{\"version\":$CONSUMER_VER},\"component\":{\"id\":\"$PROC_KEYSPACE\",\"config\":{\"properties\":{$LIVE_PROPS}}}}"
+nifi_api_put_checked "processors/$PROC_KEYSPACE" "$LIVE_BODY" > /dev/null
+
+# Wired, not started. The two connection-pool controller services these processors depend on are
+# still blank and DISABLED at this point - deploy-to-nifi.sh leaves them that way deliberately
+# (its "the two connection-pool services are expected to stay DISABLED/INVALID here" comment), and
+# nothing configures or enables them until STAGE 8's run-r2dfly.sh does. NiFi refuses to start a
+# processor whose required controller service is disabled and reports it INVALID, so trying to
+# start the Live Phase here would fail outright on a first run. run-r2dfly.sh's own pg-start
+# brings the whole process group up at the end, the three Live Phase processors included, which
+# is where they actually come alive.
+echo "  Live Phase wired - it starts with the rest of the flow in STAGE 8, once the connection pools are configured and enabled"
+
+echo
+echo "=================================================="
+echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 8/9: Initial snapshot and Live Phase start"
 echo "=================================================="
 RUN_ARGS=(
   --nifi-container "$NIFI_CONTAINER_NAME"
@@ -925,18 +1116,142 @@ RUN_ARGS=(
 
 "$PROJECT_ROOT/scripts/run-r2dfly.sh" "${RUN_ARGS[@]}"
 
+processor_run_status() {
+  nifi_api_get "processors/$1" | py3 "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('status', {}).get('runStatus', ''))
+"
+}
+
+# report_processor_failure <proc-id> <label> - dumps both validation errors AND recent bulletins
+# for a processor that wouldn't start. Bulletins are the load-bearing half: a processor whose
+# @OnScheduled throws never reaches RUNNING and has no validation errors at all, which is exactly
+# what RedisKeyspaceEventConsumer does when the source's notify-keyspace-events setting is wrong.
+# Without the bulletins that failure looks like a bare timeout with nothing to act on.
+report_processor_failure() {
+  local proc_id="$1" label="$2"
+  echo "  $label validation errors:" >&2
+  nifi_api_get "processors/$proc_id" | py3 "
+import json, sys
+d = json.load(sys.stdin)
+errs = d.get('component', {}).get('validationErrors') or []
+for e in errs:
+    print(f'    {e}')
+if not errs:
+    print('    (none reported - see the bulletins below)')
+" >&2 || true
+  echo "  $label recent bulletins:" >&2
+  nifi_api_get "flow/bulletin-board?limit=100" | py3 "
+import json, sys
+d = json.load(sys.stdin)
+found = False
+for b in d.get('bulletinBoard', {}).get('bulletins', []):
+    inner = b.get('bulletin', {})
+    if b.get('sourceId') == '$proc_id' or inner.get('sourceId') == '$proc_id':
+        found = True
+        print(f\"    [{inner.get('level', '')}] {inner.get('timestamp', '')} {inner.get('message', '')}\")
+if not found:
+    print('    (none)')
+" >&2 || true
+}
+
+# start_and_wait_running <proc-id> <label> [timeout-seconds] - starts a processor and polls until
+# NiFi actually reports it Running. The revision is re-read immediately before the write because
+# every write to a component increments it and a stale one is rejected outright. Returns 1 on
+# timeout so the caller decides what a failure means.
+start_and_wait_running() {
+  local proc_id="$1" label="$2" timeout="${3:-60}" waited=0 ver status
+  ver="$(nifi_current_version "processors/$proc_id")" || true
+  nifi_api_put "processors/$proc_id/run-status" "{\"revision\":{\"version\":$ver},\"state\":\"RUNNING\",\"disconnectedNodeAcknowledged\":false}" > /dev/null
+  while true; do
+    status="$(processor_run_status "$proc_id")" || status=""
+    if [[ "$status" == "Running" ]]; then
+      echo "  $label: Running"
+      return 0
+    fi
+    if [[ "$waited" -ge "$timeout" ]]; then
+      echo "error: $label did not reach RUNNING within ${timeout}s (last status: ${status:-unknown})" >&2
+      return 1
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+}
+
+# run-r2dfly.sh stops the WHOLE process group to apply its configuration (`nifi_cli pg-stop -pgid
+# $PG_ID`, its line 727) and starts it again at the end (`pg-start`, its line 1304), so the Live
+# Phase comes up underneath this script rather than by anything here. This pass confirms it
+# actually did, instead of assuming it. Checked downstream-first, and anything still stopped is
+# started in that same order, so the consumer never emits a keyspace event into a chain whose next
+# processor is stopped.
+echo
+echo "  verifying the Live Phase came up with the flow"
+for live_proc in "$PROC_DELETE:DeleteRedisKey" "$PROC_FETCH:RedisSingleKeyFetch" "$PROC_KEYSPACE:RedisKeyspaceEventConsumer"; do
+  LIVE_PROC_ID="${live_proc%%:*}"
+  LIVE_PROC_LABEL="${live_proc#*:}"
+  LIVE_PROC_STATUS="$(processor_run_status "$LIVE_PROC_ID")" || LIVE_PROC_STATUS=""
+  if [[ "$LIVE_PROC_STATUS" == "Running" ]]; then
+    echo "  $LIVE_PROC_LABEL: Running"
+    continue
+  fi
+  echo "  $LIVE_PROC_LABEL: ${LIVE_PROC_STATUS:-unknown} - starting it"
+  # A hard failure, never a warning: a consumer that silently isn't running is precisely the
+  # failure continuous mode exists to avoid, and it would look identical to a quiet source.
+  if ! start_and_wait_running "$LIVE_PROC_ID" "$LIVE_PROC_LABEL"; then
+    report_processor_failure "$LIVE_PROC_ID" "$LIVE_PROC_LABEL"
+    echo "error: the Live Phase is not running, so source changes are NOT being applied to the target. The initial snapshot above did complete. Run diagnose-r2dfly.sh for the full component state." >&2
+    exit 1
+  fi
+done
+
 echo
 echo "=================================================="
-echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 8/8: Migration summary"
+echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 9/9: Migration summary"
 echo "=================================================="
 SOURCE_DBSIZE_END="$(get_dbsize "$SOURCE_CONNECTION_MODE" "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")"
 TARGET_DBSIZE_END="$(get_dbsize "$TARGET_CONNECTION_MODE" "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING")"
 MIGRATED=$(( TARGET_DBSIZE_END - TARGET_DBSIZE_START ))
-echo "  mode: snapshot (one-time copy, not an ongoing sync)"
+echo "  mode: continuous"
 echo "  source keys: $SOURCE_DBSIZE_END"
 echo "  target keys: $TARGET_DBSIZE_END (was $TARGET_DBSIZE_START before this run)"
 echo "  keys migrated this run: $MIGRATED"
-echo "  changes made on the source after this run started are NOT reflected on the target."
+echo "  the initial snapshot is complete, and the Live Phase is still running."
+echo "  NiFi keeps running unsupervised after this script exits, and the Live Phase keeps applying"
+echo "  source changes to the target until it is stopped."
+echo
+echo "  LIMITATIONS - these are real, and none of them are repaired automatically:"
+echo "    1. Continuous mode captures ongoing changes but does not yet self-heal a dropped"
+echo "       connection's gap. If the keyspace pub/sub connection drops, events during the outage"
+echo "       are lost; the consumer records 'Keyspace Pub/Sub Disconnects' and 'Keyspace Pub/Sub"
+echo "       Downtime (ms)' counters so the gap is visible, but nothing repairs it. The"
+echo "       reconciliation/repair pass this would depend on is not built."
+echo "    2. If the consumer's internal queue fills (--max-queue-depth), events are dropped and"
+echo "       counted as 'Keyspace Events Dropped (Queue Full)'. Also not repaired."
+echo "    3. During the initial snapshot the Live Phase and the scanner both write to the target."
+echo "       The live path fetches the key's CURRENT value, so a live update can be overwritten by"
+echo "       the scanner's older in-flight batch for the same key. That key stays stale until it"
+echo "       changes again. This is a known narrow window in this first wiring pass."
+echo "    4. Cluster topology drift is detected and counted but the topology_drift relationship is"
+echo "       auto-terminated - nothing acts on it."
+echo "    5. The Live Phase starts together with the initial scan, when run-r2dfly.sh starts the"
+echo "       flow, so changes made on the source between this script starting and that moment are"
+echo "       not captured by the Live Phase (the initial snapshot covers whatever is on the source"
+echo "       when it scans). Additionally, run-r2dfly.sh stops and starts the whole process group"
+echo "       to apply configuration, so re-running a migration against a flow whose Live Phase was"
+echo "       already running tears the pub/sub subscription down for that reconfigure window, and"
+echo "       events during it are lost."
+echo "    6. RedisBatchWriter batches its writes: its deployed defaults are batch-size 50 and"
+echo "       batch-timeout-ms 30000, so a single live change can wait up to 30 seconds on the"
+echo "       target before it lands. That is throughput tuning, not a correctness bug, but it"
+echo "       means 'continuous' is not 'immediate'."
+echo "    7. RedisSingleKeyFetch's module_type relationship is auto-terminated, not routed to"
+echo "       ModuleTypeHandler. A live change to a non-core-type key (ReJSON-RL, TopK-TYPE, and"
+echo "       other module types) is silently dropped - no counter, no bulletin. This only affects"
+echo "       changes made DURING continuous mode; the initial snapshot handles these types fully."
+echo
+echo "  Stop the Live Phase with:"
+echo "    ./stop-continuous-migration.sh --nifi-container $NIFI_CONTAINER_NAME --nifi-user $NIFI_USER --nifi-password <the password you used>"
 
 echo
 echo "Run simple-troubleshoot.sh if there appears to be any issue with the migration."

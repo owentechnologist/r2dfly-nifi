@@ -145,11 +145,16 @@ import json, sys
 d = json.load(sys.stdin)
 snap = d['processGroupStatus']['aggregateSnapshot']
 print('  processors:')
-for p in snap.get('processorStatusSnapshot', []):
+for p in snap.get('processorStatusSnapshots', []):
     s = p['processorStatusSnapshot']
     print(f\"    {s['name']:24s} runStatus={s.get('runStatus'):10s} in={s['flowFilesIn']:>6}/{s['bytesIn']:>10}B  out={s['flowFilesOut']:>6}/{s['bytesOut']:>10}B  tasks={s['tasksCompleted']} activeThreads={s.get('activeThreadCount')}\")
 print('  queues (a queue stuck at a fixed non-zero count means the downstream processor is stalled):')
-connections = snap.get('connectionStatusSnapshot', [])
+# The outer keys NiFi returns are plural (ProcessGroupStatusSnapshotDTO declares
+# processorStatusSnapshots/connectionStatusSnapshots); only the per-entity wrapper inside each
+# list item is singular. Reading the singular name here made this whole section silently print
+# nothing - no processors at all, and the all-clear queue message below however backed up the
+# flow really was, which is the opposite of what a diagnostic should do during an incident.
+connections = snap.get('connectionStatusSnapshots', [])
 anything_queued = False
 for c in connections:
     s = c['connectionStatusSnapshot']

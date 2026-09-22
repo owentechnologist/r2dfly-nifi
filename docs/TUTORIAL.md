@@ -61,7 +61,9 @@ own normal indexing as matching documents are written during the migration). Cov
 `TEXT`/`NUMERIC`/`TAG`/`GEO`/`VECTOR` fields, including `ON JSON` indexes and `AS` aliases; a
 `VECTOR` field is skipped only if `FT.INFO` doesn't report a reconstructable algorithm/
 data_type/dim/distance_metric for it, with a warning. Pass `--ignore-search-indexes` to skip
-search index migration entirely.
+search index migration entirely. An index the target already has is left as-is unless you pass
+`--index-overwrite true`, which drops it (`FT.DROPINDEX`) and recreates it from the source's
+definition; either way the conflict is logged as an error, since the two definitions may differ.
 
 ## Prerequisites
 

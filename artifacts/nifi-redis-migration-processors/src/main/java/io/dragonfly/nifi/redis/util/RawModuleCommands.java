@@ -33,7 +33,7 @@ public final class RawModuleCommands {
         JSON_GET("JSON.GET"), JSON_SET("JSON.SET"),
         TOPK_RESERVE("TOPK.RESERVE"), TOPK_ADD("TOPK.ADD"), TOPK_INCRBY("TOPK.INCRBY"),
         TOPK_LIST("TOPK.LIST"), TOPK_INFO("TOPK.INFO"),
-        FT_LIST("FT._LIST"), FT_INFO("FT.INFO"), FT_CREATE("FT.CREATE");
+        FT_LIST("FT._LIST"), FT_INFO("FT.INFO"), FT_CREATE("FT.CREATE"), FT_DROPINDEX("FT.DROPINDEX");
 
         private final byte[] bytes;
 
@@ -149,6 +149,14 @@ public final class RawModuleCommands {
     public static CompletableFuture<String> ftCreate(StatefulConnection<byte[], byte[]> conn, List<byte[]> ftCreateArgs) {
         CommandArgs<byte[], byte[]> args = new CommandArgs<>(ByteArrayCodec.INSTANCE).addValues(ftCreateArgs);
         return dispatch(conn, ModuleCommand.FT_CREATE, new StatusOutput<>(ByteArrayCodec.INSTANCE), args);
+    }
+
+    /** Issues {@code FT.DROPINDEX <indexName>} to remove an existing index before recreating it,
+     * under {@code SearchIndexRehydrator}'s overwrite mode - the index's documents are left
+     * alone, only the index itself is dropped. */
+    public static CompletableFuture<String> ftDropIndex(StatefulConnection<byte[], byte[]> conn, byte[] indexName) {
+        CommandArgs<byte[], byte[]> args = new CommandArgs<>(ByteArrayCodec.INSTANCE).addValue(indexName);
+        return dispatch(conn, ModuleCommand.FT_DROPINDEX, new StatusOutput<>(ByteArrayCodec.INSTANCE), args);
     }
 
     private static Map<String, String> toFlatMap(List<Object> flat) {

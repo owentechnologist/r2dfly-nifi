@@ -58,6 +58,30 @@
         <scope>provided</scope>
       </dependency>
       <dependency>
+        <groupId>org.apache.nifi</groupId>
+        <artifactId>nifi-record-serialization-service-api</artifactId>
+        <version>${nifi.version}</version>
+        <scope>provided</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.nifi</groupId>
+        <artifactId>nifi-dbcp-service-api</artifactId>
+        <version>${nifi.version}</version>
+        <scope>provided</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.nifi</groupId>
+        <artifactId>nifi-record-path</artifactId>
+        <version>${nifi.version}</version>
+        <scope>provided</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.nifi</groupId>
+        <artifactId>nifi-mock-record-utils</artifactId>
+        <version>${nifi.version}</version>
+        <scope>test</scope>
+      </dependency>
+      <dependency>
         <groupId>io.lettuce</groupId>
         <artifactId>lettuce-core</artifactId>
         <version>${lettuce.version}</version>
@@ -89,6 +113,12 @@
         <groupId>org.testcontainers</groupId>
         <artifactId>testcontainers-junit-jupiter</artifactId>
         <version>${testcontainers.version}</version>
+        <scope>test</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.h2database</groupId>
+        <artifactId>h2</artifactId>
+        <version>2.3.232</version>
         <scope>test</scope>
       </dependency>
     </dependencies>

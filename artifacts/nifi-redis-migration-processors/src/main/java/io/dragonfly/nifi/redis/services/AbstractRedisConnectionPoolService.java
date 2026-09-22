@@ -1,5 +1,6 @@
 package io.dragonfly.nifi.redis.services;
 
+import io.dragonfly.nifi.redis.util.ClusterTopologySnapshot;
 import io.lettuce.core.ClientOptions;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.RedisURI;
@@ -11,6 +12,7 @@ import io.lettuce.core.cluster.ClusterTopologyRefreshOptions;
 import io.lettuce.core.cluster.RedisClusterClient;
 import io.lettuce.core.cluster.api.StatefulRedisClusterConnection;
 import io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands;
+import io.lettuce.core.cluster.models.partitions.RedisClusterNode;
 import io.lettuce.core.codec.ByteArrayCodec;
 import io.lettuce.core.support.ConnectionPoolSupport;
 import org.apache.commons.pool2.impl.GenericObjectPool;
@@ -31,6 +33,9 @@ import java.io.File;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 
 /**
@@ -259,8 +264,53 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
         }
     }
 
+    public <T> T withConnectionAndRaw(BiFunction<RedisClusterAsyncCommands<byte[], byte[]>, StatefulConnection<byte[], byte[]>, T> fn) {
+        if (clusterMode) {
+            try (StatefulRedisClusterConnection<byte[], byte[]> connection = borrow(clusterPool)) {
+                return fn.apply(connection.async(), connection);
+            }
+        } else {
+            try (StatefulRedisConnection<byte[], byte[]> connection = borrow(standalonePool)) {
+                return fn.apply(connection.async(), connection);
+            }
+        }
+    }
+
     public boolean isClusterMode() {
         return clusterMode;
+    }
+
+    /**
+     * Reads Lettuce's own partition table, which this client keeps current through
+     * {@code enableAllAdaptiveRefreshTriggers()} - no command is issued and no refresh is needed.
+     */
+    public Optional<ClusterTopologySnapshot> currentTopology() {
+        if (!clusterMode) {
+            return Optional.empty();
+        }
+        List<ClusterTopologySnapshot.MasterNode> masters = new ArrayList<>();
+        for (RedisClusterNode node : redisClusterClient.getPartitions()) {
+            if (!isServingMaster(node)) {
+                continue;
+            }
+            masters.add(new ClusterTopologySnapshot.MasterNode(
+                    node.getNodeId(), node.getUri().getHost(), node.getUri().getPort(), Set.copyOf(node.getSlots())));
+        }
+        return Optional.of(ClusterTopologySnapshot.of(System.currentTimeMillis(), masters));
+    }
+
+    /**
+     * A master flagged FAIL/EVENTUAL_FAIL/HANDSHAKE/NOADDR is either not serving or has no usable
+     * address, so counting it as current would report a spurious critical drift during a routine
+     * failover. Slot count is deliberately not a filter: a slotless new master is still a master
+     * the open subscription never subscribed to.
+     */
+    private static boolean isServingMaster(RedisClusterNode node) {
+        return node.is(RedisClusterNode.NodeFlag.MASTER)
+                && !node.is(RedisClusterNode.NodeFlag.FAIL)
+                && !node.is(RedisClusterNode.NodeFlag.EVENTUAL_FAIL)
+                && !node.is(RedisClusterNode.NodeFlag.HANDSHAKE)
+                && !node.is(RedisClusterNode.NodeFlag.NOADDR);
     }
 
     /**

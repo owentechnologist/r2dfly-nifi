@@ -10,7 +10,11 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  * {@code value}'s shape depends on {@code type}: a String for {@code string}, a
  * {@code Map<String,String>} for {@code hash}, a {@code List<String>} for {@code list}/
  * {@code set}, a {@code List<Map<String,Object>>} of {@code {member,score}} for {@code zset},
- * and a {@code List<Map<String,Object>>} of {@code {id,fields}} for {@code stream}.
+ * a {@code List<Map<String,Object>>} of {@code {id,fields}} for {@code stream}, and - for a
+ * key written as a native Dragonfly JSON document rather than sourced from Redis - {@code json},
+ * in which case {@code value} is the parsed JSON document itself (whatever Jackson's untyped
+ * {@code Object} binding produces: {@code Map<String,Object>}/{@code List<Object>}/
+ * {@code String}/{@code Number}/{@code Boolean}/{@code null}), not a pre-encoded JSON string.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class KeyRecord {

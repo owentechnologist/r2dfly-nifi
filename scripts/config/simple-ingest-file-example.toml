@@ -1,0 +1,27 @@
+[source]
+type = "local"                    # "local" | "s3"
+path = "/absolute/path/to/orders.tsv"   # local: a file, or a directory (with file-filter below to pick from it)
+                                   # s3: the object key (exact file), or a prefix (with file-filter to pick from it)
+file-type = "tsv"                 # "tsv" | "csv" | "custom"
+#delimiter = "|"                  # only when file-type = "custom"
+#file-filter = "orders-2024\\.tsv"  # regex; defaults to an exact match of path's own final component
+
+# s3-only settings (ignored when type = "local"):
+#bucket = "my-bucket"
+#endpoint-override = "https://minio.example.com"   # omit for real AWS
+#region = "us-east-1"              # required by the AWS SDK even off-AWS; consult your provider's docs
+#access-key-id = "..."
+#secret-access-key = "..."
+#path-style-access = true          # default true; most non-AWS S3-compatible stores need this
+
+[record]
+primary-key = "id"                # a field name from the source file's header row
+target-type = "hash"               # "hash" | "json"
+key-prefix = "orders"
+
+[dragonfly]
+connection-string = "redis://target-dragonfly:6379"   # rediss:// auto-enables TLS
+container = "target-dragonfly"
+
+[nifi]
+container = "nifi-redis-migration"

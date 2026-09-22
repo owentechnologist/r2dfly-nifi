@@ -122,6 +122,13 @@ Scan behavior:
                                  FT.INFO didn't report a reconstructable algorithm/data_type/
                                  dim/distance_metric for is skipped, with a warning, but that's
                                  the only case that's not currently migrated.
+  --index-overwrite BOOL         whether SearchIndexRehydrator rebuilds a target index that
+                                 already exists (env INDEX_OVERWRITE, default: false): true
+                                 drops it with FT.DROPINDEX and recreates it with FT.CREATE from
+                                 the source's cached definition, false leaves the pre-existing
+                                 target index as-is. Either way the conflict is logged as an
+                                 error on the NiFi side, since it means the source and target
+                                 definitions may differ.
 
 Target:
   --target-connection-string S   same format as above (env TARGET_CONNECTION_STRING)
@@ -299,6 +306,7 @@ PREFIX_ONLY_LIST="${PREFIX_ONLY_LIST:-}"
 MIGRATION_ID="${MIGRATION_ID:-}"
 TOPK_MODE="${TOPK_MODE:-exact}"
 IGNORE_SEARCH_INDEXES="${IGNORE_SEARCH_INDEXES:-false}"
+INDEX_OVERWRITE="${INDEX_OVERWRITE:-false}"
 BATCH_SIZE="${BATCH_SIZE:-50}"
 BATCH_SIZE_STRING="${BATCH_SIZE_STRING:-}"
 BATCH_SIZE_HASH="${BATCH_SIZE_HASH:-}"
@@ -345,6 +353,7 @@ while [[ $# -gt 0 ]]; do
     --migration-id) MIGRATION_ID="$2"; shift 2 ;;
     --topk-mode) TOPK_MODE="$2"; shift 2 ;;
     --ignore-search-indexes) IGNORE_SEARCH_INDEXES="true"; shift ;;
+    --index-overwrite) INDEX_OVERWRITE="$2"; shift 2 ;;
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
     --batch-size-string) BATCH_SIZE_STRING="$2"; shift 2 ;;
     --batch-size-hash) BATCH_SIZE_HASH="$2"; shift 2 ;;
@@ -576,7 +585,7 @@ echo "==> migration settings for '$MIGRATION_ID':"
 echo "  source-connection-mode=$SOURCE_CONNECTION_MODE  source-require-tls=$SOURCE_REQUIRE_TLS"
 echo "  target-connection-mode=$TARGET_CONNECTION_MODE  target-require-tls=$TARGET_REQUIRE_TLS"
 echo "  key-types=$KEY_TYPES  disallow-key-types=${DISALLOW_KEY_TYPES:-<none>}"
-echo "  topk-mode=$TOPK_MODE  ignore-search-indexes=$IGNORE_SEARCH_INDEXES  dfly-to-dfly=$DFLY_TO_DFLY"
+echo "  topk-mode=$TOPK_MODE  ignore-search-indexes=$IGNORE_SEARCH_INDEXES  index-overwrite=$INDEX_OVERWRITE  dfly-to-dfly=$DFLY_TO_DFLY"
 echo "  prefix-deny-list=${PREFIX_DENY_LIST:-<none>}  prefix-only-list=${PREFIX_ONLY_LIST:-<none>}"
 echo "  parallelism=$PARALLELISM  writer-concurrency=$WRITER_CONCURRENCY"
 echo "  batch-size=$BATCH_SIZE (string=${BATCH_SIZE_STRING:-default} hash=${BATCH_SIZE_HASH:-default} list=${BATCH_SIZE_LIST:-default} set=${BATCH_SIZE_SET:-default} zset=${BATCH_SIZE_ZSET:-default} stream=${BATCH_SIZE_STREAM:-default})  batch-timeout-ms=$BATCH_TIMEOUT_MS"
@@ -665,10 +674,14 @@ fi
 # processor/service has actually finished transitioning - a processor mid-onTrigger() (e.g.
 # RedisScanReader blocked borrowing a connection) keeps running for a while after pg-stop
 # returns. Found in practice: a later property PUT was rejected with "... while the Processor
-# is running" even though pg-stop had already been called and returned successfully. Poll the
-# actual state afterward instead of assuming either command completed synchronously.
+# is running" even though pg-stop had already been called and returned successfully, AND
+# runStatus had already flipped to Stopped - NiFi flips runStatus to Stopped as soon as the
+# scheduler stops issuing new triggers, but rejects a config PUT until every already-running
+# onTrigger() thread actually finishes (activeThreadCount reaches 0), which can lag runStatus
+# by several seconds. Checking runStatus alone is therefore not sufficient; the process
+# group's aggregate activeThreadCount must also be polled down to 0.
 wait_for_processors_stopped() {
-  local pgid="$1" timeout="${2:-30}" waited=0 running rc
+  local pgid="$1" timeout="${2:-30}" waited=0 running threads rc
   while true; do
     # rc is checked explicitly (not just `|| true`'d away) so a transient API failure is treated
     # as "unknown, keep polling" rather than being indistinguishable from `running` legitimately
@@ -682,12 +695,17 @@ import json, sys
 d = json.load(sys.stdin)
 print(','.join(p['component']['name'] for p in d['processors'] if p.get('status', {}).get('runStatus') == 'Running'))
 ")" || rc=$?
-    [[ $rc -eq 0 && -z "$running" ]] && return 0
+    threads="$(nifi_api_get "flow/process-groups/$pgid/status" | py3 "
+import json, sys
+d = json.load(sys.stdin)
+print(d['processGroupStatus']['aggregateSnapshot']['activeThreadCount'])
+")" || rc=$?
+    [[ $rc -eq 0 && -z "$running" && "$threads" == "0" ]] && return 0
     if [[ "$waited" -ge "$timeout" ]]; then
       if [[ $rc -ne 0 ]]; then
         echo "warning: could not confirm processor status after ${timeout}s (NiFi API call failing) - proceeding anyway" >&2
       else
-        echo "warning: still running after ${timeout}s: $running - proceeding anyway (a later property PUT may be rejected)" >&2
+        echo "warning: still running after ${timeout}s: running=[$running] activeThreadCount=$threads - proceeding anyway (a later property PUT may be rejected)" >&2
       fi
       return 1
     fi
@@ -966,20 +984,22 @@ if [[ "$SERVICES_OK" != "true" ]]; then
   echo "warning: one or more controller services are still invalid; the flow will not run cleanly until that's fixed." >&2
 fi
 
-# run_oneshot_processor <proc-id> <label> [timeout-seconds] - sets this run's migration-id on
-# the given processor, starts it, waits for it to reach RUNNING, then stops it again. All the
-# real work for SearchIndexExporter/SearchIndexRehydrator happens once, synchronously, in their
-# own @OnScheduled method - a processor only reaches RUNNING once that returns, so polling for
-# RUNNING is a genuine "did the one-shot work finish" signal, not just "did NiFi accept the
-# request" (same distinction wait_for_processors_stopped's own comment makes for pg-stop).
+# run_oneshot_processor <proc-id> <label> [timeout-seconds] [extra-props] - sets this run's
+# migration-id (plus <extra-props>, a literal ",\"name\":\"value\"" JSON fragment, for whatever
+# else that one processor needs) on the given processor, starts it, waits for it to reach
+# RUNNING, then stops it again. All the real work for SearchIndexExporter/SearchIndexRehydrator
+# happens once, synchronously, in their own @OnScheduled method - a processor only reaches
+# RUNNING once that returns, so polling for RUNNING is a genuine "did the one-shot work finish"
+# signal, not just "did NiFi accept the request" (same distinction wait_for_processors_stopped's
+# own comment makes for pg-stop).
 # Stopping it again afterward resets it to pick up a fresh migration-id (and re-run its
 # @OnScheduled) the next time this script runs. A processor whose @OnScheduled throws never
 # reaches RUNNING - NiFi just keeps retrying it administratively forever - so this gives up after
 # <timeout-seconds> and reports whatever status NiFi currently shows, rather than hanging.
 run_oneshot_processor() {
-  local proc_id="$1" label="$2" timeout="${3:-120}" waited=0 status ver body
+  local proc_id="$1" label="$2" timeout="${3:-120}" extra_props="${4:-}" waited=0 status ver body
   ver="$(nifi_current_version "processors/$proc_id")" || true
-  body="{\"revision\":{\"version\":$ver},\"component\":{\"id\":\"$proc_id\",\"config\":{\"properties\":{\"migration-id\":\"$MIGRATION_ID\"}}}}"
+  body="{\"revision\":{\"version\":$ver},\"component\":{\"id\":\"$proc_id\",\"config\":{\"properties\":{\"migration-id\":\"$MIGRATION_ID\"$extra_props}}}}"
   nifi_api_put_checked "processors/$proc_id" "$body" > /dev/null
 
   ver="$(nifi_current_version "processors/$proc_id")" || true
@@ -1019,7 +1039,7 @@ if [[ "$IGNORE_SEARCH_INDEXES" != "true" ]]; then
     echo "==> exporting search index definitions on the source (SearchIndexExporter)"
     run_oneshot_processor "$PROC_SIDX_EXPORT" "SearchIndexExporter" || true
     echo "==> rebuilding search indexes on the target (SearchIndexRehydrator)"
-    run_oneshot_processor "$PROC_SIDX_REHYDRATE" "SearchIndexRehydrator" || true
+    run_oneshot_processor "$PROC_SIDX_REHYDRATE" "SearchIndexRehydrator" "" ",\"index-overwrite\":\"$INDEX_OVERWRITE\"" || true
   else
     echo "warning: SearchIndexExporter/SearchIndexRehydrator not found in this flow (older flow definition?) - search index migration skipped. Delete and re-import the process group (reset-r2dfly-flow.sh, then deploy-to-nifi.sh) to pick them up, or pass --ignore-search-indexes to silence this." >&2
   fi

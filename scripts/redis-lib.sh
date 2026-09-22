@@ -92,7 +92,7 @@ redis_cli() {
   return "$fallback_rc"
 }
 
-# The five functions below are defined after redis_cli rather than next to the extract_host/
+# The six functions below are defined after redis_cli rather than next to the extract_host/
 # extract_port string helpers above because they're all built on it - they query a live server.
 
 # redis_lib_detect_product_kind <container> <connstr> -> "dragonfly:<version>", "valkey:<version>",
@@ -175,6 +175,29 @@ redis_lib_count_search_indexes() {
   count="$(tr -d '[:space:]' <<< "$count")"
   [[ "$count" =~ ^[0-9]+$ ]] || count=0
   echo "$count"
+}
+
+# redis_lib_check_keyspace_events <container> <connstr> -> returns 0 if the server publishes the
+# keyspace notifications RedisKeyspaceEventConsumer needs, else echoes the server's current
+# notify-keyspace-events value (empty string included - that's what a server with notifications off
+# reports) and returns 1. CONFIG GET replies with two lines, the parameter name then its value, so
+# the value is line 2.
+# The test is "contains A AND contains E", which is exactly what that processor's @OnScheduled
+# checks before it will start. Its own error message suggests a narrower class set ('K' or the
+# individual g$lshzxet type classes, plus 'E') would do, but its code accepts nothing but a value
+# holding both characters - matching the code rather than the message is deliberate, because a
+# server configured from that message would pass this check and then fail to schedule.
+redis_lib_check_keyspace_events() {
+  local container="$1" connstr="$2" out value
+  # `|| true`: an unreachable server here must fall through to the "value doesn't qualify" return
+  # below (the caller reports it) rather than aborting the calling script under set -e/pipefail.
+  out="$(redis_cli "$container" "$connstr" CONFIG GET notify-keyspace-events 2>/dev/null | tr -d '\r')" || true
+  value="$(sed -n '2p' <<< "$out")"
+  if [[ "$value" == *A* && "$value" == *E* ]]; then
+    return 0
+  fi
+  echo "$value"
+  return 1
 }
 
 # redis_lib_warn_capability_gaps <source_caps> <target_caps> <dfly_to_dfly> <source_index_count>
