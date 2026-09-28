@@ -16,3 +16,5 @@ A migration tool from Redis/Valkey to Dragonfly leveraging Apache NiFi
 [Tutorial](./docs/TUTORIAL.md)
 
 [debugging](./docs/debugging-help.md)
+
+[r2dfly vs. RedisShake](./docs/r2dfly-vs-redisshake.md)

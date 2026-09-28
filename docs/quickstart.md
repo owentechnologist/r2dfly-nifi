@@ -115,6 +115,10 @@ These options apply to `simple-migration.sh` and `continuous-migration.sh` alike
 --writer-concurrency N          concurrent tasks for the write side of the flow (default: 1)
 --key-types LIST               comma-separated Redis types to scan/migrate (see run-r2dfly.sh
                                --help for the full alias/TopK/dfly-to-dfly interaction notes)
+--disallow-key-types LIST       comma-separated Redis types to exclude from whatever
+                               --key-types would otherwise include (accepts the same
+                               type strings/aliases; see run-r2dfly.sh --help for exactly
+                               when this is applied relative to --topk-mode/--dfly-to-dfly)
 --prefix-deny-list LIST         comma-separated key prefixes to exclude (see run-r2dfly.sh --help)
 --prefix-only-list LIST         comma-separated key prefixes to exclusively migrate (see
                                run-r2dfly.sh --help)
@@ -180,6 +184,7 @@ writer-concurrency = 5                            # --writer-concurrency
 
 [migration]
 key-types = "string,hash,ReJSON-RL"                # --key-types
+disallow-key-types = ""                            # --disallow-key-types
 prefix-deny-list = ""                              # --prefix-deny-list
 prefix-only-list = ""                              # --prefix-only-list
 topk-mode = "exact"                                # --topk-mode
@@ -192,12 +197,19 @@ yes = true                                         # -y / --yes
 ```
 
 An unrecognized section or key is a warning (likely a typo), not a silent no-op or a hard
-error. Two annotated samples ship in `scripts/config/`:
+error. Several annotated samples ship in `scripts/config/`:
 
 - `source-cluster-hefty-box-config.toml` - a real Redis Cluster source, migrated onto a bigger
   host with parallelism/resources turned up
 - `key-filter-example.toml` - only `hash`/`json`/`string` keys, and only under the
   `accounting:shelter:123`, `pet:detail`, and `geo` prefixes
+- `disallow-key-types-example.toml` - the subtractive counterpart to `key-filter-example.toml`:
+  migrate `--key-types`' own default list except `stream` and Cuckoo Filter keys
+- `per-type-batch-size-example.toml` - shrink `--batch-size`/`--module-batch-size` for one or
+  two expensive types (large zsets, TopK under `--topk-mode exact`) while leaving the rest at
+  the tool's own default
+- `simple-config.toml` - a minimal starter config with the common flags stubbed out and
+  commented alternatives (e.g. a Dragonfly Cloud `rediss://` target) shown inline
 
 ## Disk space and --disable-provenance
 

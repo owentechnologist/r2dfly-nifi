@@ -19,9 +19,9 @@ for ReJSON-RL/TopK keys) — not the live keyspace-notification phase described 
 [`NIFI_REDIS_MIGRATION_SPEC.md`](../artifacts/NIFI_REDIS_MIGRATION_SPEC.md).
 
 `RedisScanReader`'s **Key Type Filter** property controls which types get scanned at all
-(default: `string,hash,list,set,zset,stream,ReJSON-RL,TopK-TYPE`); anything not in that list
-is skipped entirely, not routed anywhere. Non-core types you *do* include (currently
-`ReJSON-RL` and `TopK-TYPE`) go out the `unknown` relationship instead of to
+(default: `string,hash,list,set,zset,stream`); anything not in that list is skipped
+entirely, not routed anywhere. Add `ReJSON-RL`/`TopK-TYPE` to include those non-core types -
+they go out the `unknown` relationship instead of to
 `RedisTypeDeserializer`, since `RedisTypeDeserializer`/`RedisBatchWriter` only know the six
 core Redis types. `ModuleTypeHandler` reads and writes ReJSON-RL keys directly via
 `JSON.GET`/`JSON.SET`, and TopK keys via `TOPK.INFO`/`TOPK.LIST WITHCOUNT`/`TOPK.RESERVE`/
@@ -130,10 +130,12 @@ out.
 
 > **Redeploying after a code change:** NiFi's NAR auto-loader only loads a NAR
 > whose `groupId:artifactId:version` it hasn't seen before. This project pins
-> `1.0.0-SNAPSHOT`, so re-running `./deploy-to-nifi.sh` after editing processor
-> code copies the new NAR in but NiFi silently keeps running the old one. Force
-> a reload with `<docker|podman> restart nifi-redis-migration` after any
-> rebuild where the version didn't change.
+> `1.0.0-SNAPSHOT`, so a rebuilt NAR always has the same coordinate as the one
+> already running. `deploy-to-nifi.sh` handles this for you: it hashes the
+> built NAR, and if it's different from the one already deployed to a
+> container that's already running, it copies the new NAR in and restarts the
+> container automatically so NiFi actually reloads it. You don't need to
+> restart it by hand.
 
 Open `https://localhost:8443/nifi/` in a browser (the trailing slash matters —
 NiFi redirects to it anyway, but going there directly avoids an extra hop;
