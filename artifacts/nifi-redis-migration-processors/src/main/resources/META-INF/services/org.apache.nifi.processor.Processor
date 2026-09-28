@@ -10,3 +10,5 @@ io.dragonfly.nifi.redis.processors.ModuleTypeHandler
 io.dragonfly.nifi.redis.processors.MigrationValidationProcessor
 io.dragonfly.nifi.redis.processors.RecordToKeyRecord
 io.dragonfly.nifi.redis.processors.ExecuteSQLIncremental
+io.dragonfly.nifi.redis.processors.SearchIndexExporter
+io.dragonfly.nifi.redis.processors.SearchIndexRehydrator

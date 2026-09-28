@@ -143,7 +143,7 @@ Redis's `SCAN` command does not support range-based partitioning natively. Imple
 | `Partition Count` | Integer | Total number of partitions — must match `Concurrent Tasks` |
 | `Scan Count` | Integer | `COUNT` hint per SCAN call — default `200` |
 | `Key Pattern` | String | MATCH pattern — default `*` |
-| `Key Type Filter` | Multi-select Enum | Limit to specific types — default all |
+| `Key Type Filter` | Multi-select Enum | Limit to specific types — default `string,hash,list,set,zset,stream` (module types are opt-in) |
 | `Database Index` | Integer | Override pool default — standalone only |
 | `Cursor State Cache` | Controller Service | `DistributedMapCacheClientService` for cursor checkpointing |
 | `Emit TTL` | Boolean | Fetch and attach TTL per key — default `true` |
@@ -284,7 +284,7 @@ For `list`, `value` is an ordered JSON array. For `set`, an unordered JSON array
 | Property | Type | Description |
 | :---- | :---- | :---- |
 | `Dragonfly Connection Pool` | Controller Service | Target `DragonflyConnectionPoolService` |
-| `Batch Size` | Integer | Number of FlowFiles to accumulate before flushing — default `500` |
+| `Batch Size` | Integer | Number of FlowFiles to accumulate before flushing — default `50` |
 | `Batch Timeout (ms)` | Integer | Flush batch after this time even if not full — default `1000` |
 | `Max Pipeline Depth` | Integer | Max outstanding async commands before awaiting completions — default `2000` |
 | `TTL Strategy` | Enum: `PRESERVE`, `STRIP`, `RESET` | How to handle TTLs: preserve from source, strip all, or reset to a fixed offset |
