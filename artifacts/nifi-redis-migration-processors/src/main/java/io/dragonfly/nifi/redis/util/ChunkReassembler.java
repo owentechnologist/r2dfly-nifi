@@ -62,6 +62,15 @@ public final class ChunkReassembler {
             }
             default -> throw new IllegalStateException("Chunking is only supported for hash/list, got: " + first.type);
         };
-        return new KeyRecord(first.key, first.type, first.ttlMs, first.encoding, mergedValue);
+        KeyRecord merged = new KeyRecord(first.key, first.type, first.ttlMs, first.encoding, mergedValue);
+        for (KeyRecord chunk : recordsByIndex.values()) {
+            if (chunk.fieldExpireAtMs != null) {
+                if (merged.fieldExpireAtMs == null) {
+                    merged.fieldExpireAtMs = new LinkedHashMap<>();
+                }
+                merged.fieldExpireAtMs.putAll(chunk.fieldExpireAtMs);
+            }
+        }
+        return merged;
     }
 }

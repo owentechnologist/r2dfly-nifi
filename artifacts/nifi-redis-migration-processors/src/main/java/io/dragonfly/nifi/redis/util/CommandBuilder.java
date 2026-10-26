@@ -5,12 +5,19 @@ import io.lettuce.core.RedisCommandExecutionException;
 import io.lettuce.core.RedisFuture;
 import io.lettuce.core.RestoreArgs;
 import io.lettuce.core.ScoredValue;
+import io.lettuce.core.XClaimArgs;
 import io.lettuce.core.SetArgs;
 import io.lettuce.core.XAddArgs;
 import io.lettuce.core.XGroupCreateArgs;
 import io.lettuce.core.XReadArgs;
 import io.lettuce.core.api.StatefulConnection;
 import io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands;
+import io.lettuce.core.codec.ByteArrayCodec;
+import io.lettuce.core.output.ArrayOutput;
+import io.lettuce.core.output.IntegerListOutput;
+import io.lettuce.core.output.StatusOutput;
+import io.lettuce.core.protocol.CommandArgs;
+import io.lettuce.core.protocol.ProtocolKeyword;
 
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
@@ -26,12 +33,13 @@ import java.util.concurrent.CompletionException;
  * Builds and dispatches the Dragonfly write command(s) for a {@link KeyRecord}, per spec
  * section 4.3.1 and Appendix B.
  *
- * <p>Stream writes reproduce entries with their original IDs via {@code XADD ... ID}, which
- * also advances the target stream's internal last-id the same way {@code XSETID} would for any
- * copied entry - so {@code XSETID} itself is not issued. The one case that differs is an empty
- * stream whose last-id is ahead of all (trimmed-away) entries; reproducing that exactly would
- * require a raw {@code XSETID} call that Lettuce does not expose as a typed method, so it is
- * treated as an accepted gap rather than reached for via low-level protocol dispatch.
+ * <p>Stream writes reproduce entries with their original IDs, then each group at its
+ * last-delivered-id and entries-read, then the source's last-generated-id, then each consumer and
+ * each pending entry with its owner, delivery time and delivery count. Dragonfly 2.0.2 rejects
+ * XSETID's ENTRIESADDED and MAXDELETEDID, so those two counters (they only feed XINFO's lag) are
+ * whatever the copied entries produce. Its XCLAIM IDLE is wrong (the entry reads back as idle
+ * since 1970), so the delivery time goes out as XCLAIM TIME on the target's own clock, read with
+ * TIME first: delivered_at_ms is on the reading host's clock, and server clocks drift from it.
  */
 public final class CommandBuilder {
 
@@ -45,6 +53,16 @@ public final class CommandBuilder {
     }
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
+    /** Commands Lettuce 6.3 has no typed method for. */
+    private enum RawCommand implements ProtocolKeyword {
+        XSETID, XGROUP, HEXPIRE, TIME;
+
+        @Override
+        public byte[] getBytes() {
+            return name().getBytes(StandardCharsets.US_ASCII);
+        }
+    }
 
     /** Default cap on elements/fields/members sent in a single RPUSH/SADD/ZADD/HSET call - a
      * key with more than this many entries is written across several smaller commands instead
@@ -79,29 +97,30 @@ public final class CommandBuilder {
 
         byte[] targetKey = prefixedKey(record.key, keyPrefix, keyPrefixSeparator);
         Long effectiveTtl = effectiveTtl(record.ttlMs, ttlStrategy, ttlResetOffsetMs);
+        boolean keepFieldTtls = ttlStrategy != TtlStrategy.STRIP;
 
         if (record.dumpPayload != null) {
             return writeDump(target, targetKey, record.dumpPayload, effectiveTtl, conflictStrategy);
         }
 
         if (conflictStrategy == ConflictStrategy.OVERWRITE) {
-            return dispatchWrite(target, rawConn, record, targetKey, effectiveTtl, writeChunkSize).thenApply(v -> WriteOutcome.SUCCESS);
+            return dispatchWrite(target, rawConn, record, targetKey, effectiveTtl, keepFieldTtls, writeChunkSize).thenApply(v -> WriteOutcome.SUCCESS);
         }
         return toCf(target.exists(targetKey)).thenCompose(count -> {
             if (count != null && count > 0) {
                 WriteOutcome outcome = conflictStrategy == ConflictStrategy.SKIP ? WriteOutcome.SKIPPED : WriteOutcome.CONFLICT;
                 return CompletableFuture.completedFuture(outcome);
             }
-            return dispatchWrite(target, rawConn, record, targetKey, effectiveTtl, writeChunkSize).thenApply(v -> WriteOutcome.SUCCESS);
+            return dispatchWrite(target, rawConn, record, targetKey, effectiveTtl, keepFieldTtls, writeChunkSize).thenApply(v -> WriteOutcome.SUCCESS);
         });
     }
 
     private static CompletableFuture<Void> dispatchWrite(
             RedisClusterAsyncCommands<byte[], byte[]> target, StatefulConnection<byte[], byte[]> rawConn,
-            KeyRecord record, byte[] key, Long ttlMs, int writeChunkSize) {
+            KeyRecord record, byte[] key, Long ttlMs, boolean keepFieldTtls, int writeChunkSize) {
         return switch (record.type) {
             case "string" -> writeString(target, key, record, ttlMs);
-            case "hash" -> writeHash(target, key, record, ttlMs, writeChunkSize);
+            case "hash" -> writeHash(target, key, record, ttlMs, keepFieldTtls, writeChunkSize);
             case "list" -> writeList(target, key, record, ttlMs, writeChunkSize);
             case "set" -> writeSet(target, key, record, ttlMs, writeChunkSize);
             case "zset" -> writeZset(target, key, record, ttlMs, writeChunkSize);
@@ -176,7 +195,8 @@ public final class CommandBuilder {
     }
 
     private static CompletableFuture<Void> writeHash(
-            RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, KeyRecord record, Long ttlMs, int writeChunkSize) {
+            RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, KeyRecord record, Long ttlMs, boolean keepFieldTtls,
+            int writeChunkSize) {
         List<CompletableFuture<?>> futures = new ArrayList<>();
         futures.add(toCf(target.del(key)));
         Map<byte[], byte[]> chunk = new LinkedHashMap<>();
@@ -190,7 +210,37 @@ public final class CommandBuilder {
         if (!chunk.isEmpty()) {
             futures.add(toCf(target.hset(key, chunk)));
         }
+        if (keepFieldTtls && record.fieldExpireAtMs != null) {
+            addFieldTtlFutures(target, key, record.fieldExpireAtMs, futures);
+        }
         return allOf(futures).thenCompose(v -> applyTtl(target, key, ttlMs));
+    }
+
+    /** HEXPIRE takes seconds and is the only relative form Dragonfly 2.0.2 has (no HPEXPIRE), so each
+     * TTL rounds up to the next second; fields sharing a value go out in one call. A field whose
+     * expiry passed while the record was in flight is deleted, as the source will have done. */
+    private static void addFieldTtlFutures(
+            RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, Map<String, Long> expireAtMs, List<CompletableFuture<?>> futures) {
+        long now = System.currentTimeMillis();
+        Map<Long, List<byte[]>> fieldsBySeconds = new java.util.TreeMap<>();
+        List<byte[]> expired = new ArrayList<>();
+        expireAtMs.forEach((field, at) -> {
+            byte[] raw = field.getBytes(StandardCharsets.UTF_8);
+            long remainingMs = at - now;
+            if (remainingMs <= 0) {
+                expired.add(raw);
+            } else {
+                fieldsBySeconds.computeIfAbsent((remainingMs + 999) / 1000, s -> new ArrayList<>()).add(raw);
+            }
+        });
+        if (!expired.isEmpty()) {
+            futures.add(toCf(target.hdel(key, expired.toArray(new byte[0][]))));
+        }
+        fieldsBySeconds.forEach((seconds, fields) -> {
+            CommandArgs<byte[], byte[]> args = new CommandArgs<>(ByteArrayCodec.INSTANCE).addKey(key).add(seconds).add("FIELDS").add(fields.size());
+            fields.forEach(args::add);
+            futures.add(toCf(target.dispatch(RawCommand.HEXPIRE, new IntegerListOutput<>(ByteArrayCodec.INSTANCE), args)));
+        });
     }
 
     private static CompletableFuture<Void> writeList(
@@ -266,6 +316,7 @@ public final class CommandBuilder {
         List<Object> entries = asList(record.value);
         List<CompletableFuture<?>> futures = new ArrayList<>();
         futures.add(toCf(target.del(key)));
+        String lastEntryId = null;
         for (Object o : entries) {
             Map<String, Object> entry = (Map<String, Object>) o;
             String id = String.valueOf(entry.get("id"));
@@ -273,29 +324,86 @@ public final class CommandBuilder {
             Map<byte[], byte[]> fields = new LinkedHashMap<>();
             fieldsRaw.forEach((k, v) -> fields.put(k.getBytes(StandardCharsets.UTF_8), String.valueOf(v).getBytes(StandardCharsets.UTF_8)));
             futures.add(toCf(target.xadd(key, new XAddArgs().id(id), fields)));
+            lastEntryId = id;
         }
-        addConsumerGroupFutures(target, key, record, futures);
-        return allOf(futures).thenCompose(v -> applyTtl(target, key, ttlMs));
+        List<Map<String, Object>> groups = record.consumerGroups == null ? List.of()
+                : ((List<Object>) record.consumerGroups).stream().map(g -> (Map<String, Object>) g).filter(g -> g.get("name") != null).toList();
+        for (Map<String, Object> group : groups) {
+            String lastDeliveredId = String.valueOf(group.getOrDefault("last-delivered-id", "0"));
+            XReadArgs.StreamOffset<byte[]> offset = XReadArgs.StreamOffset.from(key, lastDeliveredId);
+            futures.add(toCf(target.xgroupCreate(offset, bytes(group.get("name")), new XGroupCreateArgs().mkstream(true))));
+            // Through SETID rather than CREATE's own ENTRIESREAD, which Dragonfly 2.0.2 accepts and ignores.
+            if (group.get("entries-read") instanceof Number entriesRead) {
+                futures.add(toCf(target.dispatch(RawCommand.XGROUP, new StatusOutput<>(ByteArrayCodec.INSTANCE),
+                        new CommandArgs<>(ByteArrayCodec.INSTANCE).add("SETID").addKey(key).add(bytes(group.get("name")))
+                                .add(lastDeliveredId).add("ENTRIESREAD").add(entriesRead.longValue()))));
+            }
+        }
+        // After the groups: a stream with no entries left exists on the target only once MKSTREAM
+        // has created it, and XSETID needs an existing key.
+        if (record.lastGeneratedId != null && !record.lastGeneratedId.equals(lastEntryId) && (lastEntryId != null || !groups.isEmpty())) {
+            futures.add(toCf(target.dispatch(RawCommand.XSETID, new StatusOutput<>(ByteArrayCodec.INSTANCE),
+                    new CommandArgs<>(ByteArrayCodec.INSTANCE).addKey(key).add(record.lastGeneratedId))));
+        }
+        boolean anyPending = false;
+        for (Map<String, Object> group : groups) {
+            byte[] groupName = bytes(group.get("name"));
+            if (group.get("consumers") instanceof List<?> consumers) {
+                for (Object c : consumers) {
+                    if (c instanceof Map<?, ?> consumer && consumer.get("name") != null) {
+                        futures.add(toCf(target.xgroupCreateconsumer(key, io.lettuce.core.Consumer.from(groupName, bytes(consumer.get("name"))))));
+                    }
+                }
+            }
+            anyPending |= group.get("pending") instanceof List<?> pending && !pending.isEmpty();
+        }
+        CompletableFuture<Void> written = allOf(futures);
+        if (anyPending) {
+            // Raw, because Dragonfly answers TIME with integers where Redis sends bulk strings, which
+            // Lettuce's typed time() cannot parse.
+            written = written.thenCompose(v -> toCf(target.dispatch(RawCommand.TIME, new ArrayOutput<>(ByteArrayCodec.INSTANCE), new CommandArgs<>(ByteArrayCodec.INSTANCE))))
+                    .thenCompose(time -> claimPending(target, key, groups, targetClockOffsetMs(time)));
+        }
+        return written.thenCompose(v -> applyTtl(target, key, ttlMs));
+    }
+
+    /** TIME answers seconds and microseconds; the offset maps this host's clock onto the target's. */
+    private static long targetClockOffsetMs(List<Object> time) {
+        long targetNowMs = asLong(time.get(0)) * 1000 + asLong(time.get(1)) / 1000;
+        return targetNowMs - System.currentTimeMillis();
+    }
+
+    private static long asLong(Object reply) {
+        return reply instanceof Number n ? n.longValue() : Long.parseLong(new String((byte[]) reply, StandardCharsets.US_ASCII));
     }
 
     @SuppressWarnings("unchecked")
-    private static void addConsumerGroupFutures(
-            RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, KeyRecord record, List<CompletableFuture<?>> futures) {
-        if (record.consumerGroups == null) {
-            return;
-        }
-        for (Object o : (List<Object>) record.consumerGroups) {
-            Map<String, Object> group = (Map<String, Object>) o;
-            Object nameObj = group.get("name");
-            Object lastDeliveredObj = group.getOrDefault("last-delivered-id", "0");
-            if (nameObj == null) {
-                continue;
+    private static CompletableFuture<Void> claimPending(
+            RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, List<Map<String, Object>> groups, long clockOffsetMs) {
+        List<CompletableFuture<?>> claims = new ArrayList<>();
+        for (Map<String, Object> group : groups) {
+            if (group.get("pending") instanceof List<?> pending) {
+                for (Object p : pending) {
+                    if (p instanceof Map<?, ?> entry) {
+                        claims.add(toCf(target.xclaim(key, io.lettuce.core.Consumer.from(bytes(group.get("name")), bytes(entry.get("consumer"))),
+                                claimArgs((Map<String, Object>) entry, clockOffsetMs), String.valueOf(entry.get("id")))));
+                    }
+                }
             }
-            byte[] groupName = String.valueOf(nameObj).getBytes(StandardCharsets.UTF_8);
-            String lastDeliveredId = String.valueOf(lastDeliveredObj);
-            XReadArgs.StreamOffset<byte[]> offset = XReadArgs.StreamOffset.from(key, lastDeliveredId);
-            futures.add(toCf(target.xgroupCreate(offset, groupName, new XGroupCreateArgs().mkstream(true))));
         }
+        return allOf(claims);
+    }
+
+    /** Records written before delivered_at_ms existed only carry the idle time as of their read. */
+    private static XClaimArgs claimArgs(Map<String, Object> pending, long clockOffsetMs) {
+        long deliveredAt = pending.get("delivered_at_ms") instanceof Number at ? at.longValue()
+                : System.currentTimeMillis() - ((Number) pending.getOrDefault("ms_since_last_delivery", 0L)).longValue();
+        long deliveries = ((Number) pending.getOrDefault("redelivery_count", 1L)).longValue();
+        return new XClaimArgs().minIdleTime(0).time(deliveredAt + clockOffsetMs).retryCount(deliveries).force().justid();
+    }
+
+    private static byte[] bytes(Object value) {
+        return String.valueOf(value).getBytes(StandardCharsets.UTF_8);
     }
 
     private static CompletableFuture<Void> applyTtl(

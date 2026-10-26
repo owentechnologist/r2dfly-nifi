@@ -31,6 +31,14 @@ public class KeyRecord {
     @JsonProperty("consumer_groups")
     public Object consumerGroups;
 
+    /** Stream only: the source's last-generated-id, which can be ahead of the last remaining entry. */
+    @JsonProperty("last_generated_id")
+    public String lastGeneratedId;
+
+    /** Hash only: field to its expiry deadline in epoch ms on the reading host's clock. */
+    @JsonProperty("field_expire_at_ms")
+    public java.util.Map<String, Long> fieldExpireAtMs;
+
     /** Raw DUMP payload for a --dfly-to-dfly write - when set, {@link CommandBuilder#write}
      * issues a single RESTORE instead of a type-specific write, bypassing {@code value}
      * entirely. Set directly by {@code RedisBatchWriter} from a FlowFile's raw content when it

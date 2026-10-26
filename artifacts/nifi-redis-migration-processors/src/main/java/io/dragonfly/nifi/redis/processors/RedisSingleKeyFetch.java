@@ -7,6 +7,7 @@ import io.dragonfly.nifi.redis.util.RedisTypeSerializer;
 import io.dragonfly.nifi.redis.util.RedisValueFetcher;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
+import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.processor.AbstractProcessor;
@@ -68,6 +69,13 @@ public class RedisSingleKeyFetch extends AbstractProcessor {
         return RELATIONSHIPS;
     }
 
+    private volatile RedisValueFetcher.FieldTtlSupport fieldTtls = new RedisValueFetcher.FieldTtlSupport();
+
+    @OnScheduled
+    public void onScheduled() {
+        fieldTtls = new RedisValueFetcher.FieldTtlSupport();
+    }
+
     @Override
     public void onTrigger(ProcessContext context, ProcessSession session) throws ProcessException {
         FlowFile flowFile = session.get();
@@ -118,7 +126,7 @@ public class RedisSingleKeyFetch extends AbstractProcessor {
             }
 
             Optional<List<KeyRecord>> records = redisPool.withConnection(cmds -> RedisValueFetcher.fetch(
-                    cmds, key, type, meta.ttlMs(), null, hashFieldBatchSize, listChunkSize, streamReadCount, includeConsumerGroups));
+                    cmds, key, type, meta.ttlMs(), null, hashFieldBatchSize, listChunkSize, streamReadCount, includeConsumerGroups, fieldTtls));
 
             if (records.isEmpty()) {
                 session.transfer(flowFile, REL_KEY_MISSING);

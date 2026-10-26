@@ -193,8 +193,11 @@ public class RedisTypeDeserializer extends AbstractProcessor {
     /** Null when no probe target is configured. Rebuilt on every start so a changed target is re-probed. */
     private volatile RestoreProbe restoreProbe;
 
+    private volatile RedisValueFetcher.FieldTtlSupport fieldTtls = new RedisValueFetcher.FieldTtlSupport();
+
     @OnScheduled
     public void onScheduled(ProcessContext context) {
+        fieldTtls = new RedisValueFetcher.FieldTtlSupport();
         restoreProbe = context.getProperty(RESTORE_PROBE_TARGET).isSet()
                 ? new RestoreProbe(context.getProperty(REDIS_CONNECTION_POOL).asControllerService(RedisConnectionPoolService.class),
                         context.getProperty(RESTORE_PROBE_TARGET).asControllerService(DragonflyConnectionPoolService.class))
@@ -340,6 +343,7 @@ public class RedisTypeDeserializer extends AbstractProcessor {
             awaitAllTolerantly(f.values().toArray(new RedisFuture[0]), batchTimeoutMs);
             return f;
         });
+        Map<Item, Map<String, Long>> fieldExpiries = readFieldExpiries(redisPool, items, futures, batchTimeoutMs, logger);
 
         for (Item item : items) {
             RedisFuture<?> future = futures.get(item);
@@ -357,7 +361,7 @@ public class RedisTypeDeserializer extends AbstractProcessor {
 
             Optional<List<KeyRecord>> records;
             try {
-                records = buildRecords(item, raw, hashFieldBatchSize, listChunkSize);
+                records = buildRecords(item, raw, hashFieldBatchSize, listChunkSize, fieldExpiries.getOrDefault(item, Map.of()));
             } catch (Exception e) {
                 logger.error("Failed to serialize value for key {}", item.key(), e);
                 session.transfer(session.penalize(item.flowFile()), REL_FAILURE);
@@ -396,11 +400,49 @@ public class RedisTypeDeserializer extends AbstractProcessor {
         };
     }
 
+    /** A second pipelined round, for the hashes in this batch only: HPTTL needs the field
+     * names the first round returned. A failure here loses no data, so it only drops the TTLs of
+     * that hash and is logged. */
     @SuppressWarnings("unchecked")
-    private static Optional<List<KeyRecord>> buildRecords(Item item, Object raw, int hashFieldBatchSize, int listChunkSize) {
+    private Map<Item, Map<String, Long>> readFieldExpiries(RedisConnectionPoolService redisPool, List<Item> items,
+                                                           Map<Item, RedisFuture<?>> reads, long batchTimeoutMs, ComponentLog logger) {
+        RedisValueFetcher.FieldTtlSupport support = fieldTtls;
+        if (!support.supported()) {
+            return Map.of();
+        }
+        Map<Item, List<Map.Entry<List<String>, RedisFuture<List<Long>>>>> requests = redisPool.withConnection(cmds -> {
+            Map<Item, List<Map.Entry<List<String>, RedisFuture<List<Long>>>>> r = new LinkedHashMap<>();
+            for (Item item : items) {
+                RedisFuture<?> read = reads.get(item);
+                if ("hash".equals(item.type()) && read != null && read.isDone() && read.getError() == null) {
+                    try {
+                        r.put(item, RedisValueFetcher.requestFieldExpiries(cmds, item.key(), ((Map<byte[], byte[]>) read.get()).keySet(), support));
+                    } catch (Exception e) {
+                        logger.warn("Could not request field TTLs for hash {}", item.key(), e);
+                    }
+                }
+            }
+            awaitAllTolerantly(r.values().stream().flatMap(List::stream).map(Map.Entry::getValue).toArray(RedisFuture[]::new), batchTimeoutMs);
+            return r;
+        });
+        Map<Item, Map<String, Long>> expiries = new HashMap<>();
+        requests.forEach((item, request) -> {
+            try {
+                expiries.put(item, RedisValueFetcher.awaitFieldExpiries(request, support));
+            } catch (Exception e) {
+                logger.warn("Could not read field TTLs for hash {}; copying it without them", item.key(), e);
+            }
+        });
+        return expiries;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Optional<List<KeyRecord>> buildRecords(Item item, Object raw, int hashFieldBatchSize, int listChunkSize,
+                                                          Map<String, Long> fieldExpireAtMs) {
         return switch (item.type()) {
             case "string" -> RedisValueFetcher.buildStringRecord(item.key(), item.ttlMs(), item.encoding(), (byte[]) raw);
-            case "hash" -> RedisValueFetcher.buildHashRecord(item.key(), item.ttlMs(), item.encoding(), (Map<byte[], byte[]>) raw, hashFieldBatchSize);
+            case "hash" -> RedisValueFetcher.buildHashRecord(item.key(), item.ttlMs(), item.encoding(), (Map<byte[], byte[]>) raw,
+                    hashFieldBatchSize, fieldExpireAtMs);
             case "list" -> RedisValueFetcher.buildListRecord(item.key(), item.ttlMs(), item.encoding(), (List<byte[]>) raw, listChunkSize);
             case "set" -> RedisValueFetcher.buildSetRecord(item.key(), item.ttlMs(), item.encoding(), (Set<byte[]>) raw);
             case "zset" -> RedisValueFetcher.buildZsetRecord(item.key(), item.ttlMs(), item.encoding(), (List<ScoredValue<byte[]>>) raw);

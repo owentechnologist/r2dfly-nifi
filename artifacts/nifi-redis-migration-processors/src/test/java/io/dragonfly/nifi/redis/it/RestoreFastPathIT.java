@@ -35,6 +35,7 @@ import java.util.TreeMap;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * The scan path with the RESTORE probe and the restore_rejected loop, against real containers.
@@ -71,7 +72,9 @@ class RestoreFastPathIT {
         assertTargetMatchesSource(redis74, true);
         // 15 keys: hash:fieldttl (listpackex) is the only one the probe sends to the typed read.
         assertEquals(new Counters(14, 1, 0), counters);
-        assertEquals(List.of(), fieldTtls(dragonfly, "hash:fieldttl"), "field TTLs are not copied by the typed path yet (WP3)");
+        List<Long> ttl = fieldTtls(dragonfly, "hash:fieldttl");
+        assertEquals(1, ttl.size(), "the typed path copies field TTLs");
+        assertTrue(ttl.get(0) > 3590 && ttl.get(0) <= 3600, "field TTL " + ttl.get(0));
     }
 
     @Test
