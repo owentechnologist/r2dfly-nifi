@@ -180,6 +180,13 @@ network round trip per pipeline flush rather than a near-zero-latency local one)
                                   under --topk-mode exact, the default; no effect with --topk-mode off
   --batch-size-bloom-cms N         same, for Bloom/Cuckoo Filter/CMS keys, only ever migrated at
                                   all under --dfly-to-dfly (env BATCH_SIZE_BLOOM_CMS)
+  --no-restore-fast-path         copy every core-type key with the typed read and write (env
+                                  RESTORE_FAST_PATH=false). By default RedisTypeDeserializer probes
+                                  the target once per type and encoding (DUMP a real key, RESTORE it
+                                  to a scratch key, compare) and copies the keys whose probe passed
+                                  with DUMP/RESTORE, which keeps stream consumers and pending entries
+                                  and is about 4x faster for large hashes and sorted sets. The
+                                  verdicts are logged in nifi-app.log ("RESTORE probe for ...").
   --module-batch-timeout-ms N    how long ModuleTypeHandler awaits one batch's pipeline
                                   (env MODULE_BATCH_TIMEOUT_MS, default: 10000)
   --dfly-to-dfly                 enable when BOTH source and target are Dragonfly (env
@@ -321,6 +328,7 @@ BATCH_SIZE_TOPK="${BATCH_SIZE_TOPK:-}"
 BATCH_SIZE_BLOOM_CMS="${BATCH_SIZE_BLOOM_CMS:-}"
 MODULE_BATCH_TIMEOUT_MS="${MODULE_BATCH_TIMEOUT_MS:-10000}"
 DFLY_TO_DFLY="${DFLY_TO_DFLY:-false}"
+RESTORE_FAST_PATH="${RESTORE_FAST_PATH:-true}"
 MAX_DUMP_PAYLOAD_BYTES="${MAX_DUMP_PAYLOAD_BYTES:-67108864}"
 PARALLELISM="${PARALLELISM:-1}"
 WRITER_CONCURRENCY="${WRITER_CONCURRENCY:-1}"
@@ -368,6 +376,7 @@ while [[ $# -gt 0 ]]; do
     --batch-size-bloom-cms) BATCH_SIZE_BLOOM_CMS="$2"; shift 2 ;;
     --module-batch-timeout-ms) MODULE_BATCH_TIMEOUT_MS="$2"; shift 2 ;;
     --dfly-to-dfly) DFLY_TO_DFLY="true"; shift ;;
+    --no-restore-fast-path) RESTORE_FAST_PATH="false"; shift ;;
     --max-dump-payload-bytes) MAX_DUMP_PAYLOAD_BYTES="$2"; shift 2 ;;
     --parallelism) PARALLELISM="$2"; shift 2 ;;
     --writer-concurrency) WRITER_CONCURRENCY="$2"; shift 2 ;;
@@ -811,7 +820,26 @@ fi
 echo "==> setting RedisTypeDeserializer's parallelism and dfly-to-dfly optimizations"
 echo "  parallelism=$PARALLELISM  dfly-to-dfly=$DFLY_TO_DFLY  max-dump-payload-bytes=$MAX_DUMP_PAYLOAD_BYTES"
 PROC_VER="$(nifi_current_version "processors/$PROC_DESER")" || true
-DESER_PROPS="\"dfly-to-dfly\":\"$DFLY_TO_DFLY\",\"max-dump-payload-bytes\":\"$MAX_DUMP_PAYLOAD_BYTES\""
+# The probe target is set only when the writer's restore_rejected loop back to the deserializer
+# exists: without it a payload the target rejects lands on the writer's auto-terminated failure.
+# Flows imported before the loop was added to artifacts/r2dfly.json don't have it.
+PROBE_TARGET_JSON="null"
+if [[ "$RESTORE_FAST_PATH" == "true" ]]; then
+  HAS_RESTORE_LOOP="$(nifi_api_get "process-groups/$PG_ID/connections" | py3 "
+import json, sys
+d = json.load(sys.stdin)
+print('yes' if any(c['component']['source']['id'] == '$PROC_WRITER' and c['component']['destination']['id'] == '$PROC_DESER'
+                   and 'restore_rejected' in (c['component'].get('selectedRelationships') or []) for c in d['connections']) else 'no')
+")" || true
+  if [[ "$HAS_RESTORE_LOOP" == "yes" ]]; then
+    PROBE_TARGET_JSON="\"$SVC_TARGET\""
+  else
+    echo "  note: this flow predates the RESTORE fast path (no RedisBatchWriter restore_rejected -> RedisTypeDeserializer"
+    echo "        connection), so every key uses the typed read. Re-import the baseline with reset-r2dfly-flow.sh to enable it."
+  fi
+fi
+echo "  restore-fast-path=$RESTORE_FAST_PATH  probe-target=$PROBE_TARGET_JSON"
+DESER_PROPS="\"dfly-to-dfly\":\"$DFLY_TO_DFLY\",\"max-dump-payload-bytes\":\"$MAX_DUMP_PAYLOAD_BYTES\",\"restore-probe-target\":$PROBE_TARGET_JSON"
 PROC_BODY="{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_DESER\",\"config\":{\"properties\":{$DESER_PROPS},\"concurrentlySchedulableTaskCount\":$PARALLELISM}}}"
 nifi_api_put_checked "processors/$PROC_DESER" "$PROC_BODY" > /dev/null
 

@@ -162,6 +162,13 @@ public class RedisBatchWriter extends AbstractProcessor {
     public static final Relationship REL_SKIPPED = new Relationship.Builder().name("skipped").description("Key skipped per conflict strategy").build();
     public static final Relationship REL_FAILURE = new Relationship.Builder().name("failure").description("Write failed").build();
     public static final Relationship REL_RETRY = new Relationship.Builder().name("retry").description("Transient failure; route back to this processor's incoming queue").build();
+    // Auto-terminated by default so flows built before it existed stay valid; while nothing is
+    // connected to it, a rejected payload goes to failure as it always did.
+    public static final Relationship REL_RESTORE_REJECTED = new Relationship.Builder().name("restore_rejected")
+            .description("The target rejected this key's DUMP payload. Route it back to RedisTypeDeserializer, "
+                    + "which re-reads the key with the typed path (it carries redis.restore.rejected).")
+            .autoTerminateDefault(true)
+            .build();
 
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
             DRAGONFLY_CONNECTION_POOL, BATCH_SIZE, BATCH_SIZE_STRING, BATCH_SIZE_HASH, BATCH_SIZE_LIST,
@@ -169,7 +176,7 @@ public class RedisBatchWriter extends AbstractProcessor {
             MAX_PIPELINE_DEPTH, TTL_STRATEGY, TTL_RESET_OFFSET_MS, KEY_PREFIX, KEY_PREFIX_SEPARATOR,
             CONFLICT_STRATEGY, WRITE_CONFIRMATION);
 
-    private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_SUCCESS, REL_SKIPPED, REL_FAILURE, REL_RETRY);
+    private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_SUCCESS, REL_SKIPPED, REL_FAILURE, REL_RETRY, REL_RESTORE_REJECTED);
 
     private final ChunkReassembler chunkReassembler = new ChunkReassembler();
 
@@ -289,6 +296,11 @@ public class RedisBatchWriter extends AbstractProcessor {
                     case SUCCESS -> session.transfer(flowFile, REL_SUCCESS);
                     case SKIPPED -> session.transfer(flowFile, REL_SKIPPED);
                     case CONFLICT -> session.transfer(flowFile, REL_FAILURE);
+                    case RESTORE_REJECTED -> {
+                        getLogger().warn("Target rejected the DUMP payload for key {}; sending it back for a typed copy", ready.get(i).record.key);
+                        FlowFile rejected = session.putAttribute(flowFile, "redis.restore.rejected", "true");
+                        session.transfer(rejected, context.hasConnection(REL_RESTORE_REJECTED) ? REL_RESTORE_REJECTED : REL_FAILURE);
+                    }
                 }
             }
         }

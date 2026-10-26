@@ -230,7 +230,8 @@
           "redis-connection-pool": "75de38ab-51b2-3ab6-a5b6-f2d9d92862be",
           "stream-read-count": "1000",
           "hash-field-batch-size": "10000",
-          "list-chunk-size": "5000"
+          "list-chunk-size": "5000",
+          "restore-probe-target": "d17a8dbb-f7c7-3347-977a-063290bbd4bc"
         },
         "propertyDescriptors": {
           "include-consumer-groups": {
@@ -265,6 +266,13 @@
             "name": "list-chunk-size",
             "displayName": "List Chunk Size",
             "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          },
+          "restore-probe-target": {
+            "name": "restore-probe-target",
+            "displayName": "RESTORE Probe Target",
+            "identifiesControllerService": true,
             "sensitive": false,
             "dynamic": false
           }
@@ -651,6 +659,40 @@
         "zIndex": 0,
         "selectedRelationships": [
           "success"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "1a712e21-820a-4f4f-ad2d-49eaded9ac92",
+        "instanceIdentifier": "8567425a-a54f-4b10-9cd6-e1e0fcaa64f5",
+        "source": {
+          "id": "20ee6727-0fe2-3a0b-8c3a-f3525c04f480",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisBatchWriter",
+          "comments": "",
+          "instanceIdentifier": "0fbaec2b-24d2-360a-c727-bcfb2669ae57"
+        },
+        "destination": {
+          "id": "3d1e8a19-d603-3d5d-bd8a-daf2f4edcc70",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisTypeDeserializer",
+          "comments": "",
+          "instanceIdentifier": "7a782c41-8c7b-3e63-e3d2-6f387456cdd2"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "restore_rejected"
         ],
         "backPressureObjectThreshold": 10000,
         "backPressureDataSizeThreshold": "1 GB",

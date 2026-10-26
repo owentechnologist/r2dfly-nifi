@@ -1,6 +1,7 @@
 package io.dragonfly.nifi.redis.util;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.lettuce.core.RedisCommandExecutionException;
 import io.lettuce.core.RedisFuture;
 import io.lettuce.core.RestoreArgs;
 import io.lettuce.core.ScoredValue;
@@ -19,6 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 /**
  * Builds and dispatches the Dragonfly write command(s) for a {@link KeyRecord}, per spec
@@ -37,7 +39,7 @@ public final class CommandBuilder {
 
     public enum ConflictStrategy { OVERWRITE, SKIP, FAIL }
 
-    public enum WriteOutcome { SUCCESS, SKIPPED, CONFLICT }
+    public enum WriteOutcome { SUCCESS, SKIPPED, CONFLICT, RESTORE_REJECTED }
 
     private CommandBuilder() {
     }
@@ -137,21 +139,31 @@ public final class CommandBuilder {
             RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, byte[] payload, Long ttlMs,
             ConflictStrategy conflictStrategy) {
         if (conflictStrategy == ConflictStrategy.OVERWRITE) {
-            return dispatchRestore(target, key, payload, ttlMs).thenApply(v -> WriteOutcome.SUCCESS);
+            return dispatchRestore(target, key, payload, ttlMs);
         }
         return toCf(target.exists(key)).thenCompose(count -> {
             if (count != null && count > 0) {
                 WriteOutcome outcome = conflictStrategy == ConflictStrategy.SKIP ? WriteOutcome.SKIPPED : WriteOutcome.CONFLICT;
                 return CompletableFuture.completedFuture(outcome);
             }
-            return dispatchRestore(target, key, payload, ttlMs).thenApply(v -> WriteOutcome.SUCCESS);
+            return dispatchRestore(target, key, payload, ttlMs);
         });
     }
 
-    private static CompletableFuture<Void> dispatchRestore(
+    /** A server error reply means the target cannot read this payload (for example a DUMP version
+     * newer than it supports); that is permanent for the key, so it is reported as an outcome the
+     * caller can re-route to the typed path instead of an exception that would only be retried. */
+    private static CompletableFuture<WriteOutcome> dispatchRestore(
             RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, byte[] payload, Long ttlMs) {
         RestoreArgs args = new RestoreArgs().replace().ttl(ttlMs != null ? ttlMs : 0);
-        return toCf(target.restore(key, payload, args)).thenApply(v -> null);
+        return toCf(target.restore(key, payload, args))
+                .thenApply(v -> WriteOutcome.SUCCESS)
+                .exceptionallyCompose(e -> {
+                    Throwable cause = e instanceof CompletionException && e.getCause() != null ? e.getCause() : e;
+                    return cause instanceof RedisCommandExecutionException
+                            ? CompletableFuture.completedFuture(WriteOutcome.RESTORE_REJECTED)
+                            : CompletableFuture.failedFuture(cause);
+                });
     }
 
     private static CompletableFuture<Void> writeString(

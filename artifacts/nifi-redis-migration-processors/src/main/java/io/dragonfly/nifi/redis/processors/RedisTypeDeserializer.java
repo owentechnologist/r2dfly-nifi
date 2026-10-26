@@ -1,15 +1,18 @@
 package io.dragonfly.nifi.redis.processors;
 
+import io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService;
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.dragonfly.nifi.redis.util.KeyRecord;
 import io.dragonfly.nifi.redis.util.RedisTypeSerializer;
 import io.dragonfly.nifi.redis.util.RedisValueFetcher;
+import io.dragonfly.nifi.redis.util.RestoreProbe;
 import io.lettuce.core.LettuceFutures;
 import io.lettuce.core.RedisFuture;
 import io.lettuce.core.ScoredValue;
 import io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
+import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.logging.ComponentLog;
@@ -150,6 +153,19 @@ public class RedisTypeDeserializer extends AbstractProcessor {
             .defaultValue("67108864")
             .build();
 
+    public static final PropertyDescriptor RESTORE_PROBE_TARGET = new PropertyDescriptor.Builder()
+            .name("restore-probe-target")
+            .displayName("RESTORE Probe Target")
+            .description("The migration target. When set, the first key of each type and encoding is "
+                    + "DUMPed, RESTOREd to a scratch key on this target and compared with a typed read of "
+                    + "both sides. Keys of a type and encoding that pass are copied with DUMP/RESTORE "
+                    + "(streams keep their consumers and pending entries); the rest use the typed read. "
+                    + "The verdicts are logged. Leave unset to use only the typed read, unless "
+                    + "Dragonfly-to-Dragonfly Optimizations forces DUMP without a probe.")
+            .required(false)
+            .identifiesControllerService(DragonflyConnectionPoolService.class)
+            .build();
+
     public static final Relationship REL_SUCCESS = new Relationship.Builder().name("success").description("Value read and serialised successfully").build();
     public static final Relationship REL_KEY_MISSING = new Relationship.Builder().name("key_missing").description("Key expired between SCAN and fetch").build();
     public static final Relationship REL_MODULE_TYPE = new Relationship.Builder().name("module_type").description("Key is a module type (ReJSON-RL, TopK, etc.)").build();
@@ -159,7 +175,8 @@ public class RedisTypeDeserializer extends AbstractProcessor {
 
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
             REDIS_CONNECTION_POOL, HASH_FIELD_BATCH_SIZE, LIST_CHUNK_SIZE, STREAM_READ_COUNT,
-            INCLUDE_CONSUMER_GROUPS, BATCH_SIZE, BATCH_TIMEOUT_MS, DFLY_TO_DFLY, MAX_DUMP_PAYLOAD_BYTES);
+            INCLUDE_CONSUMER_GROUPS, BATCH_SIZE, BATCH_TIMEOUT_MS, DFLY_TO_DFLY, MAX_DUMP_PAYLOAD_BYTES,
+            RESTORE_PROBE_TARGET);
 
     private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_SUCCESS, REL_KEY_MISSING, REL_MODULE_TYPE, REL_FAILURE);
 
@@ -171,6 +188,17 @@ public class RedisTypeDeserializer extends AbstractProcessor {
     @Override
     public Set<Relationship> getRelationships() {
         return RELATIONSHIPS;
+    }
+
+    /** Null when no probe target is configured. Rebuilt on every start so a changed target is re-probed. */
+    private volatile RestoreProbe restoreProbe;
+
+    @OnScheduled
+    public void onScheduled(ProcessContext context) {
+        restoreProbe = context.getProperty(RESTORE_PROBE_TARGET).isSet()
+                ? new RestoreProbe(context.getProperty(REDIS_CONNECTION_POOL).asControllerService(RedisConnectionPoolService.class),
+                        context.getProperty(RESTORE_PROBE_TARGET).asControllerService(DragonflyConnectionPoolService.class))
+                : null;
     }
 
     /** One FlowFile's worth of context, carried through the batched read phase. */
@@ -196,8 +224,10 @@ public class RedisTypeDeserializer extends AbstractProcessor {
         long maxDumpPayloadBytes = context.getProperty(MAX_DUMP_PAYLOAD_BYTES).asLong();
         ComponentLog logger = getLogger();
 
+        List<Item> dumpItems = new ArrayList<>();
         List<Item> pipelineItems = new ArrayList<>();
         List<Item> streamItems = new ArrayList<>();
+        RestoreProbe probe = restoreProbe;
 
         for (FlowFile flowFile : batch) {
             String key = flowFile.getAttribute("redis.key");
@@ -209,17 +239,34 @@ public class RedisTypeDeserializer extends AbstractProcessor {
                 session.transfer(flowFile, REL_MODULE_TYPE);
                 continue;
             }
+            // Returned by RedisBatchWriter's restore_rejected: still carries its DUMP content and
+            // marker, which the typed children created from it must not inherit.
+            boolean rejected = "true".equals(flowFile.getAttribute("redis.restore.rejected"));
+            if (rejected) {
+                flowFile = session.removeAttribute(flowFile, "redis.dfly-dump");
+            }
             Item item = new Item(flowFile, key, type, ttlMs, encoding);
-            if ("stream".equals(type)) {
+            boolean viaDump = !rejected && ((dflyToDfly && !"stream".equals(type))
+                    || (probe != null && probe.verdictFor(key, type, encoding, this::reportVerdict).accepted()));
+            if (viaDump) {
+                dumpItems.add(item);
+            } else if ("stream".equals(type)) {
                 streamItems.add(item);
             } else {
                 pipelineItems.add(item);
             }
         }
+        session.adjustCounter("Keys Read for RESTORE", dumpItems.size(), false);
+        session.adjustCounter("Keys Read for Typed Write", pipelineItems.size() + streamItems.size(), false);
 
+        if (!dumpItems.isEmpty()) {
+            List<Item> fallback = processDumpItems(redisPool, dumpItems, batchTimeoutMs, session, logger, maxDumpPayloadBytes);
+            for (Item item : fallback) {
+                ("stream".equals(item.type()) ? streamItems : pipelineItems).add(item);
+            }
+        }
         if (!pipelineItems.isEmpty()) {
-            processPipelinedBatch(redisPool, pipelineItems, hashFieldBatchSize, listChunkSize, batchTimeoutMs, session, logger,
-                    dflyToDfly, maxDumpPayloadBytes);
+            processNormalItems(redisPool, pipelineItems, hashFieldBatchSize, listChunkSize, batchTimeoutMs, session, logger);
         }
         for (Item item : streamItems) {
             processStream(redisPool, item, streamReadCount, includeConsumerGroups, session, logger);
@@ -227,20 +274,19 @@ public class RedisTypeDeserializer extends AbstractProcessor {
         session.commit();
     }
 
-    /** Entry point for the single-command-per-key types (string/hash/list/set/zset). Under
-     * dfly-to-dfly, every item DUMPs first (see class javadoc on Dragonfly-to-Dragonfly
-     * Optimizations); any key whose payload exceeds Max Dump Payload Bytes falls back to
-     * {@link #processNormalItems} - a real fallback (a second read), not just a failure route,
-     * so an oversized DUMP payload never leaves a key unmigrated when the normal chunked-write
-     * path would have handled it fine. Off, every item goes straight to processNormalItems. */
-    private void processPipelinedBatch(RedisConnectionPoolService redisPool, List<Item> items, int hashFieldBatchSize,
-                                        int listChunkSize, long batchTimeoutMs, ProcessSession session, ComponentLog logger,
-                                        boolean dflyToDfly, long maxDumpPayloadBytes) {
-        if (!dflyToDfly) {
-            processNormalItems(redisPool, items, hashFieldBatchSize, listChunkSize, batchTimeoutMs, session, logger);
-            return;
+    private void reportVerdict(String typeAndEncoding, String sampleKey, RestoreProbe.Verdict verdict) {
+        if (verdict.accepted()) {
+            getLogger().info("RESTORE probe for {} (sample key {}): {}; these keys use DUMP/RESTORE", typeAndEncoding, sampleKey, verdict.detail());
+        } else {
+            getLogger().warn("RESTORE probe for {} (sample key {}): {}; these keys use the typed read", typeAndEncoding, sampleKey, verdict.detail());
         }
+    }
 
+    /** DUMPs every item in one pipeline and emits the payloads. Returns the items whose payload
+     * exceeds Max Dump Payload Bytes, for the caller to copy with the typed read instead - a real
+     * fallback, so an oversized payload never leaves a key unmigrated. */
+    private List<Item> processDumpItems(RedisConnectionPoolService redisPool, List<Item> items, long batchTimeoutMs,
+                                        ProcessSession session, ComponentLog logger, long maxDumpPayloadBytes) {
         Map<Item, RedisFuture<byte[]>> futures = redisPool.withConnection(cmds -> {
             Map<Item, RedisFuture<byte[]>> f = new LinkedHashMap<>();
             for (Item item : items) {
@@ -278,16 +324,12 @@ public class RedisTypeDeserializer extends AbstractProcessor {
             }
             emitDump(session, item.flowFile(), dumpPayload);
         }
-
-        if (!fallbackItems.isEmpty()) {
-            processNormalItems(redisPool, fallbackItems, hashFieldBatchSize, listChunkSize, batchTimeoutMs, session, logger);
-        }
+        return fallbackItems;
     }
 
     /** Dispatches the type-specific single-command-per-key read (GET/HGETALL/LRANGE/SMEMBERS/
      * ZRANGE) for every item concurrently on one borrowed connection, awaits them all together,
-     * then resolves and serializes each individually. Used both as the only path when
-     * dfly-to-dfly is off, and as the fallback for any key whose DUMP payload was too large. */
+     * then resolves and serializes each individually. */
     private void processNormalItems(RedisConnectionPoolService redisPool, List<Item> items, int hashFieldBatchSize,
                                      int listChunkSize, long batchTimeoutMs, ProcessSession session, ComponentLog logger) {
         Map<Item, RedisFuture<?>> futures = redisPool.withConnection(cmds -> {

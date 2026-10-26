@@ -118,6 +118,10 @@ Optional:
                                  a formality).
   --no-dfly-to-dfly              force-disable it instead, even if both sides auto-detect as
                                  matching-version Dragonfly (env DFLY_TO_DFLY=false)
+  --no-restore-fast-path         copy every core-type key with the typed read and write, forwarded
+                                 to run-r2dfly.sh (env RESTORE_FAST_PATH=false, default: true -
+                                 probe the target and use DUMP/RESTORE where it passes). See
+                                 run-r2dfly.sh --help.
   --batch-size N                 RedisBatchWriter's default batch size, forwarded as-is to
                                  run-r2dfly.sh (env BATCH_SIZE, default: run-r2dfly.sh's own
                                  default - 50). See run-r2dfly.sh --help for the full per-type
@@ -194,6 +198,7 @@ TOPK_MODE="${TOPK_MODE:-}"
 # Left unset (as opposed to "true"/"false") means "decide automatically from the STAGE 1
 # server-type detection below"; --dfly-to-dfly/--no-dfly-to-dfly (or the env var) pin it instead.
 DFLY_TO_DFLY="${DFLY_TO_DFLY:-}"
+RESTORE_FAST_PATH="${RESTORE_FAST_PATH:-true}"
 # All left unset by default (as opposed to run-r2dfly.sh's own global --batch-size/
 # --module-batch-size, which do have real numeric defaults) - unset here means "let
 # run-r2dfly.sh apply its own default", forwarded only when actually set (see RUN_ARGS below).
@@ -270,6 +275,7 @@ MAPPING = {
     ("migration", "prefix-only-list"): "PREFIX_ONLY_LIST",
     ("migration", "topk-mode"): "TOPK_MODE",
     ("migration", "dfly-to-dfly"): "DFLY_TO_DFLY",
+    ("migration", "restore-fast-path"): "RESTORE_FAST_PATH",
     ("migration", "batch-size"): "BATCH_SIZE",
     ("migration", "batch-size-string"): "BATCH_SIZE_STRING",
     ("migration", "batch-size-hash"): "BATCH_SIZE_HASH",
@@ -392,6 +398,7 @@ while [[ $# -gt 0 ]]; do
     --topk-mode) require_value "$@"; TOPK_MODE="$2"; shift 2 ;;
     --dfly-to-dfly) DFLY_TO_DFLY="true"; shift ;;
     --no-dfly-to-dfly) DFLY_TO_DFLY="false"; shift ;;
+    --no-restore-fast-path) RESTORE_FAST_PATH="false"; shift ;;
     --batch-size) require_value "$@"; BATCH_SIZE="$2"; shift 2 ;;
     --batch-size-string) require_value "$@"; BATCH_SIZE_STRING="$2"; shift 2 ;;
     --batch-size-hash) require_value "$@"; BATCH_SIZE_HASH="$2"; shift 2 ;;
@@ -911,6 +918,7 @@ RUN_ARGS=(
 [[ -n "$PREFIX_ONLY_LIST" ]] && RUN_ARGS+=(--prefix-only-list "$PREFIX_ONLY_LIST")
 [[ -n "$TOPK_MODE" ]] && RUN_ARGS+=(--topk-mode "$TOPK_MODE")
 [[ "$DFLY_TO_DFLY" == "true" ]] && RUN_ARGS+=(--dfly-to-dfly)
+[[ "$RESTORE_FAST_PATH" == "false" ]] && RUN_ARGS+=(--no-restore-fast-path)
 [[ -n "$BATCH_SIZE" ]] && RUN_ARGS+=(--batch-size "$BATCH_SIZE")
 [[ -n "$BATCH_SIZE_STRING" ]] && RUN_ARGS+=(--batch-size-string "$BATCH_SIZE_STRING")
 [[ -n "$BATCH_SIZE_HASH" ]] && RUN_ARGS+=(--batch-size-hash "$BATCH_SIZE_HASH")
