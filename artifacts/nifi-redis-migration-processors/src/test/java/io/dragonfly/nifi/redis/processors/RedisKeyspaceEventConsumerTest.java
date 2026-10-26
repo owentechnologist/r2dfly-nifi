@@ -18,6 +18,7 @@ import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RedisKeyspaceEventConsumerTest {
@@ -43,6 +44,76 @@ class RedisKeyspaceEventConsumerTest {
     @Test
     void returnsNullForAnUnrecognizedChannel() {
         assertNull(RedisKeyspaceEventConsumer.parse("some.other.channel", "payload"));
+    }
+
+    @Test
+    void startsWithAWarningWhenTheSourceBlocksConfig() throws Exception {
+        TestRunner runner = newRunner();
+        pool(runner).setNotifyKeyspaceEvents(null);
+        FakeRedisPubSubHandle handle = start(runner);
+
+        handle.deliver("__keyevent@0__:set", "key:a");
+        runner.run(1, false, false);
+
+        assertEquals(1, runner.getFlowFilesForRelationship(RedisKeyspaceEventConsumer.REL_KEY_CHANGED).size());
+        assertEquals(1, matching(runner, "Unable to read notify-keyspace-events").size());
+    }
+
+    @Test
+    void refusesToStartWhenConfigIsBlockedAndTheCheckIsRequired() throws Exception {
+        TestRunner runner = newRunner();
+        runner.setProperty(RedisKeyspaceEventConsumer.REQUIRE_CONFIG_CHECK, "true");
+        pool(runner).setNotifyKeyspaceEvents(null);
+
+        assertThrows(AssertionError.class, () -> runner.run(1, false));
+    }
+
+    @Test
+    void refusesToStartWhenTheReadableSettingLacksKeyeventClasses() throws Exception {
+        TestRunner runner = newRunner();
+        pool(runner).setNotifyKeyspaceEvents("Ex");
+
+        AssertionError error = assertThrows(AssertionError.class, () -> runner.run(1, false));
+        Throwable root = error;
+        while (root.getCause() != null) {
+            root = root.getCause();
+        }
+        assertTrue(root.getMessage().contains("notify-keyspace-events='Ex'"), root.getMessage());
+    }
+
+    @Test
+    void appliesTheDenyListBeforeTheOnlyList() throws Exception {
+        TestRunner runner = newRunner();
+        runner.setProperty(RedisScanReader.PREFIX_DENY_LIST, "user:tmp:");
+        runner.setProperty(RedisScanReader.PREFIX_ONLY_LIST, "user:");
+        FakeRedisPubSubHandle handle = start(runner);
+
+        handle.deliver("__keyevent@0__:set", "user:1");
+        handle.deliver("__keyevent@0__:set", "user:tmp:1");
+        handle.deliver("__keyevent@0__:del", "order:1");
+        runner.run(3, false, false);
+
+        List<String> emitted = runner.getFlowFilesForRelationship(RedisKeyspaceEventConsumer.REL_KEY_CHANGED).stream()
+                .map(flowFile -> flowFile.getAttribute("redis.key")).toList();
+        assertEquals(List.of("user:1"), emitted);
+        assertEquals(List.of(), runner.getFlowFilesForRelationship(RedisKeyspaceEventConsumer.REL_KEY_DELETED));
+        assertEquals(2L, runner.getCounterValue("Keyspace Events Skipped (Prefix Filter)"));
+    }
+
+    @Test
+    void routesTheOldNameOfARenameOrMoveToDeleted() throws Exception {
+        TestRunner runner = newRunner();
+        FakeRedisPubSubHandle handle = start(runner);
+
+        handle.deliver("__keyevent@0__:rename_from", "old");
+        handle.deliver("__keyevent@0__:rename_to", "new");
+        handle.deliver("__keyevent@0__:move_from", "moved");
+        runner.run(3, false, false);
+
+        assertEquals(List.of("old", "moved"), runner.getFlowFilesForRelationship(RedisKeyspaceEventConsumer.REL_KEY_DELETED).stream()
+                .map(flowFile -> flowFile.getAttribute("redis.key")).toList());
+        assertEquals(List.of("new"), runner.getFlowFilesForRelationship(RedisKeyspaceEventConsumer.REL_KEY_CHANGED).stream()
+                .map(flowFile -> flowFile.getAttribute("redis.key")).toList());
     }
 
     @Test

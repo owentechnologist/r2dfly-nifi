@@ -649,7 +649,8 @@ PROC_LIST_JSON="$(nifi_api_get "process-groups/$PG_ID/processors")" || true
 PROC_IDS="$(echo "$PROC_LIST_JSON" | py3 "
 import json, sys
 d = json.load(sys.stdin)
-order = ['RedisScanReader', 'RedisBatchWriter', 'ModuleTypeHandler', 'RedisTypeDeserializer', 'SearchIndexExporter', 'SearchIndexRehydrator']
+order = ['RedisScanReader', 'RedisBatchWriter', 'ModuleTypeHandler', 'RedisTypeDeserializer', 'SearchIndexExporter', 'SearchIndexRehydrator',
+         'RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch']
 ids = {name: '' for name in order}
 for p in d['processors']:
     t = p['component']['type']
@@ -659,7 +660,7 @@ for p in d['processors']:
             break
 print('|'.join(ids[name] for name in order))
 ")" || true
-IFS='|' read -r PROC_SCAN PROC_WRITER PROC_MTH PROC_DESER PROC_SIDX_EXPORT PROC_SIDX_REHYDRATE <<< "$PROC_IDS"
+IFS='|' read -r PROC_SCAN PROC_WRITER PROC_MTH PROC_DESER PROC_SIDX_EXPORT PROC_SIDX_REHYDRATE PROC_LIVE_CONSUMER PROC_LIVE_FETCH <<< "$PROC_IDS"
 if [[ -z "$PROC_SCAN" ]]; then
   echo "error: could not find the RedisScanReader processor in $PG_ID" >&2; exit 1
 fi
@@ -794,6 +795,18 @@ PREFIX_ONLY_JSON="null"
 PROC_PROPS="\"key-type-filter\":\"$KEY_TYPES\",\"migration-id\":\"$MIGRATION_ID\",\"prefix-deny-list\":$PREFIX_DENY_JSON,\"prefix-only-list\":$PREFIX_ONLY_JSON,\"partition-count\":\"$PARALLELISM\""
 PROC_BODY="{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_SCAN\",\"config\":{\"properties\":{$PROC_PROPS},\"concurrentlySchedulableTaskCount\":$PARALLELISM}}}"
 nifi_api_put_checked "processors/$PROC_SCAN" "$PROC_BODY" > /dev/null
+
+# Present only once continuous-migration.sh (build-live-phase-flow.sh) has added the Live Phase. It
+# gets the same filters as the scan, so a key the scan skips is never copied by a live change either.
+if [[ -n "$PROC_LIVE_CONSUMER" && -n "$PROC_LIVE_FETCH" ]]; then
+  echo "==> applying the same prefix and type filters to the Live Phase"
+  PROC_VER="$(nifi_current_version "processors/$PROC_LIVE_CONSUMER")" || true
+  PROC_BODY="{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_LIVE_CONSUMER\",\"config\":{\"properties\":{\"prefix-deny-list\":$PREFIX_DENY_JSON,\"prefix-only-list\":$PREFIX_ONLY_JSON}}}}"
+  nifi_api_put_checked "processors/$PROC_LIVE_CONSUMER" "$PROC_BODY" > /dev/null
+  PROC_VER="$(nifi_current_version "processors/$PROC_LIVE_FETCH")" || true
+  PROC_BODY="{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_LIVE_FETCH\",\"config\":{\"properties\":{\"key-type-filter\":\"$KEY_TYPES\"}}}}"
+  nifi_api_put_checked "processors/$PROC_LIVE_FETCH" "$PROC_BODY" > /dev/null
+fi
 
 echo "==> setting RedisTypeDeserializer's parallelism and dfly-to-dfly optimizations"
 echo "  parallelism=$PARALLELISM  dfly-to-dfly=$DFLY_TO_DFLY  max-dump-payload-bytes=$MAX_DUMP_PAYLOAD_BYTES"

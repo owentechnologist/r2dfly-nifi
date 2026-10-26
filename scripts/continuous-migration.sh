@@ -57,9 +57,14 @@ Live Phase options:
   --skip-keyspace-check          skip STAGE 1's notify-keyspace-events pre-flight on the source
                                  (env SKIP_KEYSPACE_CHECK, default: false). The check is the only
                                  thing that turns a misconfigured source into a clear error here
-                                 rather than a processor that never starts - skipping it means
-                                 the consumer fails at schedule time in STAGE 8 instead, which
-                                 surfaces only as a NiFi bulletin.
+                                 rather than a processor that never starts. Skip it for a source
+                                 that blocks CONFIG (ElastiCache): the consumer then only warns
+                                 that it could not read the setting and starts anyway. A readable
+                                 setting without 'A' and 'E' still stops the consumer at schedule
+                                 time in STAGE 8, which surfaces only as a NiFi bulletin.
+  --require-config-check         make the consumer refuse to start when it cannot read
+                                 notify-keyspace-events (env REQUIRE_CONFIG_CHECK, default: false,
+                                 which only warns)
   --reconciliation-signals       route the consumer's topology_drift relationship to a NiFi funnel
                                  queue instead of auto-terminating it (env RECONCILIATION_SIGNALS,
                                  default: false). The queue is durable and can be read back over
@@ -273,6 +278,7 @@ KEYSPACE_PATTERN="${KEYSPACE_PATTERN:-}"
 EVENT_TYPES="${EVENT_TYPES:-}"
 MAX_QUEUE_DEPTH="${MAX_QUEUE_DEPTH:-}"
 SKIP_KEYSPACE_CHECK="${SKIP_KEYSPACE_CHECK:-false}"
+REQUIRE_CONFIG_CHECK="${REQUIRE_CONFIG_CHECK:-false}"
 RECONCILIATION_SIGNALS="${RECONCILIATION_SIGNALS:-false}"
 ASSUME_DEFAULTS="${ASSUME_DEFAULTS:-false}"
 DISABLE_PROVENANCE="${DISABLE_PROVENANCE:-true}"
@@ -351,6 +357,7 @@ MAPPING = {
     ("live", "event-types"): "EVENT_TYPES",
     ("live", "max-queue-depth"): "MAX_QUEUE_DEPTH",
     ("live", "skip-keyspace-check"): "SKIP_KEYSPACE_CHECK",
+    ("live", "require-config-check"): "REQUIRE_CONFIG_CHECK",
     ("live", "reconciliation-signals"): "RECONCILIATION_SIGNALS",
     ("run", "defaults"): "ASSUME_DEFAULTS",
     ("run", "verbose"): "VERBOSE",
@@ -476,6 +483,7 @@ while [[ $# -gt 0 ]]; do
     --event-types) require_value "$@"; EVENT_TYPES="$2"; shift 2 ;;
     --max-queue-depth) require_value "$@"; MAX_QUEUE_DEPTH="$2"; shift 2 ;;
     --skip-keyspace-check) SKIP_KEYSPACE_CHECK="true"; shift ;;
+    --require-config-check) REQUIRE_CONFIG_CHECK="true"; shift ;;
     --reconciliation-signals) RECONCILIATION_SIGNALS="true"; shift ;;
     --defaults) ASSUME_DEFAULTS="true"; shift ;;
     --disable-provenance) DISABLE_PROVENANCE="true"; shift ;;
@@ -655,6 +663,10 @@ if [[ "$SKIP_KEYSPACE_CHECK" != "true" ]]; then
   KEYSPACE_EVENTS_VALUE="$(redis_lib_check_keyspace_events "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")" || KEYSPACE_CHECK_RC=$?
   if [[ $KEYSPACE_CHECK_RC -eq 0 ]]; then
     echo "  source keyspace notifications: OK"
+  elif [[ $KEYSPACE_CHECK_RC -eq 2 && "$REQUIRE_CONFIG_CHECK" != "true" ]]; then
+    echo "warning: could not read the source's notify-keyspace-events (CONFIG GET answered: ${KEYSPACE_EVENTS_VALUE:-<nothing>})." >&2
+    echo "         Continuing on the assumption that a managed service enables it in its parameter group." >&2
+    echo "         If the Live Phase copies nothing, check that setting first. --require-config-check makes this an error." >&2
   else
     echo "error: the source's notify-keyspace-events is '${KEYSPACE_EVENTS_VALUE:-<empty>}' - the Live Phase needs it to contain both 'A' (every key-event class) and 'E' (keyevent channels), or it sees nothing at all" >&2
     echo "       Enable it with: CONFIG SET notify-keyspace-events AE" >&2
@@ -669,7 +681,7 @@ if [[ "$SKIP_KEYSPACE_CHECK" != "true" ]]; then
     exit 1
   fi
 else
-  echo "warning: --skip-keyspace-check given - the source's notify-keyspace-events setting was not verified. If it doesn't contain both 'A' and 'E', RedisKeyspaceEventConsumer will fail at schedule time in STAGE 8 instead." >&2
+  echo "warning: --skip-keyspace-check given - the source's notify-keyspace-events setting was not verified. If it is readable and lacks 'A' or 'E', RedisKeyspaceEventConsumer will fail at schedule time in STAGE 8 instead; if CONFIG is blocked, it starts with a warning." >&2
 fi
 
 echo
@@ -1065,6 +1077,7 @@ CONSUMER_VER="$(nifi_current_version "processors/$PROC_KEYSPACE")" || true
 LIVE_PROPS="\"keyspace-pattern\":$(json_or_null "$KEYSPACE_PATTERN")"
 LIVE_PROPS="$LIVE_PROPS,\"event-types\":$(json_or_null "$EVENT_TYPES")"
 LIVE_PROPS="$LIVE_PROPS,\"max-queue-depth\":$(json_or_null "$MAX_QUEUE_DEPTH")"
+LIVE_PROPS="$LIVE_PROPS,\"require-config-check\":\"$REQUIRE_CONFIG_CHECK\""
 LIVE_BODY="{\"revision\":{\"version\":$CONSUMER_VER},\"component\":{\"id\":\"$PROC_KEYSPACE\",\"config\":{\"properties\":{$LIVE_PROPS}}}}"
 nifi_api_put_checked "processors/$PROC_KEYSPACE" "$LIVE_BODY" > /dev/null
 

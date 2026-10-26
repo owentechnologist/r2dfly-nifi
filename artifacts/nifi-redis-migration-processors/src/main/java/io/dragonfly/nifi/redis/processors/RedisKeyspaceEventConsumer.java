@@ -3,6 +3,7 @@ package io.dragonfly.nifi.redis.processors;
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.dragonfly.nifi.redis.services.RedisPubSubHandle;
 import io.dragonfly.nifi.redis.util.ClusterTopologySnapshot;
+import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.TopologyDiff;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
@@ -103,6 +104,18 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
             .defaultValue("30000")
             .build();
 
+    public static final PropertyDescriptor REQUIRE_CONFIG_CHECK = new PropertyDescriptor.Builder()
+            .name("require-config-check")
+            .displayName("Require Config Check")
+            .description("When true, the processor refuses to start unless CONFIG GET notify-keyspace-events "
+                    + "succeeds. When false, a source that blocks CONFIG (for example AWS ElastiCache, where "
+                    + "notifications are enabled through a parameter group) only logs a warning. A readable "
+                    + "value that lacks 'A' or 'E' always stops the start, since no events would arrive.")
+            .required(true)
+            .allowableValues("true", "false")
+            .defaultValue("false")
+            .build();
+
     public static final Relationship REL_KEY_CHANGED = new Relationship.Builder().name("key_changed").description("Key was created or modified").build();
     public static final Relationship REL_KEY_DELETED = new Relationship.Builder().name("key_deleted").description("Key was deleted").build();
     public static final Relationship REL_KEY_EXPIRED = new Relationship.Builder().name("key_expired").description("Key expired on source").build();
@@ -112,7 +125,8 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
                     + "so its slots were never subscribed to").build();
 
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
-            REDIS_CONNECTION_POOL, KEYSPACE_PATTERN, EVENT_TYPES, MAX_QUEUE_DEPTH, RECONNECT_BACKOFF_MS,
+            REDIS_CONNECTION_POOL, KEYSPACE_PATTERN, EVENT_TYPES, RedisScanReader.PREFIX_DENY_LIST,
+            RedisScanReader.PREFIX_ONLY_LIST, MAX_QUEUE_DEPTH, RECONNECT_BACKOFF_MS, REQUIRE_CONFIG_CHECK,
             TOPOLOGY_STATE_CACHE, TOPOLOGY_CHECK_INTERVAL_MS);
     private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_KEY_CHANGED, REL_KEY_DELETED, REL_KEY_EXPIRED, REL_FAILURE, REL_TOPOLOGY_DRIFT);
 
@@ -132,6 +146,7 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
     private BlockingQueue<RawEvent> eventQueue;
     private RedisPubSubHandle pubSubHandle;
     private Set<String> eventTypeFilter;
+    private KeyFilter keyFilter;
     private volatile RedisConnectionPoolService redisPool;
 
     // Written from Lettuce's IO thread and read/drained from the onTrigger thread.
@@ -181,20 +196,7 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
         lastTopologyCheckAtMs.set(0L);
 
         redisPool = context.getProperty(REDIS_CONNECTION_POOL).asControllerService(RedisConnectionPoolService.class);
-        Map<String, String> config = redisPool.withConnection(cmds -> {
-            try {
-                return cmds.configGet("notify-keyspace-events").get();
-            } catch (Exception e) {
-                throw new ProcessException("Unable to read notify-keyspace-events configuration", e);
-            }
-        });
-        String value = config.getOrDefault("notify-keyspace-events", "");
-        if (!value.contains("A") || !value.contains("E")) {
-            throw new ProcessException("Source Redis has notify-keyspace-events='" + value + "'; keyspace "
-                    + "notifications require at least 'AE' (or the specific classes covering your Event "
-                    + "Types plus 'E'). Enable it with: CONFIG SET notify-keyspace-events AE (or set the "
-                    + "equivalent parameter-group setting on managed services such as ElastiCache).");
-        }
+        checkNotifyKeyspaceEvents(context.getProperty(REQUIRE_CONFIG_CHECK).asBoolean());
 
         int maxQueueDepth = context.getProperty(MAX_QUEUE_DEPTH).asInteger();
         reconnectBackoffMs = context.getProperty(RECONNECT_BACKOFF_MS).asInteger();
@@ -206,6 +208,8 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
         eventTypeFilter = context.getProperty(EVENT_TYPES).isSet()
                 ? Arrays.stream(context.getProperty(EVENT_TYPES).getValue().split(",")).map(String::trim).map(String::toLowerCase).filter(s -> !s.isEmpty()).collect(Collectors.toSet())
                 : Set.of();
+        keyFilter = KeyFilter.parse(null, context.getProperty(RedisScanReader.PREFIX_DENY_LIST).getValue(),
+                context.getProperty(RedisScanReader.PREFIX_ONLY_LIST).getValue());
 
         pubSubHandle = redisPool.openPubSub();
         pubSubHandle.onConnectionStateChange(this::recordDisconnect, this::recordReconnect);
@@ -222,6 +226,39 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
                 droppedEvents.incrementAndGet();
             }
         });
+    }
+
+    private void checkNotifyKeyspaceEvents(boolean required) {
+        String value;
+        try {
+            value = redisPool.withConnection(cmds -> {
+                try {
+                    return cmds.configGet("notify-keyspace-events").get().get("notify-keyspace-events");
+                } catch (Exception e) {
+                    throw new ProcessException("CONFIG GET notify-keyspace-events failed", e);
+                }
+            });
+        } catch (ProcessException e) {
+            value = null;
+            if (required) {
+                throw new ProcessException("Unable to read notify-keyspace-events and Require Config Check is true", e);
+            }
+        }
+        if (value == null) {
+            if (required) {
+                throw new ProcessException("CONFIG GET returned no notify-keyspace-events value and Require Config Check is true");
+            }
+            getLogger().warn("Unable to read notify-keyspace-events from the source (CONFIG may be blocked, as on "
+                    + "ElastiCache); continuing on the assumption that notifications are enabled outside Redis. "
+                    + "If no events arrive, check the source's notify-keyspace-events setting.");
+            return;
+        }
+        if (!value.contains("A") || !value.contains("E")) {
+            throw new ProcessException("Source Redis has notify-keyspace-events='" + value + "'; keyspace "
+                    + "notifications require at least 'AE' (or the specific classes covering your Event "
+                    + "Types plus 'E'). Enable it with: CONFIG SET notify-keyspace-events AE (or set the "
+                    + "equivalent parameter-group setting on managed services such as ElastiCache).");
+        }
     }
 
     private void recordDisconnect() {
@@ -318,6 +355,7 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
         }
         eventQueue = null;
         eventTypeFilter = null;
+        keyFilter = null;
         topologyBaseline = null;
         topologyCache = null;
     }
@@ -352,6 +390,10 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
             return;
         }
         if (!eventTypeFilter.isEmpty() && !eventTypeFilter.contains(parsed.eventType.toLowerCase())) {
+            return;
+        }
+        if (!keyFilter.allowsKey(parsed.key)) {
+            session.adjustCounter("Keyspace Events Skipped (Prefix Filter)", 1, false);
             return;
         }
 
@@ -432,7 +474,9 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
 
     private Relationship relationshipFor(String eventType) {
         return switch (eventType.toLowerCase()) {
-            case "del" -> REL_KEY_DELETED;
+            // RENAME and MOVE announce the old name with *_from: the key is gone from this DB,
+            // and the new name arrives as its own rename_to/move_to event on key_changed.
+            case "del", "rename_from", "move_from" -> REL_KEY_DELETED;
             case "expired" -> REL_KEY_EXPIRED;
             default -> REL_KEY_CHANGED;
         };

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Adds the Live Phase to an already-deployed "R2Dfly Migration" flow: RedisKeyspaceEventConsumer
-# -> RedisSingleKeyFetch -> the flow's existing RedisBatchWriter for creates/updates, and
-# RedisKeyspaceEventConsumer -> DeleteRedisKey for deletes/expiries. Reuses the flow's own two
-# connection-pool controller services and its scan-path writer rather than creating parallel
+# -> RedisSingleKeyFetch -> the flow's existing RedisBatchWriter for creates/updates (and its
+# existing ModuleTypeHandler for JSON and other module types), and RedisKeyspaceEventConsumer ->
+# DeleteRedisKey for deletes, expiries and the old name of a renamed key. A key that is gone by the
+# time RedisSingleKeyFetch reads it also goes to DeleteRedisKey. Reuses the flow's own two
+# connection-pool controller services, writer and module handler rather than creating parallel
 # copies. Idempotent: it creates only what's missing and converges a half-built flow (e.g. a
 # previous run that died between creating the processors and wiring them) on re-run. It wires and
 # validates; it never starts anything. The Live Phase comes up with the rest of the process group
@@ -170,14 +172,14 @@ if [[ "$SVC_SOURCE_STATE" == "ENABLED" && "$SVC_TARGET_STATE" == "ENABLED" ]]; t
   POOLS_ENABLED="true"
 fi
 
-echo "==> looking for the writer and the three Live Phase processors"
-# One pass for all four ids rather than four toolbox execs over the same JSON. Every name is
+echo "==> looking for the writer, the module handler and the three Live Phase processors"
+# One pass for all five ids rather than five toolbox execs over the same JSON. Every name is
 # pre-seeded to '' so the joined field count stays constant however many are actually present -
 # otherwise a missing processor would shift every id one field to the left on the read below.
 PROC_IDS="$(nifi_api_get "process-groups/$PG_ID/processors" | py3 "
 import json, sys
 d = json.load(sys.stdin)
-order = ['RedisBatchWriter', 'RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'DeleteRedisKey']
+order = ['RedisBatchWriter', 'ModuleTypeHandler', 'RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'DeleteRedisKey']
 ids = {name: '' for name in order}
 for p in d['processors']:
     t = p['component']['type']
@@ -187,9 +189,13 @@ for p in d['processors']:
             break
 print('|'.join(ids[name] for name in order))
 ")" || true
-IFS='|' read -r PROC_WRITER PROC_CONSUMER PROC_FETCH PROC_DELETE <<< "$PROC_IDS"
+IFS='|' read -r PROC_WRITER PROC_MODULE PROC_CONSUMER PROC_FETCH PROC_DELETE <<< "$PROC_IDS"
 if [[ -z "$PROC_WRITER" ]]; then
   echo "error: could not find the RedisBatchWriter processor in $PG_ID - the Live Phase reuses the scan path's writer rather than creating its own. Run ./deploy-to-nifi.sh first." >&2
+  exit 1
+fi
+if [[ -z "$PROC_MODULE" ]]; then
+  echo "error: could not find the ModuleTypeHandler processor in $PG_ID - the Live Phase sends JSON and other module-type changes to the scan path's handler. Run ./deploy-to-nifi.sh first." >&2
   exit 1
 fi
 
@@ -532,7 +538,7 @@ configure_processor "$PROC_CONSUMER" "RedisKeyspaceEventConsumer" \
 # or a live-path key would land on the target shaped differently from a scanned one.
 configure_processor "$PROC_FETCH" "RedisSingleKeyFetch" \
   "\"redis-connection-pool\":\"$SVC_SOURCE\",\"hash-field-batch-size\":\"10000\",\"list-chunk-size\":\"5000\",\"stream-read-count\":\"1000\",\"include-consumer-groups\":\"true\"" \
-  '"key_missing","module_type","failure"'
+  '"failure"'
 configure_processor "$PROC_DELETE" "DeleteRedisKey" \
   "\"dragonfly-connection-pool\":\"$SVC_TARGET\"" \
   '"success","failure"'
@@ -546,6 +552,11 @@ ensure_connection "$PROC_CONSUMER" "$PROC_DELETE" "RedisKeyspaceEventConsumer ke
   '"key_deleted","key_expired"'
 ensure_connection "$PROC_FETCH" "$PROC_WRITER" "RedisSingleKeyFetch success -> RedisBatchWriter" \
   '"success"'
+ensure_connection "$PROC_FETCH" "$PROC_MODULE" "RedisSingleKeyFetch module_type -> ModuleTypeHandler" \
+  '"module_type"'
+# A key deleted between its change event and the fetch still has to leave the target.
+ensure_connection "$PROC_FETCH" "$PROC_DELETE" "RedisSingleKeyFetch key_missing -> DeleteRedisKey" \
+  '"key_missing"'
 
 # After the configure_processor block above, which has already PUT the consumer's auto-terminated
 # list without topology_drift - NiFi rejects a relationship that is both auto-terminated and

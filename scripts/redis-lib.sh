@@ -192,6 +192,12 @@ redis_lib_check_keyspace_events() {
   # `|| true`: an unreachable server here must fall through to the "value doesn't qualify" return
   # below (the caller reports it) rather than aborting the calling script under set -e/pipefail.
   out="$(redis_cli "$container" "$connstr" CONFIG GET notify-keyspace-events 2>/dev/null | tr -d '\r')" || true
+  # Exit 2 when the reply carries no setting at all (CONFIG blocked or renamed, as on ElastiCache),
+  # so callers can tell "unknown" apart from "known to be wrong".
+  if [[ "$(sed -n '1p' <<< "$out")" != "notify-keyspace-events" ]]; then
+    echo "$out"
+    return 2
+  fi
   value="$(sed -n '2p' <<< "$out")"
   if [[ "$value" == *A* && "$value" == *E* ]]; then
     return 0

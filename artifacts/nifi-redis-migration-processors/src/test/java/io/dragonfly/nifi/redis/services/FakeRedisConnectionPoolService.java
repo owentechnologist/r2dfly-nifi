@@ -20,8 +20,8 @@ import java.util.function.Function;
  */
 public class FakeRedisConnectionPoolService extends AbstractControllerService implements RedisConnectionPoolService {
 
-    /** The minimum {@code notify-keyspace-events} setting keyspace consumers validate against. */
-    private static final String NOTIFY_KEYSPACE_EVENTS = "AE";
+    /** Defaults to the minimum setting keyspace consumers accept; null makes CONFIG GET fail, as on ElastiCache. */
+    private volatile String notifyKeyspaceEvents = "AE";
 
     private final FakeRedisPubSubHandle handle = new FakeRedisPubSubHandle();
 
@@ -30,6 +30,10 @@ public class FakeRedisConnectionPoolService extends AbstractControllerService im
 
     public FakeRedisPubSubHandle handle() {
         return handle;
+    }
+
+    public void setNotifyKeyspaceEvents(String value) {
+        this.notifyKeyspaceEvents = value;
     }
 
     public void setTopology(ClusterTopologySnapshot topology) {
@@ -48,8 +52,10 @@ public class FakeRedisConnectionPoolService extends AbstractControllerService im
                 new Class<?>[]{RedisClusterAsyncCommands.class},
                 (proxy, method, args) -> {
                     if ("configGet".equals(method.getName())) {
-                        return new PipelinedRedisFuture<>(CompletableFuture.completedFuture(
-                                Map.of("notify-keyspace-events", NOTIFY_KEYSPACE_EVENTS)));
+                        String value = notifyKeyspaceEvents;
+                        return new PipelinedRedisFuture<>(value == null
+                                ? CompletableFuture.failedFuture(new IllegalStateException("ERR unknown command 'CONFIG'"))
+                                : CompletableFuture.completedFuture(Map.of("notify-keyspace-events", value)));
                     }
                     throw new UnsupportedOperationException(method.getName());
                 });

@@ -1,6 +1,7 @@
 package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
+import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.KeyRecord;
 import io.dragonfly.nifi.redis.util.RedisTypeSerializer;
 import io.dragonfly.nifi.redis.util.RedisValueFetcher;
@@ -13,7 +14,9 @@ import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
+import org.apache.nifi.processor.util.StandardValidators;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -31,13 +34,24 @@ public class RedisSingleKeyFetch extends AbstractProcessor {
             .identifiesControllerService(RedisConnectionPoolService.class)
             .build();
 
+    public static final PropertyDescriptor KEY_TYPE_FILTER = new PropertyDescriptor.Builder()
+            .name("key-type-filter")
+            .displayName("Key Type Filter")
+            .description("Comma-separated list of types to fetch, matched case-insensitively against TYPE "
+                    + "(for example string,hash,ReJSON-RL,TopK-TYPE). A key of any other type is dropped and "
+                    + "counted. Set it to the same value as RedisScanReader's Key Type Filter so the live "
+                    + "phase copies the same keys as the scan. Leave unset to fetch every type.")
+            .required(false)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
+
     public static final Relationship REL_SUCCESS = RedisTypeDeserializer.REL_SUCCESS;
     public static final Relationship REL_KEY_MISSING = RedisTypeDeserializer.REL_KEY_MISSING;
     public static final Relationship REL_MODULE_TYPE = RedisTypeDeserializer.REL_MODULE_TYPE;
     public static final Relationship REL_FAILURE = RedisTypeDeserializer.REL_FAILURE;
 
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
-            REDIS_CONNECTION_POOL, RedisTypeDeserializer.HASH_FIELD_BATCH_SIZE, RedisTypeDeserializer.LIST_CHUNK_SIZE,
+            REDIS_CONNECTION_POOL, KEY_TYPE_FILTER, RedisTypeDeserializer.HASH_FIELD_BATCH_SIZE, RedisTypeDeserializer.LIST_CHUNK_SIZE,
             RedisTypeDeserializer.STREAM_READ_COUNT, RedisTypeDeserializer.INCLUDE_CONSUMER_GROUPS);
 
     private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_SUCCESS, REL_KEY_MISSING, REL_MODULE_TYPE, REL_FAILURE);
@@ -72,20 +86,31 @@ public class RedisSingleKeyFetch extends AbstractProcessor {
         int listChunkSize = context.getProperty(RedisTypeDeserializer.LIST_CHUNK_SIZE).asInteger();
         int streamReadCount = context.getProperty(RedisTypeDeserializer.STREAM_READ_COUNT).asInteger();
         boolean includeConsumerGroups = context.getProperty(RedisTypeDeserializer.INCLUDE_CONSUMER_GROUPS).asBoolean();
+        KeyFilter filter = KeyFilter.parse(context.getProperty(KEY_TYPE_FILTER).getValue(), null, null);
 
         try {
-            String type = redisPool.withConnection(cmds -> {
+            TypeAndTtl meta = redisPool.withConnection(cmds -> {
+                byte[] rawKey = key.getBytes(StandardCharsets.UTF_8);
                 try {
-                    return cmds.type(key.getBytes(java.nio.charset.StandardCharsets.UTF_8)).get();
+                    var type = cmds.type(rawKey);
+                    var ttl = cmds.pttl(rawKey);
+                    return new TypeAndTtl(type.get(), ttl.get());
                 } catch (Exception e) {
-                    throw new ProcessException("TYPE command failed for key " + key, e);
+                    throw new ProcessException("TYPE/PTTL failed for key " + key, e);
                 }
             });
+            String type = meta.type();
 
             if ("none".equals(type)) {
                 session.transfer(flowFile, REL_KEY_MISSING);
                 return;
             }
+            if (!filter.allowsType(type)) {
+                session.adjustCounter("Keys Skipped (Type Filter)", 1, false);
+                session.remove(flowFile);
+                return;
+            }
+            flowFile = session.putAttribute(flowFile, "redis.ttl.ms", String.valueOf(meta.ttlMs()));
             if (!CORE_TYPES.contains(type)) {
                 flowFile = session.putAttribute(flowFile, "redis.type", type);
                 session.transfer(flowFile, REL_MODULE_TYPE);
@@ -93,7 +118,7 @@ public class RedisSingleKeyFetch extends AbstractProcessor {
             }
 
             Optional<List<KeyRecord>> records = redisPool.withConnection(cmds -> RedisValueFetcher.fetch(
-                    cmds, key, type, -1L, null, hashFieldBatchSize, listChunkSize, streamReadCount, includeConsumerGroups));
+                    cmds, key, type, meta.ttlMs(), null, hashFieldBatchSize, listChunkSize, streamReadCount, includeConsumerGroups));
 
             if (records.isEmpty()) {
                 session.transfer(flowFile, REL_KEY_MISSING);
@@ -122,5 +147,8 @@ public class RedisSingleKeyFetch extends AbstractProcessor {
             getLogger().error("Failed to fetch key {}", key, e);
             session.transfer(session.penalize(flowFile), REL_FAILURE);
         }
+    }
+
+    private record TypeAndTtl(String type, long ttlMs) {
     }
 }

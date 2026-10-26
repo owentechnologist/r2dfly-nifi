@@ -1,6 +1,7 @@
 package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
+import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.PartitionAssigner;
 import io.lettuce.core.KeyScanCursor;
 import io.lettuce.core.LettuceFutures;
@@ -24,11 +25,9 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 @Tags({"redis", "migration", "scan", "source"})
 @CapabilityDescription("Scans the source Redis keyspace, partitioned across concurrent tasks by hash-slot "
@@ -203,10 +202,8 @@ public class RedisScanReader extends AbstractProcessor {
 
         int scanCount = context.getProperty(SCAN_COUNT).asInteger();
         String pattern = context.getProperty(KEY_PATTERN).getValue();
-        Set<String> allowedTypes = Arrays.stream(context.getProperty(KEY_TYPE_FILTER).getValue().split(","))
-                .map(String::trim).map(String::toLowerCase).filter(s -> !s.isEmpty()).collect(Collectors.toSet());
-        List<byte[]> denyPrefixes = parsePrefixList(context.getProperty(PREFIX_DENY_LIST).getValue());
-        List<byte[]> onlyPrefixes = parsePrefixList(context.getProperty(PREFIX_ONLY_LIST).getValue());
+        KeyFilter filter = KeyFilter.parse(context.getProperty(KEY_TYPE_FILTER).getValue(),
+                context.getProperty(PREFIX_DENY_LIST).getValue(), context.getProperty(PREFIX_ONLY_LIST).getValue());
         boolean emitTtl = context.getProperty(EMIT_TTL).asBoolean();
         boolean skipVolatile = context.getProperty(SKIP_VOLATILE_KEYS).asBoolean();
         long volatileThresholdMs = context.getProperty(VOLATILE_KEY_TTL_THRESHOLD_MS).isSet()
@@ -228,7 +225,7 @@ public class RedisScanReader extends AbstractProcessor {
             scanCursor = ScanCursor.INITIAL;
             getLogger().info("Starting fresh cluster-mode SCAN for partition {} (clusterMode={}, allowedTypes={}, pattern='{}') - "
                     + "cluster SCAN cursors can't be checkpointed/restored across restarts",
-                    partitionIndex, clusterMode, allowedTypes, pattern);
+                    partitionIndex, clusterMode, filter.allowedTypes(), pattern);
         } else {
             String cursor;
             try {
@@ -237,13 +234,13 @@ public class RedisScanReader extends AbstractProcessor {
                 throw new ProcessException("Unable to restore SCAN cursor", e);
             }
             getLogger().info("Restored cursor '{}' for partition {} (clusterMode={}, allowedTypes={}, pattern='{}')",
-                    cursor, partitionIndex, clusterMode, allowedTypes, pattern);
+                    cursor, partitionIndex, clusterMode, filter.allowedTypes(), pattern);
             scanCursor = ScanCursor.of(cursor);
         }
         while (!Thread.currentThread().isInterrupted()) {
             ScanCursor currentCursor = scanCursor;
             ScanPage page = redisPool.withConnection(cmds ->
-                    scanPage(cmds, currentCursor, scanCount, pattern, allowedTypes, denyPrefixes, onlyPrefixes,
+                    scanPage(cmds, currentCursor, scanCount, pattern, filter,
                             emitTtl, skipVolatile, volatileThresholdMs, clusterMode, partitionIndex, partitionCount));
             getLogger().info("SCAN page: {} entries, {} failures, cursorAfter='{}', finished={}",
                     page.entries.size(), page.failures.size(), page.cursorAfterPage.getCursor(), page.cursorAfterPage.isFinished());
@@ -313,36 +310,6 @@ public class RedisScanReader extends AbstractProcessor {
         };
     }
 
-    private static List<byte[]> parsePrefixList(String value) {
-        if (value == null || value.isBlank()) {
-            return List.of();
-        }
-        return Arrays.stream(value.split(","))
-                .map(String::trim)
-                .filter(s -> !s.isEmpty())
-                .map(s -> s.getBytes(StandardCharsets.UTF_8))
-                .collect(Collectors.toList());
-    }
-
-    private static boolean startsWithAny(byte[] key, List<byte[]> prefixes) {
-        for (byte[] prefix : prefixes) {
-            if (key.length < prefix.length) {
-                continue;
-            }
-            boolean match = true;
-            for (int i = 0; i < prefix.length; i++) {
-                if (key[i] != prefix[i]) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     // LettuceFutures.awaitAll throws if ANY future completed exceptionally, which would
     // otherwise propagate out of scanPage/onTrigger and permanently halt this processor on a
     // single unsupported command (e.g. a source that doesn't implement OBJECT ENCODING) -
@@ -359,7 +326,7 @@ public class RedisScanReader extends AbstractProcessor {
 
     private static ScanPage scanPage(
             RedisClusterAsyncCommands<byte[], byte[]> cmds, ScanCursor cursor, int scanCount, String pattern,
-            Set<String> allowedTypes, List<byte[]> denyPrefixes, List<byte[]> onlyPrefixes, boolean emitTtl,
+            KeyFilter filter, boolean emitTtl,
             boolean skipVolatile, long volatileThresholdMs, boolean clusterMode, int partitionIndex,
             int partitionCount) {
         ScanArgs scanArgs = new ScanArgs().match(pattern).limit(scanCount);
@@ -381,10 +348,7 @@ public class RedisScanReader extends AbstractProcessor {
             } else if (!PartitionAssigner.standaloneOwnsKey(key, partitionIndex, partitionCount)) {
                 continue;
             }
-            if (!denyPrefixes.isEmpty() && startsWithAny(key, denyPrefixes)) {
-                continue;
-            }
-            if (!onlyPrefixes.isEmpty() && !startsWithAny(key, onlyPrefixes)) {
+            if (!filter.allowsKey(key)) {
                 continue;
             }
             candidateKeys.add(key);
@@ -412,7 +376,7 @@ public class RedisScanReader extends AbstractProcessor {
                 failures.add(new ScanEntry(key, "unknown", -2, null));
                 continue;
             }
-            if (!allowedTypes.contains(type.toLowerCase())) {
+            if (!filter.allowsType(type)) {
                 continue;
             }
             ttlKeys.add(key);
