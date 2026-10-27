@@ -35,6 +35,14 @@ Source:
                                  default: standalone)
   --source-require-tls          require TLS to the source (env SOURCE_REQUIRE_TLS, default: false)
 
+Files (paths inside the NiFi container; simple-migration.sh copies files in and out):
+  --source-file PATH            read key records from a JSON-lines file instead of a source
+                                 (env SOURCE_FILE). KeyRecordFileReader feeds RedisBatchWriter.
+  --target-file PATH            write key records to a file instead of a target (env TARGET_FILE).
+                                 KeyRecordFileWriter takes RedisBatchWriter's place. Module keys
+                                 cannot be written to a file, so --key-types keeps only core types.
+  --target-file-format F        jsonl (default) or resp (env TARGET_FILE_FORMAT)
+
 Scan behavior:
   --key-types LIST              comma-separated Redis types to scan/migrate (env KEY_TYPES,
                                  default: string,hash,set,zset,list,stream,ReJSON-RL - ReJSON-RL
@@ -304,6 +312,9 @@ SOURCE_REQUIRE_TLS="${SOURCE_REQUIRE_TLS:-false}"
 TARGET_CONNECTION_STRING="${TARGET_CONNECTION_STRING:-}"
 TARGET_CONNECTION_MODE="${TARGET_CONNECTION_MODE:-standalone}"
 TARGET_REQUIRE_TLS="${TARGET_REQUIRE_TLS:-false}"
+SOURCE_FILE="${SOURCE_FILE:-}"
+TARGET_FILE="${TARGET_FILE:-}"
+TARGET_FILE_FORMAT="${TARGET_FILE_FORMAT:-jsonl}"
 START_MODE="ask"
 SOURCE_CONTAINER="${SOURCE_CONTAINER:-}"
 TARGET_CONTAINER="${TARGET_CONTAINER:-}"
@@ -365,6 +376,9 @@ while [[ $# -gt 0 ]]; do
     --target-connection-string) TARGET_CONNECTION_STRING="$2"; shift 2 ;;
     --target-connection-mode) TARGET_CONNECTION_MODE="$2"; shift 2 ;;
     --target-require-tls) TARGET_REQUIRE_TLS="true"; shift ;;
+    --source-file) SOURCE_FILE="$2"; shift 2 ;;
+    --target-file) TARGET_FILE="$2"; shift 2 ;;
+    --target-file-format) TARGET_FILE_FORMAT="$2"; shift 2 ;;
     --start) START_MODE="yes"; shift ;;
     --no-start) START_MODE="no"; shift ;;
     --source-container) SOURCE_CONTAINER="$2"; shift 2 ;;
@@ -410,12 +424,24 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$SOURCE_CONNECTION_STRING" ]]; then
-  echo "error: --source-connection-string (or SOURCE_CONNECTION_STRING) is required" >&2; usage; exit 1
+if [[ -z "$SOURCE_CONNECTION_STRING" && -z "$SOURCE_FILE" ]]; then
+  echo "error: --source-connection-string (or SOURCE_CONNECTION_STRING) or --source-file is required" >&2; usage; exit 1
 fi
-if [[ -z "$TARGET_CONNECTION_STRING" ]]; then
-  echo "error: --target-connection-string (or TARGET_CONNECTION_STRING) is required" >&2; usage; exit 1
+if [[ -z "$TARGET_CONNECTION_STRING" && -z "$TARGET_FILE" ]]; then
+  echo "error: --target-connection-string (or TARGET_CONNECTION_STRING) or --target-file is required" >&2; usage; exit 1
 fi
+if [[ -n "$SOURCE_FILE" && -n "$TARGET_FILE" ]]; then
+  echo "error: --source-file and --target-file cannot be used together" >&2; usage; exit 1
+fi
+case "$TARGET_FILE_FORMAT" in
+  jsonl|resp) ;;
+  *) echo "error: --target-file-format must be jsonl or resp (got '$TARGET_FILE_FORMAT')" >&2; usage; exit 1 ;;
+esac
+# A file holds no search indexes, and a key written to a file must be a key record, not a DUMP payload.
+if [[ -n "$SOURCE_FILE" || -n "$TARGET_FILE" ]]; then
+  IGNORE_SEARCH_INDEXES="true"
+fi
+[[ -n "$TARGET_FILE" ]] && RESTORE_FAST_PATH="false"
 if [[ -z "$NIFI_TOKEN" && ( -z "$NIFI_USER" || -z "$NIFI_PASS" ) ]]; then
   echo "error: NiFi credentials required - pass --nifi-token, or both --nifi-user and --nifi-password" >&2; usage; exit 1
 fi
@@ -585,6 +611,26 @@ fi
 # still migrated where possible: ModuleTypeHandler tries each with DUMP/RESTORE and sends what the
 # target rejects (or cannot hold at all) to RedisDeadLetterWriter with redis.incompatible.reason,
 # so the run continues and every such key is accounted for in the summary.
+if [[ -n "$TARGET_FILE" ]]; then
+  IFS=',' read -ra _KT_ALL <<< "$KEY_TYPES"
+  _KT_CORE=()
+  _KT_DROPPED=()
+  for _kt in "${_KT_ALL[@]}"; do
+    case "$(tr '[:upper:]' '[:lower:]' <<< "$_kt")" in
+      string|hash|list|set|zset|stream) _KT_CORE+=("$_kt") ;;
+      *) _KT_DROPPED+=("$_kt") ;;
+    esac
+  done
+  if [[ ${#_KT_CORE[@]} -eq 0 ]]; then
+    echo "error: none of --key-types ($KEY_TYPES) can be written to a file" >&2; exit 1
+  fi
+  if [[ ${#_KT_DROPPED[@]} -gt 0 ]]; then
+    echo "warning: module keys cannot be written to a file; skipping $(IFS=','; echo "${_KT_DROPPED[*]}") keys (counted as Scan Keys Skipped by Type Filter)" >&2
+  fi
+  KEY_TYPES="$(IFS=','; echo "${_KT_CORE[*]}")"
+  unset _KT_ALL _KT_CORE _KT_DROPPED _kt
+fi
+
 if [[ "$DFLY_TO_DFLY" != "true" ]]; then
   UNIVERSAL_KEY_TYPES=(string hash set zset list stream rejson-rl topk-type)
   IFS=',' read -ra KEY_TYPES_CHECK <<< "$KEY_TYPES"
@@ -679,7 +725,7 @@ import json, sys
 d = json.load(sys.stdin)
 order = ['RedisScanReader', 'RedisBatchWriter', 'ModuleTypeHandler', 'RedisTypeDeserializer', 'SearchIndexExporter', 'SearchIndexRehydrator',
          'RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'RedisReplicationReader', 'RedisTypeDeserializer (live)',
-         'MigrationReconciler']
+         'MigrationReconciler', 'RedisDeadLetterWriter', 'KeyRecordFileWriter', 'KeyRecordFileReader']
 ids = {name: '' for name in order}
 for p in d['processors']:
     t = p['component']['type']
@@ -693,7 +739,7 @@ for p in d['processors']:
             break
 print('|'.join(ids[name] for name in order))
 ")" || true
-IFS='|' read -r PROC_SCAN PROC_WRITER PROC_MTH PROC_DESER PROC_SIDX_EXPORT PROC_SIDX_REHYDRATE PROC_LIVE_CONSUMER PROC_LIVE_FETCH PROC_REPL_READER PROC_REPL_DESER PROC_RECONCILER <<< "$PROC_IDS"
+IFS='|' read -r PROC_SCAN PROC_WRITER PROC_MTH PROC_DESER PROC_SIDX_EXPORT PROC_SIDX_REHYDRATE PROC_LIVE_CONSUMER PROC_LIVE_FETCH PROC_REPL_READER PROC_REPL_DESER PROC_RECONCILER PROC_DEAD_LETTER PROC_FILE_WRITER PROC_FILE_READER <<< "$PROC_IDS"
 if [[ -z "$PROC_SCAN" ]]; then
   echo "error: could not find the RedisScanReader processor in $PG_ID" >&2; exit 1
 fi
@@ -1031,11 +1077,21 @@ set_pool_properties() {
   nifi_api_put_checked "controller-services/$svc_id" "$body" > /dev/null
 }
 
-echo "==> setting source Redis connection details (mode=$SOURCE_CONNECTION_MODE)"
-set_pool_properties "$SVC_SOURCE" "$SOURCE_CONNECTION_STRING" "$SOURCE_REQUIRE_TLS" "$SOURCE_CONNECTION_MODE" "$SOURCE_READ_FROM_PROPERTY"
+# The side that is a file has no server, so its pool keeps whatever it held and goes unused.
+UNUSED_SVC=""
+if [[ -n "$SOURCE_FILE" ]]; then
+  UNUSED_SVC="$SVC_SOURCE"
+else
+  echo "==> setting source Redis connection details (mode=$SOURCE_CONNECTION_MODE)"
+  set_pool_properties "$SVC_SOURCE" "$SOURCE_CONNECTION_STRING" "$SOURCE_REQUIRE_TLS" "$SOURCE_CONNECTION_MODE" "$SOURCE_READ_FROM_PROPERTY"
+fi
 
-echo "==> setting target Dragonfly connection details (mode=$TARGET_CONNECTION_MODE)"
-set_pool_properties "$SVC_TARGET" "$TARGET_CONNECTION_STRING" "$TARGET_REQUIRE_TLS" "$TARGET_CONNECTION_MODE" MASTER
+if [[ -n "$TARGET_FILE" ]]; then
+  UNUSED_SVC="$SVC_TARGET"
+else
+  echo "==> setting target Dragonfly connection details (mode=$TARGET_CONNECTION_MODE)"
+  set_pool_properties "$SVC_TARGET" "$TARGET_CONNECTION_STRING" "$TARGET_REQUIRE_TLS" "$TARGET_CONNECTION_MODE" MASTER
+fi
 
 echo "==> enabling controller services"
 nifi_cli pg-enable-services -pgid "$PG_ID" || true
@@ -1048,6 +1104,8 @@ d = json.load(sys.stdin)
 bad = False
 for s in d['controllerServices']:
     c = s['component']
+    if s['id'] == '$UNUSED_SVC':
+        continue
     print(f\"  {c['name']}: state={c.get('state')} validation={c.get('validationStatus')}\")
     if c.get('validationStatus') != 'VALID':
         bad = True
@@ -1134,6 +1192,113 @@ if [[ "$IGNORE_SEARCH_INDEXES" != "true" ]]; then
     echo "warning: SearchIndexExporter/SearchIndexRehydrator not found in this flow (older flow definition?) - search index migration skipped. Delete and re-import the process group (reset-r2dfly-flow.sh, then deploy-to-nifi.sh) to pick them up, or pass --ignore-search-indexes to silence this." >&2
   fi
 fi
+
+# --- File modes. KeyRecordFileWriter takes RedisBatchWriter's place after the deserializer, and
+#     KeyRecordFileReader feeds RedisBatchWriter in the scan's place. Both are created on first use
+#     and left DISABLED afterwards, so the whole-group start of a normal run never starts them. ---
+NAR_BUNDLE='{"group":"io.dragonfly.nifi.redis","artifact":"nifi-redis-migration-nar","version":"1.0.0-SNAPSHOT"}'
+
+# ensure_processor <type> <x> <y> - the id of this group's processor of that type, created if missing.
+ensure_processor() {
+  local type="$1" id
+  id="$(nifi_api_post "process-groups/$PG_ID/processors" "{\"revision\":{\"version\":0},\"component\":{\"type\":\"io.dragonfly.nifi.redis.processors.$type\",\"bundle\":$NAR_BUNDLE,\"name\":\"$type\",\"position\":{\"x\":$2,\"y\":$3}}}" \
+    | py3 "import json,sys; print(json.load(sys.stdin)['id'])")" || true
+  if [[ -z "$id" ]]; then
+    echo "error: could not create $type in $PG_ID" >&2; exit 1
+  fi
+  echo "$id"
+}
+
+# connection_id <source-id> <destination-id> <relationship>
+connection_id() {
+  nifi_api_get "process-groups/$PG_ID/connections" | py3 "
+import json, sys
+for c in json.load(sys.stdin)['connections']:
+    k = c['component']
+    if k['source']['id'] == '$1' and k['destination']['id'] == '$2' and '$3' in (k.get('selectedRelationships') or []):
+        print(c['id'])
+        break
+" || true
+}
+
+connect_processors() {
+  [[ -n "$(connection_id "$1" "$2" "$3")" ]] && return 0
+  nifi_api_post "process-groups/$PG_ID/connections" "{\"revision\":{\"version\":0},\"component\":{\"source\":{\"id\":\"$1\",\"groupId\":\"$PG_ID\",\"type\":\"PROCESSOR\"},\"destination\":{\"id\":\"$2\",\"groupId\":\"$PG_ID\",\"type\":\"PROCESSOR\"},\"selectedRelationships\":[\"$3\"],\"backPressureObjectThreshold\":10000,\"backPressureDataSizeThreshold\":\"1 GB\"}}" \
+    | py3 "import json,sys; json.load(sys.stdin)['id']" >/dev/null || { echo "error: could not connect $1 to $2 ($3)" >&2; exit 1; }
+}
+
+# disconnect_processors <source-id> <destination-id> <relationship> - drops what is queued first,
+# since NiFi deletes only an empty connection.
+disconnect_processors() {
+  local id drop i
+  id="$(connection_id "$1" "$2" "$3")"
+  [[ -n "$id" ]] || return 0
+  drop="$(nifi_api_post "flowfile-queues/$id/drop-requests" '{}' | py3 "import json,sys; print(json.load(sys.stdin)['dropRequest']['id'])")" || true
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -n "$drop" ]] || break
+    nifi_api_get "flowfile-queues/$id/drop-requests/$drop" | py3 "import json,sys; sys.exit(0 if json.load(sys.stdin)['dropRequest']['finished'] else 1)" && break
+    sleep 1
+  done
+  nifi_api_delete "connections/$id?version=$(nifi_current_version "connections/$id")" >/dev/null || true
+  [[ -z "$(connection_id "$1" "$2" "$3")" ]] || { echo "error: could not remove the connection $id" >&2; exit 1; }
+}
+
+# set_processor_state <id> <RUNNING|STOPPED|DISABLED>
+set_processor_state() {
+  local ver
+  ver="$(nifi_current_version "processors/$1")" || true
+  nifi_api_put "processors/$1/run-status" "{\"revision\":{\"version\":$ver},\"state\":\"$2\",\"disconnectedNodeAcknowledged\":false}" >/dev/null || true
+}
+
+FILE_PROCESSORS_TO_START=()
+FILE_RECORDS_BASE=0
+SOURCE_FILE_RECORDS=0
+if [[ -n "$SOURCE_FILE" || -n "$TARGET_FILE" || -n "$PROC_FILE_WRITER" || -n "$PROC_FILE_READER" ]]; then
+  if [[ -z "$PROC_DEAD_LETTER" ]]; then
+    echo "error: could not find the RedisDeadLetterWriter processor in $PG_ID. Re-import the baseline with reset-r2dfly-flow.sh." >&2; exit 1
+  fi
+  echo "==> stopping the flow to wire it for this run's source and target"
+  nifi_cli pg-stop -pgid "$PG_ID" >/dev/null || true
+  wait_for_processors_stopped "$PG_ID" || true
+fi
+if [[ -n "$TARGET_FILE" ]]; then
+  [[ -n "$PROC_FILE_WRITER" ]] || PROC_FILE_WRITER="$(ensure_processor KeyRecordFileWriter 1200 400)"
+  PROC_VER="$(nifi_current_version "processors/$PROC_FILE_WRITER")" || true
+  nifi_api_put_checked "processors/$PROC_FILE_WRITER" "{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_FILE_WRITER\",\"config\":{\"properties\":{\"file\":\"$TARGET_FILE\",\"format\":\"$TARGET_FILE_FORMAT\"}}}}" > /dev/null
+  connect_processors "$PROC_FILE_WRITER" "$PROC_DEAD_LETTER" failure
+  connect_processors "$PROC_DESER" "$PROC_FILE_WRITER" success
+  disconnect_processors "$PROC_DESER" "$PROC_WRITER" success
+  FILE_PROCESSORS_TO_START=("$PROC_SCAN" "$PROC_DESER" "$PROC_FILE_WRITER" "$PROC_DEAD_LETTER")
+elif [[ -n "$PROC_FILE_WRITER" ]]; then
+  connect_processors "$PROC_DESER" "$PROC_WRITER" success
+  disconnect_processors "$PROC_DESER" "$PROC_FILE_WRITER" success
+fi
+if [[ -n "$SOURCE_FILE" ]]; then
+  [[ -n "$PROC_FILE_READER" ]] || PROC_FILE_READER="$(ensure_processor KeyRecordFileReader 1200 0)"
+  PROC_VER="$(nifi_current_version "processors/$PROC_FILE_READER")" || true
+  nifi_api_put_checked "processors/$PROC_FILE_READER" "{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_FILE_READER\",\"config\":{\"properties\":{\"file\":\"$SOURCE_FILE\"}}}}" > /dev/null
+  # A file read before under the same path would otherwise resume at its end.
+  nifi_api_post "processors/$PROC_FILE_READER/state/clear-requests" '{}' > /dev/null || true
+  connect_processors "$PROC_FILE_READER" "$PROC_WRITER" success
+  connect_processors "$PROC_FILE_READER" "$PROC_DEAD_LETTER" failure
+  FILE_PROCESSORS_TO_START=("$PROC_FILE_READER" "$PROC_WRITER" "$PROC_DEAD_LETTER")
+fi
+# Left disabled whatever this run does: a file run starts only its own processors, below.
+[[ -n "$PROC_FILE_WRITER" ]] && set_processor_state "$PROC_FILE_WRITER" DISABLED
+[[ -n "$PROC_FILE_READER" ]] && set_processor_state "$PROC_FILE_READER" DISABLED
+
+# nifi_counter <name> - the counter summed across processors, 0 if never incremented.
+nifi_counter() {
+  nifi_api_get "counters" | py3 "
+import json, sys
+total = 0
+for c in json.load(sys.stdin).get('counters', {}).get('aggregateSnapshot', {}).get('counters', []):
+    # NiFi lists each counter twice: per processor, and again under \"All <type>'s\".
+    if c.get('name') == '$1' and not c.get('context', '').startswith('All '):
+        total += int(c.get('valueCount') or 0)
+print(total)
+" 2>/dev/null || echo 0
+}
 
 should_start() {
   case "$START_MODE" in
@@ -1309,20 +1474,36 @@ print_timeout_warning() {
   echo "warning: run simple-troubleshoot.sh if there appears to be any issue with the migration." >&2
 }
 
+# A file side is counted in key records: the lines of the file read, or the records written so far.
+source_count() {
+  if [[ -n "$SOURCE_FILE" ]]; then
+    echo "$SOURCE_FILE_RECORDS"
+  else
+    redis_dbsize "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING" "$SOURCE_CONNECTION_MODE" "${SOURCE_CLUSTER_NODES:-}"
+  fi
+}
+target_count() {
+  if [[ -n "$TARGET_FILE" ]]; then
+    echo $(( $(nifi_counter "File Records Written") - FILE_RECORDS_BASE ))
+  else
+    redis_dbsize "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING" "$TARGET_CONNECTION_MODE" "${TARGET_CLUSTER_NODES:-}"
+  fi
+}
+
 poll_until_synced() {
   local interval="${POLL_INTERVAL:-5}"
   local timeout="${POLL_TIMEOUT:-300}"
   local max_duration="${POLL_MAX_DURATION:-3600}"
   local max_quiet="${POLL_QUIET_ROUNDS:-3}"
 
-  echo "==> tracking DBSIZE on '$SOURCE_CONTAINER' (source) and '$TARGET_CONTAINER' (target) every ${interval}s"
+  echo "==> tracking ${SOURCE_FILE:-DBSIZE on '$SOURCE_CONTAINER'} (source) and ${TARGET_FILE:-DBSIZE on '$TARGET_CONTAINER'} (target) every ${interval}s"
   echo "    (gives up after ${timeout}s with no forward progress, or ${max_duration}s total either way)"
   
   local elapsed=0 last_progress_elapsed=0 src tgt last_tgt="" quiet_rounds=0 rate pct
   
   while true; do
-    src="$(redis_dbsize "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING" "$SOURCE_CONNECTION_MODE" "${SOURCE_CLUSTER_NODES:-}")" || true
-    tgt="$(redis_dbsize "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING" "$TARGET_CONNECTION_MODE" "${TARGET_CLUSTER_NODES:-}")" || true
+    src="$(source_count)" || true
+    tgt="$(target_count)" || true
     
     if [[ -z "$src" || -z "$tgt" ]]; then
       echo "  could not read DBSIZE (source='$src' target='$tgt') - check your redis-cli path. Giving up." >&2
@@ -1410,8 +1591,21 @@ poll_until_synced() {
 
 
 if should_start; then
-  echo "==> starting the flow"
-  nifi_cli pg-start -pgid "$PG_ID"
+  if [[ ${#FILE_PROCESSORS_TO_START[@]} -gt 0 ]]; then
+    echo "==> starting only the processors this file run uses"
+    FILE_RECORDS_BASE="$(nifi_counter "File Records Written")"
+    if [[ -n "$SOURCE_FILE" ]]; then
+      SOURCE_FILE_RECORDS="$(runtime_exec "$CONTAINER_NAME" grep -c . "$SOURCE_FILE" | tr -d '[:space:]')" || true
+      echo "  $SOURCE_FILE holds ${SOURCE_FILE_RECORDS:=0} key records"
+    fi
+    for proc_id in "${FILE_PROCESSORS_TO_START[@]}"; do
+      set_processor_state "$proc_id" STOPPED
+      set_processor_state "$proc_id" RUNNING
+    done
+  else
+    echo "==> starting the flow"
+    nifi_cli pg-start -pgid "$PG_ID"
+  fi
   echo "==> flow started"
   if [[ "$POLL_MODE" == "yes" ]]; then
     # Fetched once here (CLUSTER NODES, on whichever side is cluster-mode) and reused for every
@@ -1421,8 +1615,18 @@ if should_start; then
     TARGET_CLUSTER_NODES=""
     [[ "$SOURCE_CONNECTION_MODE" == "cluster" ]] && SOURCE_CLUSTER_NODES="$(cluster_lib_each_master "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")"
     [[ "$TARGET_CONNECTION_MODE" == "cluster" ]] && TARGET_CLUSTER_NODES="$(cluster_lib_each_master "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING")"
-    auto_tune_poll_durations
+    [[ ${#FILE_PROCESSORS_TO_START[@]} -gt 0 ]] || auto_tune_poll_durations
     poll_until_synced || true
+  fi
+  if [[ ${#FILE_PROCESSORS_TO_START[@]} -gt 0 && "$POLL_MODE" == "yes" ]]; then
+    echo "==> stopping the file run's processors"
+    for proc_id in "${FILE_PROCESSORS_TO_START[@]}"; do
+      set_processor_state "$proc_id" STOPPED
+    done
+    wait_for_processors_stopped "$PG_ID" || true
+    [[ -n "$PROC_FILE_WRITER" ]] && set_processor_state "$PROC_FILE_WRITER" DISABLED
+    [[ -n "$PROC_FILE_READER" ]] && set_processor_state "$PROC_FILE_READER" DISABLED
+    [[ -n "$TARGET_FILE" ]] && echo "    key records written to $TARGET_FILE: $(target_count)"
   fi
 else
   echo "==> flow left stopped. Start it later with: nifi pg-start -pgid $PG_ID (via the NiFi CLI), or from the canvas."

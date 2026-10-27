@@ -15,8 +15,10 @@ r2dfly has no `shake.toml` importer yet. Translate a config by hand with the tab
 | `sync_reader`, left running as a continuous sync | `scripts/continuous-migration.sh --live-source replication` |
 | `scan_reader` with `ksn = false` | `scripts/simple-migration.sh` |
 | `scan_reader` with `ksn = true` | `scripts/continuous-migration.sh` (keyspace notifications are its default live source) |
-| `rdb_reader`, `aof_reader` | No equivalent: r2dfly does not read RDB or AOF files. |
-| `file_writer` | No equivalent: r2dfly writes only to a Redis-protocol target. |
+| `rdb_reader` | `scripts/simple-migration.sh --source-rdb-file dump.rdb` |
+| `aof_reader` | `scripts/simple-migration.sh --source-aof appendonlydir` (a multi-part AOF directory, or one AOF file) |
+| `file_writer` with `type = "json"` | `scripts/simple-migration.sh --target-file backup.jsonl`, loaded back with `--source-file` |
+| `file_writer` with `type = "cmd"` or `"aof"` | `scripts/simple-migration.sh --target-file backup.aof --target-file-format resp` |
 
 Both scripts deploy NiFi and the r2dfly flow into a container on first use, then run the
 migration. Every flag also has a TOML key, so a whole run can live in one file passed with
@@ -93,6 +95,11 @@ in the live phase, through renames into and out of a prefix.
 - **Bulk copy is slower.** RedisShake's `sync_reader` copied small keys about 1.7 to 2.1 times
   faster on the benchmark machine. See the
   [measured throughput](r2dfly-vs-redisshake.md#throughput-measured).
+- **Files are read through a Redis, and written per key.** RedisShake parses RDB and AOF files
+  itself. r2dfly loads them into a throwaway Redis container (`--source-file-image`, which must
+  be as new as the Redis that wrote the file) and copies from that. Its file writer writes one
+  record or one set of rebuilding commands per key, not the source's command stream, so a file
+  written by one tool cannot be read by the other. Module keys are not written to files.
 - **It runs in NiFi.** There is a JVM and a NiFi canvas to look at. NiFi's provenance recording
   is off by default, because at migration volumes it slows the flow and can stall it.
 

@@ -115,6 +115,29 @@ Needed for the rollback path, which keeps the old Redis current from Dragonfly a
 So rollback runs `MigrationReconciler` passes with no change stream (`--live-source reconcile`).
 This was a one-time probe with `redis-cli`. No test repeats it.
 
+## Reading and writing files
+
+Tested with a Redis 7.4 source of 607 keys: strings with and without TTLs, a 12,000-field hash
+and a 6,000-element list (both split into chunks by the flow), sets, sorted sets, and a stream
+with a consumer group and a pending entry.
+
+- A Redis 7.4 RDB file, and a Redis 7.4 multi-part AOF directory (a base file plus an
+  incremental file written after `BGREWRITEAOF`), each loaded into a throwaway `redis:7.4` or
+  `redis:latest` container and copied to Dragonfly, left the target identical to the source.
+- `redis:6-alpine` refuses the Redis 7.4 RDB ("Fatal error loading the DB: Invalid argument")
+  and exits, so the image has to be at least as new as the Redis that wrote the file. The script
+  stops with that log line.
+- Redis 7.4 started with `--appendonly yes` and a RESP command file as `appendonly.aof`, with no
+  manifest, loads it as a legacy AOF. So the RESP file written by `KeyRecordFileWriter` is an
+  AOF. `redis-cli --pipe` into Redis 7.4 loads it too. Into Dragonfly, `--pipe` garbles the
+  command stream (found earlier, while bulk-loading test data), so load a RESP file into
+  Dragonfly through `--source-aof` instead.
+- Source to JSON-lines file to Dragonfly, and source to RESP file to AOF to Dragonfly, both left
+  the target identical to the source, the pending entry and its consumer included.
+
+Guarded by `FileRoundTripIT` (the JSON-lines and RESP round trips); the RDB and AOF loading was
+an end-to-end run of `simple-migration.sh` on scratch containers.
+
 ## NiFi 2.11
 
 - Processor counters are exported on `/nifi-api/flow/metrics/prometheus` as

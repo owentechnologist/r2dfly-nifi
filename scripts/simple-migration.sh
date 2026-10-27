@@ -33,6 +33,27 @@ Required:
                                  redis://host1:port1,redis://host2:port2
   --target-connection-string S  same format, for the Dragonfly target
 
+Files, in place of a source or target connection string:
+  --source-rdb-file FILE        copy from an RDB file (env SOURCE_RDB_FILE). A throwaway Redis
+                                 container loads it and the copy reads from that container, so
+                                 every option below applies. Removed when this script exits.
+  --source-aof PATH             copy from an AOF: a single file, or a multi-part AOF directory
+                                 holding a *.manifest (env SOURCE_AOF). Loaded the same way. A
+                                 RESP file written with --target-file-format resp is an AOF.
+  --source-file-image IMAGE     the image that loads --source-rdb-file or --source-aof (env
+                                 SOURCE_FILE_IMAGE, default: redis:latest). It must be the Redis
+                                 version that wrote the file or newer; for a Valkey file, use a
+                                 valkey/valkey image, and for module keys, redis/redis-stack-server.
+  --source-file FILE            copy from a JSON-lines file written with --target-file (env
+                                 SOURCE_FILE). No source server is involved.
+  --target-file FILE            write the keys to FILE instead of a target (env TARGET_FILE). Not
+                                 overwritten if it exists. Module keys cannot be written to a file,
+                                 so only string, hash, list, set, zset and stream keys are copied.
+                                 TTLs in the file count from when it is loaded.
+  --target-file-format F        jsonl (default: one key per line, read back with --source-file) or
+                                 resp (the commands that rebuild each key, which is also an AOF)
+                                 (env TARGET_FILE_FORMAT)
+
 Optional:
   --mode MODE                   snapshot (env MODE, default and the only value this script
                                  accepts - scans the source once and makes the target match that
@@ -190,6 +211,12 @@ EOF
 MODE="${MODE:-snapshot}"
 SOURCE_CONNECTION_STRING=""
 TARGET_CONNECTION_STRING=""
+SOURCE_RDB_FILE="${SOURCE_RDB_FILE:-}"
+SOURCE_AOF="${SOURCE_AOF:-}"
+SOURCE_FILE_IMAGE="${SOURCE_FILE_IMAGE:-redis:latest}"
+SOURCE_FILE="${SOURCE_FILE:-}"
+TARGET_FILE="${TARGET_FILE:-}"
+TARGET_FILE_FORMAT="${TARGET_FILE_FORMAT:-jsonl}"
 SOURCE_CONNECTION_MODE="${SOURCE_CONNECTION_MODE:-standalone}"
 TARGET_CONNECTION_MODE="${TARGET_CONNECTION_MODE:-standalone}"
 SOURCE_REQUIRE_TLS="false"
@@ -275,7 +302,13 @@ MAPPING = {
     ("source", "connection-string"): "SOURCE_CONNECTION_STRING",
     ("source", "connection-mode"): "SOURCE_CONNECTION_MODE",
     ("source", "require-tls"): "SOURCE_REQUIRE_TLS",
+    ("source", "rdb-file"): "SOURCE_RDB_FILE",
+    ("source", "aof"): "SOURCE_AOF",
+    ("source", "file-image"): "SOURCE_FILE_IMAGE",
+    ("source", "file"): "SOURCE_FILE",
     ("target", "connection-string"): "TARGET_CONNECTION_STRING",
+    ("target", "file"): "TARGET_FILE",
+    ("target", "file-format"): "TARGET_FILE_FORMAT",
     ("target", "connection-mode"): "TARGET_CONNECTION_MODE",
     ("target", "require-tls"): "TARGET_REQUIRE_TLS",
     ("nifi", "container"): "NIFI_CONTAINER_NAME",
@@ -400,6 +433,12 @@ while [[ $# -gt 0 ]]; do
     --mode) require_value "$@"; MODE="$2"; shift 2 ;;
     --source-connection-string) require_value "$@"; SOURCE_CONNECTION_STRING="$2"; shift 2 ;;
     --target-connection-string) require_value "$@"; TARGET_CONNECTION_STRING="$2"; shift 2 ;;
+    --source-rdb-file) require_value "$@"; SOURCE_RDB_FILE="$2"; shift 2 ;;
+    --source-aof) require_value "$@"; SOURCE_AOF="$2"; shift 2 ;;
+    --source-file-image) require_value "$@"; SOURCE_FILE_IMAGE="$2"; shift 2 ;;
+    --source-file) require_value "$@"; SOURCE_FILE="$2"; shift 2 ;;
+    --target-file) require_value "$@"; TARGET_FILE="$2"; shift 2 ;;
+    --target-file-format) require_value "$@"; TARGET_FILE_FORMAT="$2"; shift 2 ;;
     --source-connection-mode) require_value "$@"; SOURCE_CONNECTION_MODE="$2"; shift 2 ;;
     --target-connection-mode) require_value "$@"; TARGET_CONNECTION_MODE="$2"; shift 2 ;;
     --source-require-tls) SOURCE_REQUIRE_TLS="true"; shift ;;
@@ -458,10 +497,35 @@ case "$MODE" in
   *) echo "error: --mode must be 'snapshot' (got '$MODE')" >&2; usage; exit 1 ;;
 esac
 echo "==> mode: snapshot (one-time copy - the target will be made to match the source as of this scan; it will not track changes made afterward)"
-if [[ -z "$SOURCE_CONNECTION_STRING" || -z "$TARGET_CONNECTION_STRING" ]]; then
-  echo "error: --source-connection-string and --target-connection-string are required" >&2
+SOURCE_KINDS=0
+for _given in "$SOURCE_CONNECTION_STRING" "$SOURCE_RDB_FILE" "$SOURCE_AOF" "$SOURCE_FILE"; do
+  [[ -n "$_given" ]] && SOURCE_KINDS=$((SOURCE_KINDS + 1))
+done
+if [[ "$SOURCE_KINDS" -ne 1 ]]; then
+  echo "error: give exactly one source: --source-connection-string, --source-rdb-file, --source-aof or --source-file" >&2
   usage; exit 1
 fi
+if [[ -n "$TARGET_CONNECTION_STRING" && -n "$TARGET_FILE" || -z "$TARGET_CONNECTION_STRING" && -z "$TARGET_FILE" ]]; then
+  echo "error: give exactly one target: --target-connection-string or --target-file" >&2
+  usage; exit 1
+fi
+if [[ -n "$SOURCE_FILE" && -n "$TARGET_FILE" ]]; then
+  echo "error: --source-file and --target-file together would only copy a file" >&2
+  usage; exit 1
+fi
+for _given in "$SOURCE_RDB_FILE" "$SOURCE_AOF" "$SOURCE_FILE"; do
+  if [[ -n "$_given" && ! -e "$_given" ]]; then
+    echo "error: $_given does not exist" >&2; exit 1
+  fi
+done
+unset _given
+if [[ -n "$TARGET_FILE" && -e "$TARGET_FILE" ]]; then
+  echo "error: $TARGET_FILE already exists; it is not overwritten" >&2; exit 1
+fi
+case "$TARGET_FILE_FORMAT" in
+  jsonl|resp) ;;
+  *) echo "error: --target-file-format must be jsonl or resp (got '$TARGET_FILE_FORMAT')" >&2; usage; exit 1 ;;
+esac
 if ! [[ "$PARALLELISM" =~ ^[0-9]+$ ]] || [[ "$PARALLELISM" -lt 1 ]]; then
   echo "error: --parallelism must be a positive integer (got '$PARALLELISM')" >&2
   usage; exit 1
@@ -496,7 +560,75 @@ export DISABLE_PROVENANCE
 redis_lib_pick_runtime
 nifi_lib_check_disk_space
 
-SOURCE_CONTAINER="$(redis_lib_extract_host "$SOURCE_CONNECTION_STRING")"
+# start_file_source - a throwaway Redis loads --source-rdb-file or --source-aof, and the copy
+# reads from it like any other source. It listens inside its container on the port it publishes,
+# so redis_cli's exec path, which passes the connection string's port, reaches it.
+FILE_SOURCE_CONTAINER=""
+remove_file_source() {
+  [[ -n "$FILE_SOURCE_CONTAINER" ]] && $RUNTIME rm -f "$FILE_SOURCE_CONTAINER" >/dev/null 2>&1 || true
+}
+start_file_source() {
+  local name="r2dfly-file-source-$$" port="" attempt waited=0 reply manifest
+  local -a args=(redis-server --dir /data --save "" --protected-mode no)
+  if [[ -n "$SOURCE_RDB_FILE" ]]; then
+    args+=(--dbfilename dump.rdb --appendonly no)
+  elif [[ -d "$SOURCE_AOF" ]]; then
+    manifest="$(ls "$SOURCE_AOF"/*.manifest 2>/dev/null | head -n 1)" || true
+    if [[ -z "$manifest" ]]; then
+      echo "error: $SOURCE_AOF holds no *.manifest file, so it is not a multi-part AOF directory" >&2; exit 1
+    fi
+    manifest="$(basename "$manifest")"
+    args+=(--appendonly yes --appenddirname appendonlydir --appendfilename "${manifest%.manifest}")
+  else
+    args+=(--appendonly yes)
+  fi
+  echo "==> loading ${SOURCE_RDB_FILE:-$SOURCE_AOF} into a throwaway $SOURCE_FILE_IMAGE container"
+  FILE_SOURCE_CONTAINER="$name"
+  trap remove_file_source EXIT
+  for attempt in 1 2 3 4 5; do
+    port=$((20000 + RANDOM % 10000))
+    $RUNTIME rm -f "$name" >/dev/null 2>&1 || true
+    $RUNTIME create --name "$name" -p "$port:$port" "$SOURCE_FILE_IMAGE" "${args[@]}" --port "$port" >/dev/null
+    if [[ -n "$SOURCE_RDB_FILE" ]]; then
+      $RUNTIME cp "$SOURCE_RDB_FILE" "$name:/data/dump.rdb"
+    elif [[ -d "$SOURCE_AOF" ]]; then
+      $RUNTIME cp "$SOURCE_AOF" "$name:/data/appendonlydir"
+    else
+      $RUNTIME cp "$SOURCE_AOF" "$name:/data/appendonly.aof"
+    fi
+    $RUNTIME start "$name" >/dev/null 2>&1 && break
+    port=""
+  done
+  if [[ -z "$port" ]]; then
+    echo "error: could not start $name on a free port" >&2; exit 1
+  fi
+  while true; do
+    reply="$($RUNTIME exec "$name" redis-cli -p "$port" PING 2>/dev/null | tr -d '\r')" || true
+    [[ "$reply" == "PONG" ]] && break
+    if [[ "$($RUNTIME inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" != "true" ]]; then
+      echo "error: $SOURCE_FILE_IMAGE could not load the file. Its last log lines:" >&2
+      $RUNTIME logs --tail 15 "$name" >&2 || true
+      echo "  A file written by a newer Redis needs a newer --source-file-image; a Valkey file needs a" >&2
+      echo "  valkey/valkey image, and module keys need redis/redis-stack-server." >&2
+      exit 1
+    fi
+    sleep 2
+    waited=$((waited + 2))
+    [[ $((waited % 30)) -eq 0 ]] && echo "  still loading after ${waited}s"
+  done
+  SOURCE_CONNECTION_STRING="redis://localhost:$port"
+  echo "  loaded: $($RUNTIME exec "$name" redis-cli -p "$port" DBSIZE | tr -d '\r') keys, served at $SOURCE_CONNECTION_STRING"
+}
+[[ -n "$SOURCE_RDB_FILE" || -n "$SOURCE_AOF" ]] && start_file_source
+
+# Paths inside the NiFi container: the processors read and write there.
+FILES_DIR="/opt/nifi/nifi-current/r2dfly-files"
+NIFI_SOURCE_FILE=""
+[[ -n "$SOURCE_FILE" ]] && NIFI_SOURCE_FILE="$FILES_DIR/$MIGRATION_ID-in.jsonl"
+NIFI_TARGET_FILE=""
+[[ -n "$TARGET_FILE" ]] && NIFI_TARGET_FILE="$FILES_DIR/$MIGRATION_ID.$TARGET_FILE_FORMAT"
+
+SOURCE_CONTAINER="${FILE_SOURCE_CONTAINER:-$(redis_lib_extract_host "$SOURCE_CONNECTION_STRING")}"
 TARGET_CONTAINER="$(redis_lib_extract_host "$TARGET_CONNECTION_STRING")"
 
 redis_dbsize() {
@@ -547,13 +679,22 @@ check_connection() {
   rm -f "$errfile"
   exit 1
 }
-check_connection "source" "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING"
-check_connection "target" "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING"
-
-SOURCE_SERVER_KIND="$(redis_lib_detect_product_kind "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")"
-TARGET_SERVER_KIND="$(redis_lib_detect_product_kind "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING")"
-echo "  source: $(redis_lib_product_label "$SOURCE_SERVER_KIND")"
-echo "  target: $(redis_lib_product_label "$TARGET_SERVER_KIND")"
+SOURCE_SERVER_KIND="file"
+TARGET_SERVER_KIND="file"
+if [[ -n "$SOURCE_FILE" ]]; then
+  echo "  source: the file $SOURCE_FILE"
+else
+  check_connection "source" "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING"
+  SOURCE_SERVER_KIND="$(redis_lib_detect_product_kind "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")"
+  echo "  source: $(redis_lib_product_label "$SOURCE_SERVER_KIND")"
+fi
+if [[ -n "$TARGET_FILE" ]]; then
+  echo "  target: the file $TARGET_FILE ($TARGET_FILE_FORMAT)"
+else
+  check_connection "target" "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING"
+  TARGET_SERVER_KIND="$(redis_lib_detect_product_kind "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING")"
+  echo "  target: $(redis_lib_product_label "$TARGET_SERVER_KIND")"
+fi
 
 if [[ -z "$DFLY_TO_DFLY" ]]; then
   if [[ "$SOURCE_SERVER_KIND" == dragonfly:* && "$TARGET_SERVER_KIND" == dragonfly:* ]]; then
@@ -571,16 +712,18 @@ if [[ -z "$DFLY_TO_DFLY" ]]; then
   fi
 fi
 
-# Runs after the --dfly-to-dfly decision above because two of the gaps this warns about (Bloom
-# and CMS) depend on it rather than on the target's own command support - see
-# redis_lib_warn_capability_gaps. Warnings go to stderr and never abort the run: a capable source
-# paired with a less capable target is a legitimate migration for every other key type.
-SOURCE_CAPS="$(redis_lib_detect_capabilities "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")"
-TARGET_CAPS="$(redis_lib_detect_capabilities "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING")"
-SOURCE_INDEX_COUNT="$(redis_lib_count_search_indexes "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING" "$SOURCE_CAPS")"
-echo "  source module support: ${SOURCE_CAPS:-none detected}  (search indexes: $SOURCE_INDEX_COUNT)"
-echo "  target module support: ${TARGET_CAPS:-none detected}"
-redis_lib_warn_capability_gaps "$SOURCE_CAPS" "$TARGET_CAPS" "$DFLY_TO_DFLY" "$SOURCE_INDEX_COUNT"
+if [[ -z "$SOURCE_FILE" && -z "$TARGET_FILE" ]]; then
+  # Runs after the --dfly-to-dfly decision above because two of the gaps this warns about (Bloom
+  # and CMS) depend on it rather than on the target's own command support - see
+  # redis_lib_warn_capability_gaps. Warnings go to stderr and never abort the run: a capable source
+  # paired with a less capable target is a legitimate migration for every other key type.
+  SOURCE_CAPS="$(redis_lib_detect_capabilities "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")"
+  TARGET_CAPS="$(redis_lib_detect_capabilities "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING")"
+  SOURCE_INDEX_COUNT="$(redis_lib_count_search_indexes "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING" "$SOURCE_CAPS")"
+  echo "  source module support: ${SOURCE_CAPS:-none detected}  (search indexes: $SOURCE_INDEX_COUNT)"
+  echo "  target module support: ${TARGET_CAPS:-none detected}"
+  redis_lib_warn_capability_gaps "$SOURCE_CAPS" "$TARGET_CAPS" "$DFLY_TO_DFLY" "$SOURCE_INDEX_COUNT"
+fi
 
 # get_dbsize <mode> <container> <connstr> - lightweight key count, cluster-aware (sums across
 # masters) when mode is "cluster". Used below for the end-of-run summary, where topology
@@ -597,20 +740,24 @@ get_dbsize() {
 # A cluster side gets a full pre-flight check (topology health + full slot coverage), not just
 # a key count - cluster_lib_verify aborts the script (via set -e, since it returns 1 on
 # failure) before anything is configured or started if the cluster isn't healthy.
-if [[ "$SOURCE_CONNECTION_MODE" == "cluster" ]]; then
+if [[ -n "$SOURCE_FILE" ]]; then
+  SOURCE_DBSIZE_START=0
+elif [[ "$SOURCE_CONNECTION_MODE" == "cluster" ]]; then
   echo "  verifying source cluster topology"
   SOURCE_DBSIZE_START="$(cluster_lib_verify "source" "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")"
 else
   SOURCE_DBSIZE_START="$(redis_dbsize "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")"
 fi
-if [[ "$TARGET_CONNECTION_MODE" == "cluster" ]]; then
+if [[ -n "$TARGET_FILE" ]]; then
+  TARGET_DBSIZE_START=0
+elif [[ "$TARGET_CONNECTION_MODE" == "cluster" ]]; then
   echo "  verifying target cluster topology"
   TARGET_DBSIZE_START="$(cluster_lib_verify "target" "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING")"
 else
   TARGET_DBSIZE_START="$(redis_dbsize "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING")"
 fi
-echo "  source currently has $SOURCE_DBSIZE_START keys"
-echo "  target currently has $TARGET_DBSIZE_START keys"
+[[ -n "$SOURCE_FILE" ]] || echo "  source currently has $SOURCE_DBSIZE_START keys"
+[[ -n "$TARGET_FILE" ]] || echo "  target currently has $TARGET_DBSIZE_START keys"
 
 echo
 echo "=================================================="
@@ -645,6 +792,13 @@ echo "=================================================="
 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 3/8: Starting NiFi and deploying the processor NAR"
 echo "=================================================="
 "$PROJECT_ROOT/scripts/deploy-to-nifi.sh"
+if [[ -n "$SOURCE_FILE" || -n "$TARGET_FILE" ]]; then
+  runtime_exec "$NIFI_CONTAINER_NAME" mkdir -p "$FILES_DIR"
+fi
+if [[ -n "$SOURCE_FILE" ]]; then
+  echo "==> copying $SOURCE_FILE into $NIFI_CONTAINER_NAME:$NIFI_SOURCE_FILE"
+  $RUNTIME cp "$SOURCE_FILE" "$NIFI_CONTAINER_NAME:$NIFI_SOURCE_FILE"
+fi
 
 # Credentials are only ever printed once, in the container's own logs on first creation - grab
 # them now (rather than waiting for STAGE 5's own authentication step) so the connection-info
@@ -818,8 +972,8 @@ adapt_connection_string_for_nifi() {
   local IFS=','
   echo "${out[*]}"
 }
-SOURCE_CONNECTION_STRING="$(adapt_connection_string_for_nifi source "$SOURCE_CONNECTION_STRING")"
-TARGET_CONNECTION_STRING="$(adapt_connection_string_for_nifi target "$TARGET_CONNECTION_STRING")"
+[[ -n "$SOURCE_CONNECTION_STRING" ]] && SOURCE_CONNECTION_STRING="$(adapt_connection_string_for_nifi source "$SOURCE_CONNECTION_STRING")"
+[[ -n "$TARGET_CONNECTION_STRING" ]] && TARGET_CONNECTION_STRING="$(adapt_connection_string_for_nifi target "$TARGET_CONNECTION_STRING")"
 
 echo
 echo "=================================================="
@@ -936,6 +1090,9 @@ RUN_ARGS=(
   --writer-concurrency "$WRITER_CONCURRENCY"
   --start
 )
+[[ -n "$FILE_SOURCE_CONTAINER" ]] && RUN_ARGS+=(--source-container "$FILE_SOURCE_CONTAINER")
+[[ -n "$NIFI_SOURCE_FILE" ]] && RUN_ARGS+=(--source-file "$NIFI_SOURCE_FILE")
+[[ -n "$NIFI_TARGET_FILE" ]] && RUN_ARGS+=(--target-file "$NIFI_TARGET_FILE" --target-file-format "$TARGET_FILE_FORMAT")
 [[ "$SOURCE_REQUIRE_TLS" == "true" ]] && RUN_ARGS+=(--source-require-tls)
 [[ "$TARGET_REQUIRE_TLS" == "true" ]] && RUN_ARGS+=(--target-require-tls)
 [[ -n "$KEY_TYPES" ]] && RUN_ARGS+=(--key-types "$KEY_TYPES")
@@ -966,13 +1123,30 @@ echo
 echo "=================================================="
 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 8/8: Migration summary"
 echo "=================================================="
-SOURCE_DBSIZE_END="$(get_dbsize "$SOURCE_CONNECTION_MODE" "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")"
-TARGET_DBSIZE_END="$(get_dbsize "$TARGET_CONNECTION_MODE" "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING")"
-MIGRATED=$(( TARGET_DBSIZE_END - TARGET_DBSIZE_START ))
 echo "  mode: snapshot (one-time copy, not an ongoing sync)"
-echo "  source keys: $SOURCE_DBSIZE_END"
-echo "  target keys: $TARGET_DBSIZE_END (was $TARGET_DBSIZE_START before this run)"
-echo "  keys migrated this run: $MIGRATED"
+if [[ -n "$SOURCE_FILE" ]]; then
+  echo "  source: $SOURCE_FILE"
+  runtime_exec "$NIFI_CONTAINER_NAME" rm -f "$NIFI_SOURCE_FILE" || true
+else
+  echo "  source keys: $(get_dbsize "$SOURCE_CONNECTION_MODE" "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")"
+fi
+if [[ -n "$TARGET_FILE" ]]; then
+  if $RUNTIME cp "$NIFI_CONTAINER_NAME:$NIFI_TARGET_FILE" "$TARGET_FILE" 2>/dev/null; then
+    runtime_exec "$NIFI_CONTAINER_NAME" rm -f "$NIFI_TARGET_FILE" || true
+    if [[ "$TARGET_FILE_FORMAT" == "jsonl" ]]; then
+      echo "  wrote $(wc -l < "$TARGET_FILE" | tr -d ' ') keys to $TARGET_FILE"
+    else
+      echo "  wrote $(wc -c < "$TARGET_FILE" | tr -d ' ') bytes of commands to $TARGET_FILE"
+    fi
+  else
+    echo "  error: no file was written ($NIFI_CONTAINER_NAME:$NIFI_TARGET_FILE is missing)" >&2
+    RUN_FAILED="true"
+  fi
+else
+  TARGET_DBSIZE_END="$(get_dbsize "$TARGET_CONNECTION_MODE" "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING")"
+  echo "  target keys: $TARGET_DBSIZE_END (was $TARGET_DBSIZE_START before this run)"
+  echo "  keys migrated this run: $(( TARGET_DBSIZE_END - TARGET_DBSIZE_START ))"
+fi
 # RedisDeadLetterWriter keeps one record per key it could not copy (a time series, a Bloom filter
 # from Redis, a write that kept failing, ...), each with its reason.
 DEAD_LETTERS="$(runtime_exec "$NIFI_CONTAINER_NAME" sh -c 'ls /opt/nifi/nifi-current/r2dfly-dead-letter 2>/dev/null | wc -l' | tr -d '[:space:]')" || true
@@ -984,5 +1158,6 @@ echo "  changes made on the source after this run started are NOT reflected on t
 
 echo
 echo "Run simple-troubleshoot.sh if there appears to be any issue with the migration."
+[[ "${RUN_FAILED:-}" == "true" ]] && exit 1
 echo
 echo "Done."

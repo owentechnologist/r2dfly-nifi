@@ -9,6 +9,7 @@ A migration tool from Redis/Valkey to Dragonfly leveraging Apache NiFi
 * Support Clustered sources and targets
 * Allow filtering on keytype and prefix
 * Handle large keys
+* Copy from RDB and AOF files, and write backups to JSON-lines or RESP files
 * Require only normal client read/write access to source and target (the opt-in replication live source also needs `PSYNC` on the source)
 
 [QuickStart](./docs/quickstart.md)

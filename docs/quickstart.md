@@ -142,6 +142,52 @@ These options apply to `simple-migration.sh` and `continuous-migration.sh` alike
 -y, --yes                     don't prompt before stopping/clearing a pre-existing migration
 ```
 
+## Files: RDB and AOF input, backups to a file
+
+`simple-migration.sh` can take a file in place of the source or the target. These options are
+for one-time copies only; `continuous-migration.sh` does not take them.
+
+```
+--source-rdb-file FILE     copy from an RDB file
+--source-aof PATH          copy from an AOF: one file, or a multi-part AOF directory (with a *.manifest)
+--source-file-image IMAGE  the image that loads the RDB or AOF (default: redis:latest)
+--source-file FILE         copy from a JSON-lines file written with --target-file
+--target-file FILE         write the keys to FILE instead of a target (never overwritten)
+--target-file-format F     jsonl (default) or resp
+```
+
+r2dfly does not parse RDB or AOF files itself. A throwaway Redis container loads the file, the
+copy reads from it like any other source, and the container is removed when the script exits.
+So filters, dead letters and module handling work as usual. The image must be the Redis version
+that wrote the file or newer: an older one cannot load it, and the script stops with the
+container's own error. Use a `valkey/valkey` image for a Valkey file and
+`redis/redis-stack-server` for one holding module keys.
+
+```bash
+./simple-migration.sh --source-rdb-file dump.rdb --target-connection-string redis://localhost:6380
+./simple-migration.sh --source-aof appendonlydir --target-connection-string redis://localhost:6380
+```
+
+`--target-file` writes each key to a file instead. `jsonl` writes one key per line, in the same
+record the flow carries, and `--source-file` loads it back into a target. `resp` writes the
+commands that rebuild each key, the same commands a target would receive. A RESP file is also
+a single-file AOF, so `--source-aof` loads it, and so does `redis-cli --pipe` into Redis (not
+into Dragonfly). Either format works as a backup, or as a dry run that shows what a migration
+would write.
+
+```bash
+./simple-migration.sh --source-connection-string redis://localhost:6379 --target-file backup.jsonl
+./simple-migration.sh --source-file backup.jsonl --target-connection-string redis://localhost:6380
+```
+
+Things to know about writing to a file:
+
+- Only string, hash, list, set, sorted set and stream keys are written. Module keys (JSON, TopK,
+  Bloom) are skipped, and NiFi counts them under "Scan Keys Skipped by Type Filter".
+- TTLs are stored as time remaining, so they count from when the file is loaded, not from when
+  it was written. Stream delivery times are absolute.
+- A big hash or list that the flow splits into chunks is joined back into one line.
+
 ## Using a TOML config file
 
 Instead of (or alongside) flags, `--toml-file FILE` loads settings from a TOML file. `FILE` is
@@ -170,8 +216,16 @@ connection-string = "redis://source-host:6379"   # --source-connection-string
 connection-mode = "standalone"                    # --source-connection-mode
 require-tls = false                               # --source-require-tls
 
+# Files instead of a server (simple-migration.sh only); give one source and one target.
+# rdb-file = "dump.rdb"                           # --source-rdb-file
+# aof = "appendonlydir"                           # --source-aof
+# file-image = "redis:latest"                     # --source-file-image
+# file = "backup.jsonl"                           # --source-file
+
 [target]
 connection-string = "rediss://default:pw@target-host:6385"  # --target-connection-string
+# file = "backup.jsonl"                           # --target-file
+# file-format = "jsonl"                           # --target-file-format
 connection-mode = "standalone"                    # --target-connection-mode
 require-tls = false                               # --target-require-tls
 

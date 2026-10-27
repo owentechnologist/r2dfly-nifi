@@ -26,7 +26,8 @@ during the sync stops it. Its documentation calls it a tool for one-time migrati
 
 r2dfly is this project, a set of NiFi processors and the scripts that deploy and drive them. It
 reads Redis, Valkey and Dragonfly sources, and also JDBC databases, Kafka, files and MongoDB
-through NiFi.
+through NiFi. It copies RDB and AOF files by loading them into a throwaway Redis, and can write a
+copy to a JSON-lines or RESP file instead of a target.
 
 - **The copy** scans the source once, by shard on a cluster, and resumes from checkpoints after a
   restart. Each key is copied with `RESTORE` where a probe has shown the target restores that type
@@ -49,7 +50,8 @@ The last column marks the rows this project's recent work changed.
 
 | | RedisShake | r2dfly | |
 |---|---|---|---|
-| Sources | Redis-protocol servers, RDB and AOF files | Redis-protocol servers, plus JDBC, Kafka, files, MongoDB | |
+| Sources | Redis-protocol servers, RDB and AOF files | Redis-protocol servers, RDB and AOF files (loaded through a throwaway Redis), plus JDBC, Kafka, files, MongoDB | Now a tie |
+| Writing to a file | Command file, AOF or JSON | JSON lines (one key per line, loadable back) or RESP commands (also an AOF); core types only | Now a tie |
 | One-time copy of small keys | Faster: 63,700 keys/s for 10M strings | 38,300 keys/s | |
 | One-time copy of large values | 5.1 s for 10k lists of 1,000 elements | Under 1 s | Now r2dfly |
 | Continuous sync | Replication stream, or scan plus keyspace notifications | Replication stream, keyspace notifications, or reconcile passes | Now a tie |
