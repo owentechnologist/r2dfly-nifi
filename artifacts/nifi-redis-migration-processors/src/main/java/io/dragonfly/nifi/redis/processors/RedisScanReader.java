@@ -62,7 +62,10 @@ public class RedisScanReader extends AbstractProcessor {
     public static final PropertyDescriptor PARTITION_COUNT = new PropertyDescriptor.Builder()
             .name("partition-count")
             .displayName("Partition Count")
-            .description("Total number of partitions; must match this processor's Concurrent Tasks setting.")
+            .description("Total number of partitions; must match this processor's Concurrent Tasks setting. A cluster's "
+                    + "masters are dealt out among the partitions, each scanned once on its own node. A standalone or "
+                    + "Sentinel source is scanned once by partition 0 whatever this says: more scans of one keyspace "
+                    + "only add source load, so parallelism goes in RedisTypeDeserializer's Concurrent Tasks instead.")
             .required(true)
             .addValidator(StandardValidators.POSITIVE_INTEGER_VALIDATOR)
             .defaultValue("1")
@@ -146,6 +149,50 @@ public class RedisScanReader extends AbstractProcessor {
             .addValidator(StandardValidators.NON_NEGATIVE_INTEGER_VALIDATOR)
             .build();
 
+    public static final PropertyDescriptor CLAIM_TIMEOUT_MS = new PropertyDescriptor.Builder()
+            .name("claim-timeout-ms")
+            .displayName("Claim Timeout (ms)")
+            .description("A partition whose claim has not been refreshed for this long belonged to a task that died "
+                    + "(a killed NiFi node, say) and is taken over by the next task that looks for work. Needs a Cursor "
+                    + "State Cache with compare-and-replace, such as MapCacheClientService; with any other cache a "
+                    + "claim is never taken over.")
+            .required(true)
+            .addValidator(StandardValidators.POSITIVE_LONG_VALIDATOR)
+            .defaultValue("300000")
+            .build();
+
+    public static final PropertyDescriptor READ_ENCODING = new PropertyDescriptor.Builder()
+            .name("read-encoding")
+            .displayName("Read Encoding")
+            .description("Read each key's OBJECT ENCODING into redis.encoding. RedisTypeDeserializer's RESTORE probe "
+                    + "decides per type and encoding (a Redis 7.4 hash with field TTLs is the only listpackex encoding "
+                    + "Dragonfly cannot restore), so turning this off sends such keys through the restore_rejected loop "
+                    + "instead. Sources without OBJECT, such as some Dragonfly builds, simply leave it unset.")
+            .required(true)
+            .allowableValues("true", "false")
+            .defaultValue("true")
+            .build();
+
+    public static final PropertyDescriptor MAX_SOURCE_LATENCY_MS = new PropertyDescriptor.Builder()
+            .name("max-source-latency-ms")
+            .displayName("Max Source Latency (ms)")
+            .description("Pause between SCAN pages while a page (the SCAN and the reads that follow it) takes longer "
+                    + "than this, growing the pause up to a second until the source recovers. 0 turns it off.")
+            .required(true)
+            .addValidator(StandardValidators.NON_NEGATIVE_INTEGER_VALIDATOR)
+            .defaultValue("0")
+            .build();
+
+    public static final PropertyDescriptor MAX_SOURCE_OPS_PER_SEC = new PropertyDescriptor.Builder()
+            .name("max-source-ops-per-sec")
+            .displayName("Max Source Ops per Second")
+            .description("Pause between SCAN pages while the source's INFO instantaneous_ops_per_sec, which counts "
+                    + "its own clients as well as this scan, is above this. 0 turns it off.")
+            .required(true)
+            .addValidator(StandardValidators.NON_NEGATIVE_INTEGER_VALIDATOR)
+            .defaultValue("0")
+            .build();
+
     public static final Relationship REL_STRING = new Relationship.Builder().name("string").description("Key is of type STRING").build();
     public static final Relationship REL_HASH = new Relationship.Builder().name("hash").description("Key is of type HASH").build();
     public static final Relationship REL_LIST = new Relationship.Builder().name("list").description("Key is of type LIST").build();
@@ -158,7 +205,7 @@ public class RedisScanReader extends AbstractProcessor {
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
             REDIS_CONNECTION_POOL, MIGRATION_ID, CURSOR_STATE_CACHE, PARTITION_COUNT, SCAN_COUNT, KEY_PATTERN,
             KEY_TYPE_FILTER, PREFIX_DENY_LIST, PREFIX_ONLY_LIST, EMIT_TTL, SKIP_VOLATILE_KEYS,
-            VOLATILE_KEY_TTL_THRESHOLD_MS, DATABASE_INDEX);
+            VOLATILE_KEY_TTL_THRESHOLD_MS, DATABASE_INDEX, CLAIM_TIMEOUT_MS, READ_ENCODING, MAX_SOURCE_LATENCY_MS, MAX_SOURCE_OPS_PER_SEC);
 
     private static final Set<Relationship> RELATIONSHIPS = Set.of(
             REL_STRING, REL_HASH, REL_LIST, REL_SET, REL_ZSET, REL_STREAM, REL_UNKNOWN, REL_FAILURE);
@@ -183,7 +230,7 @@ public class RedisScanReader extends AbstractProcessor {
         PartitionAssigner assigner = new PartitionAssigner(cache, migrationId);
         int partitionCount = context.getProperty(PARTITION_COUNT).asInteger();
 
-        int partitionIndex = getOrClaimPartition(assigner, partitionCount);
+        int partitionIndex = getOrClaimPartition(assigner, partitionCount, context.getProperty(CLAIM_TIMEOUT_MS).asLong());
         if (partitionIndex < 0) {
             getLogger().info("No partition available to claim for migration '{}' ({} partitions); yielding", migrationId, partitionCount);
             context.yield();
@@ -209,41 +256,25 @@ public class RedisScanReader extends AbstractProcessor {
         long volatileThresholdMs = context.getProperty(VOLATILE_KEY_TTL_THRESHOLD_MS).isSet()
                 ? context.getProperty(VOLATILE_KEY_TTL_THRESHOLD_MS).asLong() : Long.MIN_VALUE;
         Integer databaseIndex = context.getProperty(DATABASE_INDEX).isSet() ? context.getProperty(DATABASE_INDEX).asInteger() : null;
-        boolean clusterMode = redisPool.isClusterMode();
+        boolean readEncoding = context.getProperty(READ_ENCODING).asBoolean();
+        Throttle throttle = new Throttle(context.getProperty(MAX_SOURCE_LATENCY_MS).asLong(),
+                context.getProperty(MAX_SOURCE_OPS_PER_SEC).asLong());
 
-        // Lettuce's cluster-mode SCAN rejects any cursor it didn't itself just return - even
-        // one rebuilt via ScanCursor.of() from the *same* cursor string ScanCursor.INITIAL
-        // would encode - with "A scan in Redis Cluster mode requires to reuse the resulting
-        // cursor from the previous scan invocation" (it tracks internal per-node iteration
-        // state that a plain string can't carry). Restoring a checkpointed cursor string
-        // across a NiFi restart is therefore only possible in STANDALONE/SENTINEL mode; a
-        // CLUSTER-mode partition always restarts its scan from ScanCursor.INITIAL, which just
-        // re-does some already-seen keys (discarded again by the slot-range filter below), not
-        // a correctness issue.
-        ScanCursor scanCursor;
-        if (clusterMode) {
-            scanCursor = ScanCursor.INITIAL;
-            getLogger().info("Starting fresh cluster-mode SCAN for partition {} (clusterMode={}, allowedTypes={}, pattern='{}') - "
-                    + "cluster SCAN cursors can't be checkpointed/restored across restarts",
-                    partitionIndex, clusterMode, filter.allowedTypes(), pattern);
-        } else {
-            String cursor;
-            try {
-                cursor = assigner.restoreCursor(partitionIndex).orElse(ScanCursor.INITIAL.getCursor());
-            } catch (IOException e) {
-                throw new ProcessException("Unable to restore SCAN cursor", e);
-            }
-            getLogger().info("Restored cursor '{}' for partition {} (clusterMode={}, allowedTypes={}, pattern='{}')",
-                    cursor, partitionIndex, clusterMode, filter.allowedTypes(), pattern);
-            scanCursor = ScanCursor.of(cursor);
-        }
-        while (!Thread.currentThread().isInterrupted()) {
+        List<String> nodes = scanTargets(redisPool, partitionIndex, partitionCount);
+        String[] checkpoint = restoreCheckpoint(assigner, partitionIndex);
+        int nodeIndex = Math.max(0, nodes.indexOf(checkpoint[0]));
+        ScanCursor scanCursor = nodes.indexOf(checkpoint[0]) >= 0 ? ScanCursor.of(checkpoint[1]) : ScanCursor.INITIAL;
+        getLogger().info("Scanning partition {} of {} for migration '{}': nodes {} from cursor '{}' (allowedTypes={}, pattern='{}')",
+                partitionIndex, partitionCount, migrationId, nodes, scanCursor.getCursor(), filter.allowedTypes(), pattern);
+
+        while (nodeIndex < nodes.size() && !Thread.currentThread().isInterrupted()) {
+            String node = nodes.get(nodeIndex);
             ScanCursor currentCursor = scanCursor;
-            ScanPage page = redisPool.withConnection(cmds ->
-                    scanPage(cmds, currentCursor, scanCount, pattern, filter,
-                            emitTtl, skipVolatile, volatileThresholdMs, clusterMode, partitionIndex, partitionCount));
-            getLogger().info("SCAN page: {} entries, {} failures, cursorAfter='{}', finished={}",
-                    page.entries.size(), page.failures.size(), page.cursorAfterPage.getCursor(), page.cursorAfterPage.isFinished());
+            long startedAt = System.nanoTime();
+            ScanPage page = redisPool.withConnectionAndRaw((cmds, raw) ->
+                    scanPage(node.equals(STANDALONE) ? cmds : nodeCommands(raw, node, redisPool.prefersReplicas()), cmds, currentCursor, scanCount, pattern,
+                            filter, emitTtl, skipVolatile, volatileThresholdMs, readEncoding));
+            long pageMs = (System.nanoTime() - startedAt) / 1_000_000;
 
             for (ScanEntry entry : page.entries) {
                 FlowFile flowFile = session.create();
@@ -256,20 +287,31 @@ public class RedisScanReader extends AbstractProcessor {
                 session.transfer(flowFile, REL_FAILURE);
             }
 
+            scanCursor = page.cursorAfterPage;
+            if (scanCursor.isFinished()) {
+                nodeIndex++;
+                scanCursor = ScanCursor.INITIAL;
+            }
             try {
-                assigner.checkpointCursor(partitionIndex, page.cursorAfterPage.getCursor());
+                String next = nodeIndex < nodes.size() ? nodes.get(nodeIndex) + "|" + scanCursor.getCursor() : "";
+                assigner.checkpointCursor(partitionIndex, next);
+                assigner.heartbeat(partitionIndex);
             } catch (IOException e) {
                 throw new ProcessException("Unable to checkpoint SCAN cursor", e);
             }
             session.commit();
-
-            scanCursor = page.cursorAfterPage;
-            if (scanCursor.isFinished()) {
-                break;
+            long pauseMs = throttle.pauseAfter(pageMs, () -> opsPerSec(redisPool));
+            if (pauseMs > 0) {
+                session.adjustCounter("Scan Throttle Pause (ms)", pauseMs, false);
+                try {
+                    Thread.sleep(pauseMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
 
-        if (scanCursor.isFinished()) {
+        if (nodeIndex >= nodes.size()) {
             try {
                 assigner.markPartitionComplete(partitionIndex);
             } catch (IOException e) {
@@ -281,13 +323,113 @@ public class RedisScanReader extends AbstractProcessor {
         }
     }
 
-    private int getOrClaimPartition(PartitionAssigner assigner, int partitionCount) {
+    /** The node name of a standalone or Sentinel source, which has a single keyspace to scan. */
+    private static final String STANDALONE = "-";
+
+    /**
+     * What this partition SCANs. One SCAN of a standalone source covers everything, so partition 0
+     * takes it all and the rest have nothing to do; their parallelism belongs downstream, in
+     * RedisTypeDeserializer's concurrent tasks. A cluster's masters are dealt out round-robin by
+     * node id, and each is scanned on its own connection, so every key is read once, on its node.
+     */
+    private static List<String> scanTargets(RedisConnectionPoolService pool, int partitionIndex, int partitionCount) {
+        if (!pool.isClusterMode()) {
+            return partitionIndex == 0 ? List.of(STANDALONE) : List.of();
+        }
+        List<String> masters = pool.currentTopology().orElseThrow(() -> new ProcessException("Cluster topology unavailable"))
+                .mastersById().keySet().stream().sorted().toList();
+        List<String> mine = new ArrayList<>();
+        for (int i = partitionIndex; i < masters.size(); i += partitionCount) {
+            mine.add(masters.get(i));
+        }
+        return mine;
+    }
+
+    /**
+     * A node's own cursor is a plain string, unlike Lettuce's cluster-wide one, so a cluster scan
+     * now resumes after a restart too. "node|cursor"; an unknown node (the topology changed) or an
+     * empty checkpoint restarts the partition from its first node.
+     */
+    private static String[] restoreCheckpoint(PartitionAssigner assigner, int partitionIndex) {
+        try {
+            String saved = assigner.restoreCursor(partitionIndex).orElse("");
+            int bar = saved.lastIndexOf('|');
+            return bar < 0 ? new String[]{"", "0"} : new String[]{saved.substring(0, bar), saved.substring(bar + 1)};
+        } catch (IOException e) {
+            throw new ProcessException("Unable to restore SCAN cursor", e);
+        }
+    }
+
+    /** With a replica-preferring pool, a replica of the master scans instead, if it has one. */
+    @SuppressWarnings("unchecked")
+    private static RedisClusterAsyncCommands<byte[], byte[]> nodeCommands(io.lettuce.core.api.StatefulConnection<byte[], byte[]> raw,
+                                                                           String masterId, boolean preferReplica) {
+        var cluster = (io.lettuce.core.cluster.api.StatefulRedisClusterConnection<byte[], byte[]>) raw;
+        if (preferReplica) {
+            for (io.lettuce.core.cluster.models.partitions.RedisClusterNode node : cluster.getPartitions()) {
+                if (masterId.equals(node.getSlaveOf()) && node.isConnected()) {
+                    return cluster.getConnection(node.getNodeId(), io.lettuce.core.protocol.ConnectionIntent.READ).async();
+                }
+            }
+        }
+        return cluster.getConnection(masterId).async();
+    }
+
+    private static long opsPerSec(RedisConnectionPoolService pool) {
+        String stats = pool.withConnection(cmds -> {
+            try {
+                return cmds.info("stats").get();
+            } catch (Exception e) {
+                throw new ProcessException("INFO stats failed", e);
+            }
+        });
+        for (String line : stats.split("\r?\n")) {
+            if (line.startsWith("instantaneous_ops_per_sec:")) {
+                return Long.parseLong(line.substring("instantaneous_ops_per_sec:".length()).trim());
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * Waits between pages while the source is busier than allowed: the pause doubles (up to a
+     * second) after each page that ran over a limit and halves after each that did not, so the
+     * scan settles at the pace the source can take. INFO stats is read at most once a second.
+     */
+    static final class Throttle {
+        private final long maxLatencyMs;
+        private final long maxOpsPerSec;
+        private long pauseMs;
+        private long opsReadAtMs;
+        private long lastOps;
+
+        Throttle(long maxLatencyMs, long maxOpsPerSec) {
+            this.maxLatencyMs = maxLatencyMs;
+            this.maxOpsPerSec = maxOpsPerSec;
+        }
+
+        long pauseAfter(long pageMs, java.util.function.LongSupplier opsPerSec) {
+            boolean over = maxLatencyMs > 0 && pageMs > maxLatencyMs;
+            if (maxOpsPerSec > 0) {
+                long now = System.currentTimeMillis();
+                if (now - opsReadAtMs >= 1000) {
+                    lastOps = opsPerSec.getAsLong();
+                    opsReadAtMs = now;
+                }
+                over |= lastOps > maxOpsPerSec;
+            }
+            pauseMs = over ? Math.min(1000, Math.max(10, pauseMs * 2)) : pauseMs / 2;
+            return pauseMs;
+        }
+    }
+
+    private int getOrClaimPartition(PartitionAssigner assigner, int partitionCount, long claimTimeoutMs) {
         Integer partitionIndex = assignedPartition.get();
         if (partitionIndex != null) {
             return partitionIndex;
         }
         try {
-            Optional<Integer> claimed = assigner.claimPartition(partitionCount);
+            Optional<Integer> claimed = assigner.claimPartition(partitionCount, claimTimeoutMs);
             if (claimed.isEmpty()) {
                 return -1;
             }
@@ -324,30 +466,21 @@ public class RedisScanReader extends AbstractProcessor {
         }
     }
 
+    /** {@code scanCmds} SCANs (a single node in cluster mode); {@code cmds} reads each key, following cluster redirects. */
     private static ScanPage scanPage(
-            RedisClusterAsyncCommands<byte[], byte[]> cmds, ScanCursor cursor, int scanCount, String pattern,
-            KeyFilter filter, boolean emitTtl,
-            boolean skipVolatile, long volatileThresholdMs, boolean clusterMode, int partitionIndex,
-            int partitionCount) {
+            RedisClusterAsyncCommands<byte[], byte[]> scanCmds, RedisClusterAsyncCommands<byte[], byte[]> cmds, ScanCursor cursor,
+            int scanCount, String pattern, KeyFilter filter, boolean emitTtl, boolean skipVolatile, long volatileThresholdMs,
+            boolean readEncoding) {
         ScanArgs scanArgs = new ScanArgs().match(pattern).limit(scanCount);
         KeyScanCursor<byte[]> result;
         try {
-            result = cmds.scan(cursor, scanArgs).get();
+            result = scanCmds.scan(cursor, scanArgs).get();
         } catch (Exception e) {
             throw new ProcessException("SCAN failed", e);
         }
 
         List<byte[]> candidateKeys = new ArrayList<>();
         for (byte[] key : result.getKeys()) {
-            if (clusterMode) {
-                int slot = PartitionAssigner.hashSlot(key);
-                int[] range = PartitionAssigner.clusterSlotRange(partitionIndex, partitionCount);
-                if (slot < range[0] || slot >= range[1]) {
-                    continue;
-                }
-            } else if (!PartitionAssigner.standaloneOwnsKey(key, partitionIndex, partitionCount)) {
-                continue;
-            }
             if (!filter.allowsKey(key)) {
                 continue;
             }
@@ -382,12 +515,12 @@ public class RedisScanReader extends AbstractProcessor {
             ttlKeys.add(key);
             ttlTypes.add(type);
             ttlFutures.add(emitTtl ? cmds.pttl(key) : null);
-            encodingFutures.add(cmds.objectEncoding(key));
+            encodingFutures.add(readEncoding ? cmds.objectEncoding(key) : null);
         }
         if (emitTtl) {
             awaitAllTolerantly(ttlFutures.stream().filter(java.util.Objects::nonNull).toArray(RedisFuture<?>[]::new));
         }
-        awaitAllTolerantly(encodingFutures.toArray(new RedisFuture<?>[0]));
+        awaitAllTolerantly(encodingFutures.stream().filter(java.util.Objects::nonNull).toArray(RedisFuture<?>[]::new));
 
         for (int i = 0; i < ttlKeys.size(); i++) {
             long ttlMs = -1;
@@ -403,7 +536,7 @@ public class RedisScanReader extends AbstractProcessor {
             }
             String encoding = null;
             try {
-                encoding = encodingFutures.get(i).get();
+                encoding = encodingFutures.get(i) == null ? null : encodingFutures.get(i).get();
             } catch (Exception ignored) {
                 // encoding is informational only
             }

@@ -175,7 +175,7 @@ public class MigrationReconciler extends AbstractProcessor {
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
             SOURCE_CONNECTION_POOL, TARGET_CONNECTION_POOL, MODE, PASS_INTERVAL_MS, SAMPLE_SIZE, SCAN_COUNT,
             TIME_BUDGET_MS, TTL_TOLERANCE_MS, COMPARE_VALUES, RedisScanReader.PREFIX_DENY_LIST,
-            RedisScanReader.PREFIX_ONLY_LIST, DBSIZE_DROP_PERCENT, REPORT_FORMAT);
+            RedisScanReader.PREFIX_ONLY_LIST, RedisSingleKeyFetch.KEY_TYPE_FILTER, DBSIZE_DROP_PERCENT, REPORT_FORMAT);
     private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_REPAIR, REL_REPORT);
 
     private static final Set<String> CORE_TYPES = Set.of("string", "hash", "list", "set", "zset", "stream");
@@ -255,8 +255,9 @@ public class MigrationReconciler extends AbstractProcessor {
     public void onTrigger(ProcessContext context, ProcessSession session) throws ProcessException {
         RedisConnectionPoolService source = context.getProperty(SOURCE_CONNECTION_POOL).asControllerService(RedisConnectionPoolService.class);
         RedisConnectionPoolService target = context.getProperty(TARGET_CONNECTION_POOL).asControllerService(DragonflyConnectionPoolService.class);
-        KeyFilter filter = KeyFilter.parse(null, context.getProperty(RedisScanReader.PREFIX_DENY_LIST).getValue(),
-                context.getProperty(RedisScanReader.PREFIX_ONLY_LIST).getValue());
+        // The migration's own scope: a key it was told to skip is not a difference.
+        KeyFilter filter = KeyFilter.parse(context.getProperty(RedisSingleKeyFetch.KEY_TYPE_FILTER).getValue(),
+                context.getProperty(RedisScanReader.PREFIX_DENY_LIST).getValue(), context.getProperty(RedisScanReader.PREFIX_ONLY_LIST).getValue());
 
         watchDbsize(context, source);
 
@@ -272,7 +273,7 @@ public class MigrationReconciler extends AbstractProcessor {
 
         if (current.mode == Mode.SAMPLE) {
             int size = context.getProperty(SAMPLE_SIZE).asInteger();
-            compareSourceKeys(context, session, source, target, randomKeys(source, size, filter), current);
+            compareSourceKeys(context, session, source, target, randomKeys(source, size, filter), filter, current);
             findKeysOnlyOnTarget(session, source, randomKeys(target, size, filter), current);
             finish(context, session, current);
             return;
@@ -300,7 +301,7 @@ public class MigrationReconciler extends AbstractProcessor {
                          RedisConnectionPoolService target, KeyFilter filter, int scanCount, Pass current) {
         if (current.sourceCursor == null || !current.sourceCursor.isFinished()) {
             KeyScanCursor<byte[]> page = scan(source, current.sourceCursor, scanCount);
-            compareSourceKeys(context, session, source, target, allowed(page.getKeys(), filter), current);
+            compareSourceKeys(context, session, source, target, allowed(page.getKeys(), filter), filter, current);
             // Only after the page is compared: a failure above retries this page next trigger
             // rather than leaving it out of a pass that would then report clean.
             current.sourceCursor = page;
@@ -350,7 +351,7 @@ public class MigrationReconciler extends AbstractProcessor {
      * pipeline; sizes only for keys whose types match, and values only where sizes match too.
      */
     private void compareSourceKeys(ProcessContext context, ProcessSession session, RedisConnectionPoolService source,
-                                   RedisConnectionPoolService target, List<byte[]> keys, Pass current) {
+                                   RedisConnectionPoolService target, List<byte[]> keys, KeyFilter filter, Pass current) {
         if (keys.isEmpty()) {
             return;
         }
@@ -366,7 +367,7 @@ public class MigrationReconciler extends AbstractProcessor {
             String key = new String(keys.get(i), StandardCharsets.UTF_8);
             String sourceType = sourceTypes.get(i);
             String targetType = targetTypes.get(i);
-            if ("none".equals(sourceType)) {
+            if ("none".equals(sourceType) || !filter.allowsType(sourceType)) {
                 continue;
             }
             current.keysChecked++;

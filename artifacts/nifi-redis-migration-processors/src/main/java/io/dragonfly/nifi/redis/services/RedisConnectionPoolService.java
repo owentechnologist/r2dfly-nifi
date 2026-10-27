@@ -57,6 +57,11 @@ public interface RedisConnectionPoolService extends ControllerService {
      * after a Sentinel failover reaches the new master. Empty in cluster mode, where every shard
      * has its own master.
      */
+    /** Whether this pool reads from replicas (its Read From property); the scan follows it to a replica of each master. */
+    default boolean prefersReplicas() {
+        return false;
+    }
+
     default Optional<ReplicationEndpoint> replicationEndpoint() {
         return Optional.empty();
     }

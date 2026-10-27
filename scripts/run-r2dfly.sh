@@ -187,6 +187,21 @@ network round trip per pipeline flush rather than a near-zero-latency local one)
                                   with DUMP/RESTORE, which keeps stream consumers and pending entries
                                   and is about 4x faster for large hashes and sorted sets. The
                                   verdicts are logged in nifi-app.log ("RESTORE probe for ...").
+  --max-source-latency-ms N      pause RedisScanReader between pages while a page takes longer
+                                  than N ms, backing off up to a second (env MAX_SOURCE_LATENCY_MS,
+                                  default: 0, off)
+  --max-source-ops-per-sec N     pause RedisScanReader between pages while the source's
+                                  instantaneous_ops_per_sec is above N (env MAX_SOURCE_OPS_PER_SEC,
+                                  default: 0, off)
+  --no-read-encoding             skip OBJECT ENCODING per scanned key (env READ_ENCODING=false). The
+                                  RESTORE probe then judges per type only, so a Redis 7.4 hash with
+                                  field TTLs goes through the restore_rejected loop.
+  --claim-timeout-ms N           take over a scan partition whose claim has not been refreshed for
+                                  N ms, left by a NiFi node that died (env CLAIM_TIMEOUT_MS,
+                                  default: 300000)
+  --source-read-from WHERE       master (default) or replica (env SOURCE_READ_FROM). replica scans
+                                  and reads from the source's replicas, taking the load off the
+                                  master; one-time copies only, since a replica lags its master.
   --module-batch-timeout-ms N    how long ModuleTypeHandler awaits one batch's pipeline
                                   (env MODULE_BATCH_TIMEOUT_MS, default: 10000)
   --dfly-to-dfly                 enable when BOTH source and target are Dragonfly (env
@@ -329,6 +344,11 @@ BATCH_SIZE_BLOOM_CMS="${BATCH_SIZE_BLOOM_CMS:-}"
 MODULE_BATCH_TIMEOUT_MS="${MODULE_BATCH_TIMEOUT_MS:-10000}"
 DFLY_TO_DFLY="${DFLY_TO_DFLY:-false}"
 RESTORE_FAST_PATH="${RESTORE_FAST_PATH:-true}"
+MAX_SOURCE_LATENCY_MS="${MAX_SOURCE_LATENCY_MS:-0}"
+MAX_SOURCE_OPS_PER_SEC="${MAX_SOURCE_OPS_PER_SEC:-0}"
+READ_ENCODING="${READ_ENCODING:-true}"
+CLAIM_TIMEOUT_MS="${CLAIM_TIMEOUT_MS:-300000}"
+SOURCE_READ_FROM="${SOURCE_READ_FROM:-master}"
 MAX_DUMP_PAYLOAD_BYTES="${MAX_DUMP_PAYLOAD_BYTES:-67108864}"
 PARALLELISM="${PARALLELISM:-1}"
 WRITER_CONCURRENCY="${WRITER_CONCURRENCY:-1}"
@@ -377,6 +397,11 @@ while [[ $# -gt 0 ]]; do
     --module-batch-timeout-ms) MODULE_BATCH_TIMEOUT_MS="$2"; shift 2 ;;
     --dfly-to-dfly) DFLY_TO_DFLY="true"; shift ;;
     --no-restore-fast-path) RESTORE_FAST_PATH="false"; shift ;;
+    --max-source-latency-ms) MAX_SOURCE_LATENCY_MS="$2"; shift 2 ;;
+    --max-source-ops-per-sec) MAX_SOURCE_OPS_PER_SEC="$2"; shift 2 ;;
+    --no-read-encoding) READ_ENCODING="false"; shift ;;
+    --claim-timeout-ms) CLAIM_TIMEOUT_MS="$2"; shift 2 ;;
+    --source-read-from) SOURCE_READ_FROM="$2"; shift 2 ;;
     --max-dump-payload-bytes) MAX_DUMP_PAYLOAD_BYTES="$2"; shift 2 ;;
     --parallelism) PARALLELISM="$2"; shift 2 ;;
     --writer-concurrency) WRITER_CONCURRENCY="$2"; shift 2 ;;
@@ -412,6 +437,11 @@ exec > >(tee -a "$MIGRATION_LOG") 2>&1
 echo "==> r2dfly version $R2DFLY_VERSION"
 echo "==> logging this migration run to $MIGRATION_LOG"
 
+case "$SOURCE_READ_FROM" in
+  master) SOURCE_READ_FROM_PROPERTY="MASTER" ;;
+  replica) SOURCE_READ_FROM_PROPERTY="REPLICA_PREFERRED" ;;
+  *) echo "error: --source-read-from must be master or replica (got '$SOURCE_READ_FROM')" >&2; usage; exit 1 ;;
+esac
 case "$TOPK_MODE" in
   exact|off) ;;
   *) echo "error: --topk-mode must be exact or off (got '$TOPK_MODE')" >&2; usage; exit 1 ;;
@@ -659,7 +689,8 @@ PROC_IDS="$(echo "$PROC_LIST_JSON" | py3 "
 import json, sys
 d = json.load(sys.stdin)
 order = ['RedisScanReader', 'RedisBatchWriter', 'ModuleTypeHandler', 'RedisTypeDeserializer', 'SearchIndexExporter', 'SearchIndexRehydrator',
-         'RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'RedisReplicationReader', 'RedisTypeDeserializer (live)']
+         'RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'RedisReplicationReader', 'RedisTypeDeserializer (live)',
+         'MigrationReconciler']
 ids = {name: '' for name in order}
 for p in d['processors']:
     t = p['component']['type']
@@ -673,7 +704,7 @@ for p in d['processors']:
             break
 print('|'.join(ids[name] for name in order))
 ")" || true
-IFS='|' read -r PROC_SCAN PROC_WRITER PROC_MTH PROC_DESER PROC_SIDX_EXPORT PROC_SIDX_REHYDRATE PROC_LIVE_CONSUMER PROC_LIVE_FETCH PROC_REPL_READER PROC_REPL_DESER <<< "$PROC_IDS"
+IFS='|' read -r PROC_SCAN PROC_WRITER PROC_MTH PROC_DESER PROC_SIDX_EXPORT PROC_SIDX_REHYDRATE PROC_LIVE_CONSUMER PROC_LIVE_FETCH PROC_REPL_READER PROC_REPL_DESER PROC_RECONCILER <<< "$PROC_IDS"
 if [[ -z "$PROC_SCAN" ]]; then
   echo "error: could not find the RedisScanReader processor in $PG_ID" >&2; exit 1
 fi
@@ -806,6 +837,8 @@ PREFIX_ONLY_JSON="null"
 # RedisScanReader's hash-slot partitioning to actually claim one partition per task - always
 # drive both from the same --parallelism value so they can't drift out of sync.
 PROC_PROPS="\"key-type-filter\":\"$KEY_TYPES\",\"migration-id\":\"$MIGRATION_ID\",\"prefix-deny-list\":$PREFIX_DENY_JSON,\"prefix-only-list\":$PREFIX_ONLY_JSON,\"partition-count\":\"$PARALLELISM\""
+PROC_PROPS="$PROC_PROPS,\"max-source-latency-ms\":\"$MAX_SOURCE_LATENCY_MS\",\"max-source-ops-per-sec\":\"$MAX_SOURCE_OPS_PER_SEC\""
+PROC_PROPS="$PROC_PROPS,\"read-encoding\":\"$READ_ENCODING\",\"claim-timeout-ms\":\"$CLAIM_TIMEOUT_MS\""
 PROC_BODY="{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_SCAN\",\"config\":{\"properties\":{$PROC_PROPS},\"concurrentlySchedulableTaskCount\":$PARALLELISM}}}"
 nifi_api_put_checked "processors/$PROC_SCAN" "$PROC_BODY" > /dev/null
 
@@ -819,6 +852,13 @@ if [[ -n "$PROC_LIVE_CONSUMER" && -n "$PROC_LIVE_FETCH" ]]; then
   PROC_VER="$(nifi_current_version "processors/$PROC_LIVE_FETCH")" || true
   PROC_BODY="{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_LIVE_FETCH\",\"config\":{\"properties\":{\"key-type-filter\":\"$KEY_TYPES\"}}}}"
   nifi_api_put_checked "processors/$PROC_LIVE_FETCH" "$PROC_BODY" > /dev/null
+fi
+# Without them it would report every key the migration skipped as missing on the target, and send it to be copied.
+if [[ -n "$PROC_RECONCILER" ]]; then
+  echo "==> applying the same prefix and type filters to MigrationReconciler"
+  PROC_VER="$(nifi_current_version "processors/$PROC_RECONCILER")" || true
+  PROC_BODY="{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_RECONCILER\",\"config\":{\"properties\":{\"prefix-deny-list\":$PREFIX_DENY_JSON,\"prefix-only-list\":$PREFIX_ONLY_JSON,\"key-type-filter\":\"$KEY_TYPES\"}}}}"
+  nifi_api_put_checked "processors/$PROC_RECONCILER" "$PROC_BODY" > /dev/null
 fi
 if [[ -n "$PROC_REPL_READER" && -n "$PROC_REPL_DESER" ]]; then
   echo "==> applying the same prefix and type filters to the replication Live Phase"
@@ -987,25 +1027,25 @@ for name, value in d.get('component', {}).get('properties', {}).items():
 # prefix-deny-list/prefix-only-list above: NiFi's property PUT is a partial merge, so leaving
 # it out would leave whatever mode a previous run left in place instead of resetting it.
 set_pool_properties() {
-  local svc_id="$1" conn_str="$2" require_tls="$3" connection_mode="$4"
+  local svc_id="$1" conn_str="$2" require_tls="$3" connection_mode="$4" read_from="$5"
   local mode_upper ver body
   mode_upper="$(tr '[:lower:]' '[:upper:]' <<< "$connection_mode")"
   ver="$(nifi_current_version "controller-services/$svc_id")" || true
   if [[ "$require_tls" == "true" ]]; then
     local ssl_id
     ssl_id="$(ensure_ssl_context_service)"
-    body="{\"revision\":{\"version\":$ver},\"component\":{\"id\":\"$svc_id\",\"properties\":{\"connection-string\":\"$conn_str\",\"require-tls\":\"$require_tls\",\"ssl-context-service\":\"$ssl_id\",\"connection-mode\":\"$mode_upper\"}}}"
+    body="{\"revision\":{\"version\":$ver},\"component\":{\"id\":\"$svc_id\",\"properties\":{\"connection-string\":\"$conn_str\",\"require-tls\":\"$require_tls\",\"ssl-context-service\":\"$ssl_id\",\"connection-mode\":\"$mode_upper\",\"read-from\":\"$read_from\"}}}"
   else
-    body="{\"revision\":{\"version\":$ver},\"component\":{\"id\":\"$svc_id\",\"properties\":{\"connection-string\":\"$conn_str\",\"require-tls\":\"$require_tls\",\"connection-mode\":\"$mode_upper\"}}}"
+    body="{\"revision\":{\"version\":$ver},\"component\":{\"id\":\"$svc_id\",\"properties\":{\"connection-string\":\"$conn_str\",\"require-tls\":\"$require_tls\",\"connection-mode\":\"$mode_upper\",\"read-from\":\"$read_from\"}}}"
   fi
   nifi_api_put_checked "controller-services/$svc_id" "$body" > /dev/null
 }
 
 echo "==> setting source Redis connection details (mode=$SOURCE_CONNECTION_MODE)"
-set_pool_properties "$SVC_SOURCE" "$SOURCE_CONNECTION_STRING" "$SOURCE_REQUIRE_TLS" "$SOURCE_CONNECTION_MODE"
+set_pool_properties "$SVC_SOURCE" "$SOURCE_CONNECTION_STRING" "$SOURCE_REQUIRE_TLS" "$SOURCE_CONNECTION_MODE" "$SOURCE_READ_FROM_PROPERTY"
 
 echo "==> setting target Dragonfly connection details (mode=$TARGET_CONNECTION_MODE)"
-set_pool_properties "$SVC_TARGET" "$TARGET_CONNECTION_STRING" "$TARGET_REQUIRE_TLS" "$TARGET_CONNECTION_MODE"
+set_pool_properties "$SVC_TARGET" "$TARGET_CONNECTION_STRING" "$TARGET_REQUIRE_TLS" "$TARGET_CONNECTION_MODE" MASTER
 
 echo "==> enabling controller services"
 nifi_cli pg-enable-services -pgid "$PG_ID" || true

@@ -115,6 +115,23 @@ class MigrationReconcilerIT {
     }
 
     @Test
+    void keysTheMigrationSkipsAreNotDifferences() throws Exception {
+        RedisCommands<String, String> s = src.sync();
+        s.hset("user:1", Map.of("f", "v"));
+        s.set("user:2", "a string, outside the type filter");
+        s.hset("order:1", Map.of("f", "v"));
+
+        Pipeline pipeline = new Pipeline("FULL");
+        pipeline.reconciler.setProperty(io.dragonfly.nifi.redis.processors.RedisScanReader.PREFIX_ONLY_LIST, "user:");
+        pipeline.reconciler.setProperty(io.dragonfly.nifi.redis.processors.RedisSingleKeyFetch.KEY_TYPE_FILTER, "hash");
+        JsonNode report = pipeline.pass();
+
+        assertEquals(Map.of("missing_on_target", 1L), counts(report));
+        assertEquals(List.of("user:1"), tgt.sync().keys("*"));
+        assertEquals(0, pipeline.pass().get("differences").asLong(), "the skipped keys stay out of every pass");
+    }
+
+    @Test
     void aDbsizeDropStartsAFullPassEvenInSampleMode() throws Exception {
         RedisCommands<String, String> s = src.sync();
         for (int i = 0; i < 500; i++) {

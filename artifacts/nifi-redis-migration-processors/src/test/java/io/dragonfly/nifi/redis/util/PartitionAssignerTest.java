@@ -1,5 +1,6 @@
 package io.dragonfly.nifi.redis.util;
 
+import org.apache.nifi.distributed.cache.client.Serializer;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -11,52 +12,45 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PartitionAssignerTest {
 
+    private static final Serializer<String> STRING = (value, out) -> out.write(value.getBytes(StandardCharsets.UTF_8));
+    private static final String CLAIM_0 = "redis.migration.partition.migration-1.claim.0";
+
     @Test
-    void hashSlotMatchesKnownCrc16CcittCheckValue() {
-        // "123456789" is the standard CRC16-CCITT/XMODEM (poly 0x1021, init 0) check value: 0x31C3 = 12739.
-        // Redis Cluster's hash slot is exactly this CRC16 mod 16384, and 12739 < 16384 so the slot equals it.
-        assertEquals(12739, PartitionAssigner.hashSlot("123456789".getBytes(StandardCharsets.UTF_8)));
+    void aClaimStillBeingHeartbeatIsNotTakenOver() throws Exception {
+        FakeAtomicMapCacheClient cache = new FakeAtomicMapCacheClient();
+        PartitionAssigner owner = new PartitionAssigner(cache, "migration-1");
+        assertEquals(Optional.of(0), owner.claimPartition(1, 60_000));
+        owner.heartbeat(0);
+
+        assertEquals(Optional.empty(), new PartitionAssigner(cache, "migration-1").claimPartition(1, 60_000));
     }
 
     @Test
-    void hashSlotHonorsHashTags() {
-        int taggedSlot = PartitionAssigner.hashSlot("{user1000}.following".getBytes(StandardCharsets.UTF_8));
-        int untaggedSlot = PartitionAssigner.hashSlot("user1000".getBytes(StandardCharsets.UTF_8));
-        assertEquals(untaggedSlot, taggedSlot, "keys sharing a {tag} must map to the same slot");
+    void aStaleClaimIsTakenOverByExactlyOneTask() throws Exception {
+        FakeAtomicMapCacheClient cache = new FakeAtomicMapCacheClient();
+        cache.put(CLAIM_0, String.valueOf(System.currentTimeMillis() - 120_000), STRING, STRING);
+
+        Optional<Integer> first = new PartitionAssigner(cache, "migration-1").claimPartition(1, 60_000);
+        Optional<Integer> second = new PartitionAssigner(cache, "migration-1").claimPartition(1, 60_000);
+
+        assertEquals(Optional.of(0), first, "the dead owner's claim is taken over");
+        assertEquals(Optional.empty(), second, "the take-over refreshed it, so the next task leaves it alone");
     }
 
     @Test
-    void hashSlotIgnoresEmptyHashTag() {
-        // "{}" is not a valid hash tag (no characters between braces) - falls back to the whole key.
-        byte[] key = "{}foo".getBytes(StandardCharsets.UTF_8);
-        assertEquals(PartitionAssigner.hashSlot(key) >= 0, true);
+    void aClaimFromBeforeHeartbeatsCountsAsStale() throws Exception {
+        FakeAtomicMapCacheClient cache = new FakeAtomicMapCacheClient();
+        cache.put(CLAIM_0, "claimed", STRING, STRING);
+
+        assertEquals(Optional.of(0), new PartitionAssigner(cache, "migration-1").claimPartition(1, 60_000));
     }
 
     @Test
-    void clusterSlotRangesCoverTheFullSpaceWithoutOverlap() {
-        int partitionCount = 4;
-        int expectedStart = 0;
-        for (int i = 0; i < partitionCount; i++) {
-            int[] range = PartitionAssigner.clusterSlotRange(i, partitionCount);
-            assertEquals(expectedStart, range[0]);
-            expectedStart = range[1];
-        }
-        assertEquals(16384, expectedStart, "last partition's range must reach exactly 16384");
-    }
+    void aCacheWithoutCompareAndReplaceNeverTakesAClaimOver() throws Exception {
+        FakeDistributedMapCacheClient cache = new FakeDistributedMapCacheClient();
+        cache.put(CLAIM_0, "1", STRING, STRING);
 
-    @Test
-    void standaloneOwnsKeyAssignsEachKeyToExactlyOnePartition() {
-        int partitionCount = 4;
-        for (int i = 0; i < 200; i++) {
-            byte[] key = ("key:" + i).getBytes(StandardCharsets.UTF_8);
-            int owners = 0;
-            for (int p = 0; p < partitionCount; p++) {
-                if (PartitionAssigner.standaloneOwnsKey(key, p, partitionCount)) {
-                    owners++;
-                }
-            }
-            assertEquals(1, owners, "key " + i + " must be owned by exactly one partition");
-        }
+        assertEquals(Optional.empty(), new PartitionAssigner(cache, "migration-1").claimPartition(1, 60_000));
     }
 
     @Test

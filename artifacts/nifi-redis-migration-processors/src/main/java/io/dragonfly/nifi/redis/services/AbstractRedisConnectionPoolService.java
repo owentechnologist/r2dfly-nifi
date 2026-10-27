@@ -129,11 +129,26 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
             .defaultValue("0")
             .build();
 
+    public enum ReadFrom { MASTER, REPLICA_PREFERRED }
+
+    public static final PropertyDescriptor READ_FROM = new PropertyDescriptor.Builder()
+            .name("read-from")
+            .displayName("Read From")
+            .description("REPLICA_PREFERRED sends reads to a replica when one is reachable (a cluster's replicas, or "
+                    + "the replicas a standalone master reports), taking the scan's load off the master. Only for a "
+                    + "one-time copy: a replica lags its master, so a Live Phase or reconciler reading through this "
+                    + "pool can copy a value the stream has already moved past.")
+            .required(true)
+            .allowableValues(ReadFrom.MASTER.name(), ReadFrom.REPLICA_PREFERRED.name())
+            .defaultValue(ReadFrom.MASTER.name())
+            .build();
+
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
             CONNECTION_MODE, CONNECTION_STRING, REQUIRE_TLS, SSL_CONTEXT_SERVICE,
-            CONNECTION_TIMEOUT_MS, COMMAND_TIMEOUT_MS, MAX_POOL_SIZE, DATABASE_INDEX);
+            CONNECTION_TIMEOUT_MS, COMMAND_TIMEOUT_MS, MAX_POOL_SIZE, DATABASE_INDEX, READ_FROM);
 
     private volatile boolean clusterMode;
+    private volatile boolean prefersReplicas;
     private RedisClient redisClient;
     private RedisClusterClient redisClusterClient;
     private GenericObjectPool<StatefulRedisConnection<byte[], byte[]>> standalonePool;
@@ -170,6 +185,7 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
         Duration connectTimeout = Duration.ofMillis(context.getProperty(CONNECTION_TIMEOUT_MS).asLong());
         Duration commandTimeout = Duration.ofMillis(context.getProperty(COMMAND_TIMEOUT_MS).asLong());
         int maxPoolSize = context.getProperty(MAX_POOL_SIZE).asInteger();
+        prefersReplicas = ReadFrom.valueOf(context.getProperty(READ_FROM).getValue()) == ReadFrom.REPLICA_PREFERRED;
 
         boolean requireTls = context.getProperty(REQUIRE_TLS).asBoolean();
         SSLContextService sslContextService = context.getProperty(SSL_CONTEXT_SERVICE)
@@ -193,7 +209,11 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
                 applySocketAndSsl(optionsBuilder, connectTimeout, sslOptions);
                 redisClusterClient.setOptions(optionsBuilder.build());
                 clusterPool = ConnectionPoolSupport.createGenericObjectPool(
-                        () -> redisClusterClient.connect(ByteArrayCodec.INSTANCE),
+                        () -> {
+                            StatefulRedisClusterConnection<byte[], byte[]> connection = redisClusterClient.connect(ByteArrayCodec.INSTANCE);
+                            connection.setReadFrom(readFrom());
+                            return connection;
+                        },
                         poolConfig(maxPoolSize), true);
             } else {
                 RedisURI uri = RedisURI.create(connectionString);
@@ -209,8 +229,17 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
                 ClientOptions.Builder optionsBuilder = ClientOptions.builder();
                 applySocketAndSsl(optionsBuilder, connectTimeout, sslOptions);
                 redisClient.setOptions(optionsBuilder.build());
+                // MasterReplica finds the replicas through the master's INFO replication; only built
+                // when asked for, so the default path stays a plain connection.
                 standalonePool = ConnectionPoolSupport.createGenericObjectPool(
-                        () -> redisClient.connect(ByteArrayCodec.INSTANCE),
+                        () -> {
+                            if (!prefersReplicas) {
+                                return redisClient.connect(ByteArrayCodec.INSTANCE);
+                            }
+                            var connection = io.lettuce.core.masterreplica.MasterReplica.connect(redisClient, ByteArrayCodec.INSTANCE, uri);
+                            connection.setReadFrom(readFrom());
+                            return connection;
+                        },
                         poolConfig(maxPoolSize), true);
             }
         } catch (RuntimeException e) {
@@ -311,6 +340,15 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
                 return fn.apply(connection.async(), connection);
             }
         }
+    }
+
+    /** Whether reads, the scan included, go to replicas; see Read From. */
+    public boolean prefersReplicas() {
+        return prefersReplicas;
+    }
+
+    private io.lettuce.core.ReadFrom readFrom() {
+        return prefersReplicas ? io.lettuce.core.ReadFrom.REPLICA_PREFERRED : io.lettuce.core.ReadFrom.UPSTREAM;
     }
 
     public boolean isClusterMode() {

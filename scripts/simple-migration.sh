@@ -118,6 +118,17 @@ Optional:
                                  a formality).
   --no-dfly-to-dfly              force-disable it instead, even if both sides auto-detect as
                                  matching-version Dragonfly (env DFLY_TO_DFLY=false)
+  --max-source-latency-ms N      pause the scan while a page takes longer than N ms, forwarded to
+                                 run-r2dfly.sh (env MAX_SOURCE_LATENCY_MS, default: 0, off)
+  --max-source-ops-per-sec N     pause the scan while the source is above N ops/s, forwarded to
+                                 run-r2dfly.sh (env MAX_SOURCE_OPS_PER_SEC, default: 0, off)
+  --no-read-encoding             skip OBJECT ENCODING per scanned key, forwarded to run-r2dfly.sh
+                                 (env READ_ENCODING=false)
+  --claim-timeout-ms N           take over a dead node's scan partition after N ms, forwarded to
+                                 run-r2dfly.sh (env CLAIM_TIMEOUT_MS, default: 300000)
+  --source-read-from WHERE       master or replica, forwarded to run-r2dfly.sh (env SOURCE_READ_FROM,
+                                 default: master). replica scans and reads the source's replicas;
+                                 one-time copies only.
   --no-restore-fast-path         copy every core-type key with the typed read and write, forwarded
                                  to run-r2dfly.sh (env RESTORE_FAST_PATH=false, default: true -
                                  probe the target and use DUMP/RESTORE where it passes). See
@@ -199,6 +210,11 @@ TOPK_MODE="${TOPK_MODE:-}"
 # server-type detection below"; --dfly-to-dfly/--no-dfly-to-dfly (or the env var) pin it instead.
 DFLY_TO_DFLY="${DFLY_TO_DFLY:-}"
 RESTORE_FAST_PATH="${RESTORE_FAST_PATH:-true}"
+MAX_SOURCE_LATENCY_MS="${MAX_SOURCE_LATENCY_MS:-0}"
+MAX_SOURCE_OPS_PER_SEC="${MAX_SOURCE_OPS_PER_SEC:-0}"
+READ_ENCODING="${READ_ENCODING:-true}"
+CLAIM_TIMEOUT_MS="${CLAIM_TIMEOUT_MS:-300000}"
+SOURCE_READ_FROM="${SOURCE_READ_FROM:-master}"
 # All left unset by default (as opposed to run-r2dfly.sh's own global --batch-size/
 # --module-batch-size, which do have real numeric defaults) - unset here means "let
 # run-r2dfly.sh apply its own default", forwarded only when actually set (see RUN_ARGS below).
@@ -276,6 +292,11 @@ MAPPING = {
     ("migration", "topk-mode"): "TOPK_MODE",
     ("migration", "dfly-to-dfly"): "DFLY_TO_DFLY",
     ("migration", "restore-fast-path"): "RESTORE_FAST_PATH",
+    ("migration", "max-source-latency-ms"): "MAX_SOURCE_LATENCY_MS",
+    ("migration", "max-source-ops-per-sec"): "MAX_SOURCE_OPS_PER_SEC",
+    ("migration", "read-encoding"): "READ_ENCODING",
+    ("migration", "claim-timeout-ms"): "CLAIM_TIMEOUT_MS",
+    ("source", "read-from"): "SOURCE_READ_FROM",
     ("migration", "batch-size"): "BATCH_SIZE",
     ("migration", "batch-size-string"): "BATCH_SIZE_STRING",
     ("migration", "batch-size-hash"): "BATCH_SIZE_HASH",
@@ -399,6 +420,11 @@ while [[ $# -gt 0 ]]; do
     --dfly-to-dfly) DFLY_TO_DFLY="true"; shift ;;
     --no-dfly-to-dfly) DFLY_TO_DFLY="false"; shift ;;
     --no-restore-fast-path) RESTORE_FAST_PATH="false"; shift ;;
+    --max-source-latency-ms) require_value "$@"; MAX_SOURCE_LATENCY_MS="$2"; shift 2 ;;
+    --max-source-ops-per-sec) require_value "$@"; MAX_SOURCE_OPS_PER_SEC="$2"; shift 2 ;;
+    --no-read-encoding) READ_ENCODING="false"; shift ;;
+    --claim-timeout-ms) require_value "$@"; CLAIM_TIMEOUT_MS="$2"; shift 2 ;;
+    --source-read-from) require_value "$@"; SOURCE_READ_FROM="$2"; shift 2 ;;
     --batch-size) require_value "$@"; BATCH_SIZE="$2"; shift 2 ;;
     --batch-size-string) require_value "$@"; BATCH_SIZE_STRING="$2"; shift 2 ;;
     --batch-size-hash) require_value "$@"; BATCH_SIZE_HASH="$2"; shift 2 ;;
@@ -919,6 +945,9 @@ RUN_ARGS=(
 [[ -n "$TOPK_MODE" ]] && RUN_ARGS+=(--topk-mode "$TOPK_MODE")
 [[ "$DFLY_TO_DFLY" == "true" ]] && RUN_ARGS+=(--dfly-to-dfly)
 [[ "$RESTORE_FAST_PATH" == "false" ]] && RUN_ARGS+=(--no-restore-fast-path)
+RUN_ARGS+=(--max-source-latency-ms "$MAX_SOURCE_LATENCY_MS" --max-source-ops-per-sec "$MAX_SOURCE_OPS_PER_SEC")
+RUN_ARGS+=(--claim-timeout-ms "$CLAIM_TIMEOUT_MS" --source-read-from "$SOURCE_READ_FROM")
+[[ "$READ_ENCODING" == "false" ]] && RUN_ARGS+=(--no-read-encoding)
 [[ -n "$BATCH_SIZE" ]] && RUN_ARGS+=(--batch-size "$BATCH_SIZE")
 [[ -n "$BATCH_SIZE_STRING" ]] && RUN_ARGS+=(--batch-size-string "$BATCH_SIZE_STRING")
 [[ -n "$BATCH_SIZE_HASH" ]] && RUN_ARGS+=(--batch-size-hash "$BATCH_SIZE_HASH")
