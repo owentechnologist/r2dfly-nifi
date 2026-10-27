@@ -301,7 +301,7 @@ echo "==> the NAR is placed in nar_extensions/ and reloaded (via restart, if the
 # A cap alone is not enough: the WriteAheadProvenanceRepository still indexes every event in
 # Lucene, and at migration volumes (several events per key, millions of keys) its index queue
 # fills until every session commit in the flow blocks, and stays blocked after the flow is
-# stopped. Seen on NiFi 2.11 after about 30 million keys. So disabling switches to
+# stopped. Seen on NiFi 2.11 after about 25 million keys over several runs. So disabling switches to
 # NoOpProvenanceRepository, which NiFi 2.11 bundles in nifi-provenance-repository-nar
 # (nifi-volatile-provenance-repository) and which records nothing.
 PROVENANCE_DISABLED_IMPLEMENTATION="org.apache.nifi.provenance.NoOpProvenanceRepository"

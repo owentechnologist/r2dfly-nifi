@@ -55,6 +55,31 @@ class RedisConnectionPoolServiceIT {
     }
 
     @Test
+    void usesTheDatabaseNamedInTheConnectionString() throws Exception {
+        TestRunner runner = TestRunners.newTestRunner(RedisScanReader.class);
+        StandardRedisConnectionPoolService service = new StandardRedisConnectionPoolService();
+        runner.addControllerService("redis-pool", service);
+        runner.setProperty(service, AbstractRedisConnectionPoolService.CONNECTION_STRING,
+                "redis://" + redis.getHost() + ":" + redis.getMappedPort(6379) + "/3");
+        runner.setProperty(service, AbstractRedisConnectionPoolService.REQUIRE_TLS, "false");
+        runner.enableControllerService(service);
+        service.withConnection(cmds -> {
+            try {
+                return cmds.set("db-key".getBytes(StandardCharsets.UTF_8), "in-db-3".getBytes(StandardCharsets.UTF_8)).get();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        try (io.lettuce.core.RedisClient client = io.lettuce.core.RedisClient.create("redis://" + redis.getHost() + ":" + redis.getMappedPort(6379));
+             var connection = client.connect()) {
+            assertEquals(0L, connection.sync().exists("db-key"), "not written to database 0");
+            connection.sync().select(3);
+            assertEquals("in-db-3", connection.sync().get("db-key"));
+        }
+    }
+
+    @Test
     void connectsToDragonflyAndRoundTripsAValue() throws Exception {
         TestRunner runner = TestRunners.newTestRunner(RedisScanReader.class);
         StandardDragonflyConnectionPoolService service = new StandardDragonflyConnectionPoolService();

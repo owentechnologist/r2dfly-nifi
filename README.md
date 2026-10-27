@@ -9,7 +9,7 @@ A migration tool from Redis/Valkey to Dragonfly leveraging Apache NiFi
 * Support Clustered sources and targets
 * Allow filtering on keytype and prefix
 * Handle large keys
-* Require only normal client read/write access to source and target
+* Require only normal client read/write access to source and target (the opt-in replication live source also needs `PSYNC` on the source)
 
 [QuickStart](./docs/quickstart.md)
 
@@ -18,3 +18,7 @@ A migration tool from Redis/Valkey to Dragonfly leveraging Apache NiFi
 [debugging](./docs/debugging-help.md)
 
 [r2dfly vs. RedisShake](./docs/r2dfly-vs-redisshake.md)
+
+[Migrating from RedisShake](./docs/migrating-from-redisshake.md)
+
+[Verified behavior](./docs/verified-behavior.md)

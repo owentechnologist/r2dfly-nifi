@@ -123,7 +123,8 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
     public static final PropertyDescriptor DATABASE_INDEX = new PropertyDescriptor.Builder()
             .name("database-index")
             .displayName("Database Index")
-            .description("SELECT index for STANDALONE/SENTINEL mode. Ignored for CLUSTER mode, "
+            .description("SELECT index for STANDALONE/SENTINEL mode. When 0, the database named in the connection "
+                    + "string (redis://host:port/2) is used, or 0 if it names none. Ignored for CLUSTER mode, "
                     + "which does not support multiple logical databases.")
             .required(true)
             .addValidator(StandardValidators.NON_NEGATIVE_INTEGER_VALIDATOR)
@@ -228,9 +229,12 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
                 uri.setTimeout(commandTimeout);
                 uri.setSsl(requireTls);
                 // This branch covers both STANDALONE and SENTINEL (CLUSTER took the other branch
-                // above); DATABASE_INDEX's own description promises both, so it applies here
-                // unconditionally.
-                uri.setDatabase(databaseIndex);
+                // above). A database in the connection string (redis://host:port/2) is kept unless
+                // Database Index names one: overwriting it with the default 0 silently migrated
+                // database 0 instead.
+                if (databaseIndex != 0) {
+                    uri.setDatabase(databaseIndex);
+                }
                 standaloneUri = uri;
                 replicationSocketFactory = requireTls ? replicationSocketFactory(sslContextService) : null;
                 redisClient = RedisClient.create(uri);

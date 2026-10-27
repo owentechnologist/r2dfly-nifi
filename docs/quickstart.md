@@ -70,9 +70,12 @@ source's keyspace notifications so changes made after the scan keep flowing to t
   --target-connection-string rediss://default:password@target-host:6385
 ```
 
-The source must have keyspace notifications on (`CONFIG SET notify-keyspace-events AE`). The
-script checks this before it changes anything and stops with that instruction if the setting is
-missing.
+By default the live phase follows the source's keyspace notifications, so the source must have
+them on (`CONFIG SET notify-keyspace-events AE`). The script checks this before it changes
+anything and stops with that instruction if the setting is missing. `--live-source replication`
+follows the source as a replica instead (`PSYNC`): it needs no notifications, sees module commands
+that publish none, resumes after a restart, and follows a cluster through failovers and
+resharding. The source must accept `PSYNC` from NiFi, which managed services often block.
 
 The script starts the flow and exits. NiFi keeps running unsupervised and keeps applying source
 changes until you stop it:
@@ -82,15 +85,17 @@ changes until you stop it:
   --nifi-user USER --nifi-password PASSWORD
 ```
 
-Continuous mode captures ongoing changes but does not yet self-heal a dropped connection's gap.
-If the keyspace pub/sub connection drops, the changes made during the outage are lost. The stop
-script prints the `Keyspace Pub/Sub Disconnects` and `Keyspace Pub/Sub Downtime (ms)` counters so
-you can see that it happened, but nothing repairs it. There is no reconciliation pass yet.
-`--reconciliation-signals` routes the consumer's `topology_drift` signal to a NiFi queue you can
-read over the REST API instead of discarding it, but no reconciliation trigger reads that queue,
-so nothing acts on the signal yet either. Run `./continuous-migration.sh --help` for the other
-limitations, including what happens when the consumer's queue fills and what the initial scan can
-overwrite.
+With keyspace notifications, a dropped pub/sub connection loses the changes made during the
+outage. The stop script prints the `Keyspace Pub/Sub Disconnects` and `Keyspace Pub/Sub Downtime
+(ms)` counters so you can see that it happened. MigrationReconciler, which continuous mode runs
+alongside the live phase, repairs those gaps: its default SAMPLE passes find part of a gap each
+time, and a FULL pass (`--reconcile-mode FULL`) finds all of it. Run
+`./continuous-migration.sh --help` for the other limitations.
+
+To switch the application over, run `./cutover.sh`. It says when the live phase has caught up,
+and with `--writes-stopped` it confirms the target with a final full reconcile and prints the
+steps to switch. [Migrating from RedisShake](migrating-from-redisshake.md#cut-over) walks through
+cutover and rollback.
 
 ## Options
 
@@ -227,7 +232,7 @@ keys/0 bytes written the whole time, with no clearer error surfaced anywhere in 
 output (only `nifi-app.log` showed the real cause).
 
 A cap alone did not prevent the second way it stalls: the repository still indexes every event
-in Lucene, and after about 30 million keys on NiFi 2.11 its index queue filled until every
+in Lucene, and after about 25 million keys over several runs on NiFi 2.11 its index queue filled until every
 session commit in the flow blocked, and stayed blocked after the flow was stopped.
 
 **So provenance is off by default** - `--disable-provenance` is on unless you say otherwise. It
