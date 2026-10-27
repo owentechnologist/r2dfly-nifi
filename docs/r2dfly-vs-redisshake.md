@@ -61,6 +61,43 @@ outside what it can read at all.
 | Operating model | One binary, one config file | A NiFi deployment: JVM, containers, a canvas, a REST API |
 | Maturity | Shipping since the redis-port lineage, ~4,400 stars | New to this project; Scan Phase field-tested, the rest is not |
 
+## Throughput, measured
+
+Both tools copied the same datasets between the same two containers (Redis 7.4 to Dragonfly
+2.0.2) on one podman VM with 8 CPUs and 12 GB of memory, in October 2026. Each figure runs from the
+first key reaching the target until the last one has; NiFi deployment and container start-up are
+left out on both sides. Rerun any row with `scripts/benchmark-vs-redisshake.sh --dataset <name>`.
+
+| Dataset | RedisShake `sync_reader` | RedisShake `scan_reader` | r2dfly |
+|---|---|---|---|
+| 10 million strings, 64-byte values | 63,700 keys/s (157 s) | 20,900 keys/s (479 s) | 38,300 keys/s (261 s) |
+| 1 million hashes, 20 fields of 32 bytes | 77,900 keys/s (13 s) | 21,200 keys/s (47 s) | 37,100 keys/s (27 s) |
+| 10,000 lists, 1,000 elements of 100 bytes | 2,000 keys/s (5.1 s) | 7,900 keys/s (1.3 s) | under 1 s |
+| Live: 60 s of SET, INCR, HSET, LPUSH on 1M random keys | target matched 1,075 s after the writes stopped | not tested | target matched 328 s after the writes stopped |
+
+What the numbers say:
+
+- For a one-time copy of many small keys, RedisShake's replication reader is faster: about 1.7x
+  on strings and 2.1x on hashes. It parses the source's RDB stream; r2dfly reads key by key, one
+  NiFi FlowFile per key.
+- r2dfly is 1.8x faster than RedisShake's own scan reader, the comparable way of reading.
+- For large values r2dfly took under a second against RedisShake's 5.1 s and 1.3 s, moving each
+  key as one RESTORE payload. At this size the half-second polling limits the precision.
+- In a live sync r2dfly caught up about 3x sooner: it copies each changed key's current value
+  once, where RedisShake replays every command it saw, so its backlog grows with write volume
+  rather than with the number of keys changed (4.1 million here).
+
+These figures assume NiFi's provenance recording is off, which `deploy-to-nifi.sh` does by
+default. With provenance on, r2dfly copied the 10 million strings at 20,700 keys/s, and on long
+runs the provenance index eventually stopped the flow. More concurrent tasks did not help on this
+machine: `--parallelism 8 --writer-concurrency 8` copied the 10 million strings at 12,600 keys/s,
+so the default of one task each stays.
+
+The bulk-copy gap was accepted deliberately. Closing it means carrying many keys per FlowFile
+through every processor, which would rework the per-key failure reasons, dead letters, RESTORE
+fallback and replication ordering that the rest of this comparison relies on. A three-node NiFi
+cluster was not measured.
+
 ## The decision
 
 If your job is moving data from a Redis-compatible source into Dragonfly, once, RedisShake is

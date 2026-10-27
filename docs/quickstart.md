@@ -127,8 +127,7 @@ These options apply to `simple-migration.sh` and `continuous-migration.sh` alike
 --no-dfly-to-dfly              force-disable it
 --toml-file FILE               load any/all of the above from a TOML config file - see
                                [Using a TOML config file](#using-a-toml-config-file) below
---disable-provenance           cap NiFi's provenance repository to a small fixed footprint
-                               (default: on) - see [Disk space and
+--disable-provenance           turn NiFi's provenance recording off (default: on) - see [Disk space and
                                --disable-provenance](#disk-space-and---disable-provenance) below
 --no-disable-provenance        restore this project's own provenance defaults (1GB, full lineage/audit
                                history) instead, if you actually want that and have the disk
@@ -227,17 +226,21 @@ left on device` in a loop. The visible symptom was silent and confusing: the tar
 keys/0 bytes written the whole time, with no clearer error surfaced anywhere in this tool's own
 output (only `nifi-app.log` showed the real cause).
 
-**This is capped by default** - `--disable-provenance` is on unless you say otherwise, precisely
-so nobody has to discover this problem mid-migration the way it was first found. It caps
-`nifi.provenance.repository.max.storage.size`/`rollover.size`/`max.storage.time` down to a small
-fixed footprint (a few MB, a few minutes' retention) instead of disabling provenance tracking
-outright, restarting the NiFi container to apply it if it isn't already set (a no-op, safe to
-pass on every run, once it is).
+A cap alone did not prevent the second way it stalls: the repository still indexes every event
+in Lucene, and after about 30 million keys on NiFi 2.11 its index queue filled until every
+session commit in the flow blocked, and stayed blocked after the flow was stopped.
+
+**So provenance is off by default** - `--disable-provenance` is on unless you say otherwise. It
+sets `nifi.provenance.repository.implementation` to NiFi's own `NoOpProvenanceRepository`, which
+records nothing, restarting the NiFi container to apply it if it isn't already set (a no-op,
+safe to pass on every run, once it is). Failures stay visible without it: every failed key has
+a dead-letter record with its reason, and processors raise bulletins.
 
 Pass `--no-disable-provenance` instead if you actually want NiFi's fine-grained lineage/audit
 history for the migration and the host has the disk for it (this project's own default is a 1GB
 cap, well under NiFi's own 10GB shipped default) - this also restarts the container if a
-previous default-on run already capped it, restoring this project's own defaults.
+previous default-on run turned it off, restoring the WriteAheadProvenanceRepository with this
+project's own defaults.
 
 ## Re-running against a container with leftover queued data
 

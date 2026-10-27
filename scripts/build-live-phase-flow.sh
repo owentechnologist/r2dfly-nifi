@@ -454,7 +454,9 @@ print(d['processGroupStatus']['aggregateSnapshot']['activeThreadCount'])
 
 echo "==> stopping the flow so NiFi will accept the new processors and connections"
 nifi_cli pg-stop -pgid "$PG_ID" || true
-wait_for_processors_stopped
+# Its warning says the run proceeds, so it must: under set -e its non-zero return ended the run
+# there, silently, whenever a stopping processor still held a thread after 30 s.
+wait_for_processors_stopped || true
 if [[ "$LIVE_SOURCE" != "replication" ]]; then
   while read -r switch_state switch_id; do
     [[ -n "$switch_id" ]] && set_run_status "$switch_id" "processor $switch_id" "$switch_state"

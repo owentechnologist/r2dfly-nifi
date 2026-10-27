@@ -777,7 +777,8 @@ print(','.join(s['component']['name'] for s in d['controllerServices'] if s['com
 # properties, and RedisScanReader may still be running from a previous configure/start.
 echo "==> stopping the flow to apply configuration changes"
 nifi_cli pg-stop -pgid "$PG_ID" || true
-wait_for_processors_stopped "$PG_ID"
+# `|| true`: it returns 1 on timeout after warning that the run proceeds, as in reset-r2dfly-flow.sh.
+wait_for_processors_stopped "$PG_ID" || true
 
 # Same requirement applies to controller services, but for *enabled*, not running: NiFi
 # rejects a property PUT to an enabled service outright (a real bug found in practice - every

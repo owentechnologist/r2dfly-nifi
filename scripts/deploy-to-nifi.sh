@@ -26,8 +26,8 @@ SKIP_TESTS="${SKIP_TESTS:-true}"
 MAVEN_IMAGE="${MAVEN_IMAGE:-docker.io/library/maven:3.9-eclipse-temurin-21}"
 M2_CACHE_VOLUME="${M2_CACHE_VOLUME:-nifi-redis-migration-m2-cache}"
 # --verbose shows real pull/build/download output instead of a progress bar (see
-# run_with_progress in toolbox-lib.sh). Provenance repository capping (see further down for
-# why - it's the confirmed root cause of a real stuck migration on a small-disk host) is on by
+# run_with_progress in toolbox-lib.sh). Turning provenance recording off (see further down for
+# why - it stalled real migrations, by disk on a small host and by index on a large run) is on by
 # default; --no-disable-provenance restores this project's own default (1GB, full lineage/audit
 # history) for anyone who actually wants that and has the disk for it. No other flags are
 # accepted - every other setting here is env-var driven (see the block above and below).
@@ -298,11 +298,14 @@ echo "==> the NAR is placed in nar_extensions/ and reloaded (via restart, if the
 # this reason; pass --no-disable-provenance to restore full lineage/audit history if you
 # actually want it and have the disk for it.
 #
-# Kept as the same WriteAheadProvenanceRepository implementation (not a NoOp one) with its own
-# storage/rollover caps shrunk to a small fixed footprint, rather than switching implementation
-# class - verified directly that this NiFi version's nifi-provenance-repository-nar only
-# bundles WriteAheadProvenanceRepository, no NoOp alternative, so pointing nifi.properties at an
-# unverified class name risks NiFi failing to start entirely instead of just capping disk use.
+# A cap alone is not enough: the WriteAheadProvenanceRepository still indexes every event in
+# Lucene, and at migration volumes (several events per key, millions of keys) its index queue
+# fills until every session commit in the flow blocks, and stays blocked after the flow is
+# stopped. Seen on NiFi 2.11 after about 30 million keys. So disabling switches to
+# NoOpProvenanceRepository, which NiFi 2.11 bundles in nifi-provenance-repository-nar
+# (nifi-volatile-provenance-repository) and which records nothing.
+PROVENANCE_DISABLED_IMPLEMENTATION="org.apache.nifi.provenance.NoOpProvenanceRepository"
+PROVENANCE_DEFAULT_IMPLEMENTATION="org.apache.nifi.provenance.WriteAheadProvenanceRepository"
 PROVENANCE_CAP_SIZE="8 MB"
 PROVENANCE_ROLLOVER_SIZE="1 MB"
 PROVENANCE_MAX_STORAGE_TIME="5 mins"
@@ -314,13 +317,14 @@ PROVENANCE_DEFAULT_SIZE="1 GB"
 PROVENANCE_DEFAULT_ROLLOVER_SIZE="100 MB"
 PROVENANCE_DEFAULT_MAX_STORAGE_TIME="30 days"
 
-# apply_provenance_settings <label> <max-storage-size> <rollover-size> <max-storage-time> -
-# writes the three properties and restarts+waits, shared by both the cap and restore paths
+# apply_provenance_settings <label> <implementation> <max-storage-size> <rollover-size> <max-storage-time> -
+# writes the four properties and restarts+waits, shared by both the disable and restore paths
 # below so that logic (and its 5-minute readiness timeout) exists exactly once.
 apply_provenance_settings() {
-  local label="$1" size="$2" rollover="$3" storage_time="$4"
-  echo "==> $label: max.storage.size=$size, rollover.size=$rollover, max.storage.time=$storage_time"
+  local label="$1" implementation="$2" size="$3" rollover="$4" storage_time="$5"
+  echo "==> $label: implementation=${implementation##*.}, max.storage.size=$size, rollover.size=$rollover, max.storage.time=$storage_time"
   runtime_exec "$CONTAINER_NAME" sed -i \
+    -e "s/^nifi.provenance.repository.implementation=.*/nifi.provenance.repository.implementation=$implementation/" \
     -e "s/^nifi.provenance.repository.max.storage.size=.*/nifi.provenance.repository.max.storage.size=$size/" \
     -e "s/^nifi.provenance.repository.rollover.size=.*/nifi.provenance.repository.rollover.size=$rollover/" \
     -e "s/^nifi.provenance.repository.max.storage.time=.*/nifi.provenance.repository.max.storage.time=$storage_time/" \
@@ -344,20 +348,21 @@ apply_provenance_settings() {
   echo "==> NiFi is back up"
 }
 
+CURRENT_PROVENANCE_IMPLEMENTATION="$(runtime_exec "$CONTAINER_NAME" sed -n 's/^nifi.provenance.repository.implementation=//p' /opt/nifi/nifi-current/conf/nifi.properties)"
 CURRENT_PROVENANCE_CAP="$(runtime_exec "$CONTAINER_NAME" sed -n 's/^nifi.provenance.repository.max.storage.size=//p' /opt/nifi/nifi-current/conf/nifi.properties)"
 if [[ "$DISABLE_PROVENANCE" == "true" ]]; then
-  if [[ "$CURRENT_PROVENANCE_CAP" == "$PROVENANCE_CAP_SIZE" ]]; then
-    echo "==> provenance repository already capped at $PROVENANCE_CAP_SIZE - skipping"
+  if [[ "$CURRENT_PROVENANCE_IMPLEMENTATION" == "$PROVENANCE_DISABLED_IMPLEMENTATION" ]]; then
+    echo "==> provenance recording already off - skipping"
   else
-    apply_provenance_settings "capping NiFi's provenance repository (default on; pass --no-disable-provenance to restore full tracking)" \
-      "$PROVENANCE_CAP_SIZE" "$PROVENANCE_ROLLOVER_SIZE" "$PROVENANCE_MAX_STORAGE_TIME"
+    apply_provenance_settings "turning NiFi's provenance recording off (default on; pass --no-disable-provenance to restore full tracking)" \
+      "$PROVENANCE_DISABLED_IMPLEMENTATION" "$PROVENANCE_CAP_SIZE" "$PROVENANCE_ROLLOVER_SIZE" "$PROVENANCE_MAX_STORAGE_TIME"
   fi
 else
-  if [[ "$CURRENT_PROVENANCE_CAP" == "$PROVENANCE_DEFAULT_SIZE" ]]; then
+  if [[ "$CURRENT_PROVENANCE_IMPLEMENTATION" == "$PROVENANCE_DEFAULT_IMPLEMENTATION" && "$CURRENT_PROVENANCE_CAP" == "$PROVENANCE_DEFAULT_SIZE" ]]; then
     echo "==> provenance repository already at this project's own defaults - skipping"
   else
     apply_provenance_settings "--no-disable-provenance: restoring this project's own provenance repository defaults" \
-      "$PROVENANCE_DEFAULT_SIZE" "$PROVENANCE_DEFAULT_ROLLOVER_SIZE" "$PROVENANCE_DEFAULT_MAX_STORAGE_TIME"
+      "$PROVENANCE_DEFAULT_IMPLEMENTATION" "$PROVENANCE_DEFAULT_SIZE" "$PROVENANCE_DEFAULT_ROLLOVER_SIZE" "$PROVENANCE_DEFAULT_MAX_STORAGE_TIME"
   fi
 fi
 
