@@ -41,12 +41,9 @@ class ScanLoadIT {
                 s.set("k:" + i, "v");
             }
 
-            long onePartition = scanCalls(s, () -> assertEquals(2000, scan(1).size()));
-            long fourPartitions = scanCalls(s, () -> {
-                List<String> keys = scan(4);
-                assertEquals(2000, keys.size());
-                assertEquals(2000, new HashSet<>(keys).size(), "every key emitted exactly once");
-            });
+            // Distinct keys: SCAN promises every key at least once, not exactly once.
+            long onePartition = scanCalls(s, () -> assertEquals(2000, new HashSet<>(scan(1)).size()));
+            long fourPartitions = scanCalls(s, () -> assertEquals(2000, new HashSet<>(scan(4)).size()));
 
             assertEquals(onePartition, fourPartitions,
                     "SCAN calls with 4 partitions (" + fourPartitions + ") vs 1 partition (" + onePartition + ")");

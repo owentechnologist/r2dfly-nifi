@@ -40,7 +40,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * RedisScanReader against a real 3-master, 3-replica Redis Cluster and a standalone master with a
  * replica, all inside one container. Nodes announce 127.0.0.1 on fixed ports that the host maps
  * one to one, so the cluster bus works inside the container and the client reaches every node from
- * outside. SCAN load is counted on each node (INFO commandstats). Requires Docker.
+ * outside. SCAN load is counted on each node (INFO commandstats). Failover is off: on a loaded host
+ * a master once missed the default 15 s node timeout mid-suite, its replica took over, and the
+ * scan counts and keys moved with it (failover during a scan is WP7's topology recovery, untested
+ * here). Requires Docker.
  */
 @Testcontainers
 class ClusterScanIT {
@@ -52,7 +55,8 @@ class ClusterScanIT {
 
     private static final String START = String.join("; ",
             "for p in 17001 17002 17003 17004 17005 17006; do redis-server --port $p --cluster-enabled yes "
-                    + "--cluster-config-file /tmp/n$p.conf --cluster-announce-ip 127.0.0.1 --repl-diskless-sync-delay 0 --daemonize yes --save ''; done",
+                    + "--cluster-config-file /tmp/n$p.conf --cluster-announce-ip 127.0.0.1 --repl-diskless-sync-delay 0 "
+                    + "--cluster-node-timeout 60000 --cluster-replica-no-failover yes --daemonize yes --save ''; done",
             "redis-server --port 17101 --repl-diskless-sync-delay 0 --daemonize yes --save ''",
             "redis-server --port 17102 --replicaof 127.0.0.1 17101 --replica-announce-ip 127.0.0.1 --daemonize yes --save ''",
             "sleep 1",
@@ -105,12 +109,10 @@ class ClusterScanIT {
 
     @Test
     void eachMasterIsScannedOnceWhateverThePartitionCount() throws Exception {
-        Map<Integer, Long> onePartition = scanCallsPerNode(() -> assertEquals(KEYS, scanCluster(1, "MASTER", null).size()));
-        Map<Integer, Long> twoPartitions = scanCallsPerNode(() -> {
-            List<String> keys = scanCluster(2, "MASTER", null);
-            assertEquals(KEYS, keys.size());
-            assertEquals(KEYS, new HashSet<>(keys).size(), "every key emitted exactly once");
-        });
+        // Keys are counted distinct, since SCAN promises every key at least once rather than exactly
+        // once; overlapping partitions show in the SCAN call counts.
+        Map<Integer, Long> onePartition = scanCallsPerNode(() -> assertEquals(KEYS, new HashSet<>(scanCluster(1, "MASTER", null)).size()));
+        Map<Integer, Long> twoPartitions = scanCallsPerNode(() -> assertEquals(KEYS, new HashSet<>(scanCluster(2, "MASTER", null)).size()));
 
         assertEquals(onePartition, twoPartitions, "per-node SCAN calls with 2 partitions vs 1");
         for (int replica : replicaPorts()) {
@@ -120,7 +122,7 @@ class ClusterScanIT {
 
     @Test
     void aReplicaPreferringPoolScansAndReadsTheReplicas() throws Exception {
-        Map<Integer, Long> scans = scanCallsPerNode(() -> assertEquals(KEYS, scanCluster(1, "REPLICA_PREFERRED", null).size()));
+        Map<Integer, Long> scans = scanCallsPerNode(() -> assertEquals(KEYS, new HashSet<>(scanCluster(1, "REPLICA_PREFERRED", null)).size()));
         for (int master : masterPorts()) {
             assertEquals(0L, scans.get(master), "master " + master + " took no SCAN");
         }
@@ -135,13 +137,13 @@ class ClusterScanIT {
             laterMastersKeys += dbsize(portOf(id));
         }
         List<String> keys = scanCluster(1, "MASTER", masters.get(1) + "|0");
-        assertEquals(laterMastersKeys, keys.size(), "only the checkpointed master and those after it were scanned");
+        assertEquals(laterMastersKeys, new HashSet<>(keys).size(), "only the checkpointed master and those after it were scanned");
     }
 
     @Test
     void aStandaloneReplicaPreferringPoolScansTheReplica() throws Exception {
-        Map<Integer, Long> scans = scanCallsPerNode(() -> assertEquals(KEYS, scan("redis://127.0.0.1:" + MASTER_PORT, "STANDALONE",
-                "REPLICA_PREFERRED", 1, null).size()));
+        Map<Integer, Long> scans = scanCallsPerNode(() -> assertEquals(KEYS, new HashSet<>(scan("redis://127.0.0.1:" + MASTER_PORT, "STANDALONE",
+                "REPLICA_PREFERRED", 1, null)).size()));
         assertEquals(0L, scans.get(MASTER_PORT), "the master took no SCAN");
         assertTrue(scans.get(REPLICA_PORT) > 0, "the replica did the scanning: " + scans);
     }

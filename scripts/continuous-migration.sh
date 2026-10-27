@@ -1351,6 +1351,13 @@ echo "  mode: continuous"
 echo "  source keys: $SOURCE_DBSIZE_END"
 echo "  target keys: $TARGET_DBSIZE_END (was $TARGET_DBSIZE_START before this run)"
 echo "  keys migrated this run: $MIGRATED"
+# RedisDeadLetterWriter keeps one record per key it could not copy (a time series, a Bloom filter
+# from Redis, ...), each with redis.incompatible.reason.
+DEAD_LETTERS="$(runtime_exec "$NIFI_CONTAINER_NAME" sh -c 'ls /opt/nifi/nifi-current/r2dfly-dead-letter 2>/dev/null | wc -l' | tr -d '[:space:]')" || true
+if [[ "${DEAD_LETTERS:-0}" -gt 0 ]]; then
+  echo "  keys NOT copied (no copy path to this Dragonfly): $DEAD_LETTERS - one JSON record each, with the reason, in"
+  echo "    $NIFI_CONTAINER_NAME:/opt/nifi/nifi-current/r2dfly-dead-letter"
+fi
 echo "  the initial snapshot is complete, and the Live Phase is still running."
 echo "  NiFi keeps running unsupervised after this script exits, and the Live Phase keeps applying"
 echo "  source changes to the target until it is stopped."

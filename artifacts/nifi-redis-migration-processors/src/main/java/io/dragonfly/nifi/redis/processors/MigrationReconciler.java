@@ -6,6 +6,7 @@ import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.dragonfly.nifi.redis.util.ComparableValue;
 import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.KeyRecord;
+import io.dragonfly.nifi.redis.util.ModuleCopy;
 import io.dragonfly.nifi.redis.util.RedisValueFetcher;
 import io.lettuce.core.KeyScanCursor;
 import io.lettuce.core.LettuceFutures;
@@ -367,7 +368,10 @@ public class MigrationReconciler extends AbstractProcessor {
             String key = new String(keys.get(i), StandardCharsets.UTF_8);
             String sourceType = sourceTypes.get(i);
             String targetType = targetTypes.get(i);
-            if ("none".equals(sourceType) || !filter.allowsType(sourceType)) {
+            // A type Dragonfly cannot hold is reported once, by ModuleTypeHandler's dead-letter
+            // record, not again as a difference on every pass.
+            if ("none".equals(sourceType) || !filter.allowsType(sourceType)
+                    || (!CORE_TYPES.contains(sourceType) && ModuleCopy.of(sourceType) == ModuleCopy.NOT_SUPPORTED_BY_DRAGONFLY)) {
                 continue;
             }
             current.keysChecked++;

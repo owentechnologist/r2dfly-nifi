@@ -2,6 +2,7 @@ package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService;
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
+import io.dragonfly.nifi.redis.util.ModuleCopy;
 import io.dragonfly.nifi.redis.util.RawModuleCommands;
 import io.lettuce.core.LettuceFutures;
 import io.lettuce.core.RedisFuture;
@@ -125,10 +126,10 @@ public class ModuleTypeHandler extends AbstractProcessor {
                     + "MBbloomCF (Cuckoo Filter), and CMSk-TYPE (Count-Min Sketch) keys. Roughly halves "
                     + "round trips (one DUMP+RESTORE pair instead of a read command followed by a rebuild "
                     + "command) and, for TopK, is exact rather than the approximate TOPK.ADD-based "
-                    + "reconstruction. Bloom, Cuckoo Filter, and CMS keys have no other reconstruction "
-                    + "path in this processor, so they're only migrated when this is enabled; ReJSON-RL "
-                    + "and TopK-TYPE fall back to their normal reconstruction for any key where DUMP or "
-                    + "RESTORE itself fails. Only safe between Dragonfly instances on compatible versions "
+                    + "reconstruction. Bloom, Cuckoo Filter, CMS and unknown module keys are always tried "
+                    + "with DUMP/RESTORE, this setting or not, and go to unsupported when the target "
+                    + "rejects the payload; ReJSON-RL and TopK-TYPE fall back to their normal "
+                    + "reconstruction for any key where DUMP or RESTORE itself fails. Only safe between Dragonfly instances on compatible versions "
                     + "- DUMP payloads aren't a portable format, and Cuckoo Filter support itself is "
                     + "version-gated on Dragonfly's side (e.g. present in df-v1.40.2, absent in "
                     + "df-v1.39.0).")
@@ -143,7 +144,15 @@ public class ModuleTypeHandler extends AbstractProcessor {
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
             SOURCE_CONNECTION_POOL, TARGET_CONNECTION_POOL, KEY_PREFIX, KEY_PREFIX_SEPARATOR, BATCH_SIZE,
             BATCH_SIZE_JSON, BATCH_SIZE_TOPK, BATCH_SIZE_BLOOM_CMS, BATCH_TIMEOUT_MS, DFLY_TO_DFLY);
-    private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_SUCCESS, REL_FAILURE);
+    // Auto-terminated by default so flows built before it existed stay valid; while nothing is
+    // connected to it, these keys go to failure as they always did.
+    public static final Relationship REL_UNSUPPORTED = new Relationship.Builder().name("unsupported")
+            .description("A key this Dragonfly cannot hold or receive losslessly (time series, T-Digest, a Bloom filter "
+                    + "from Redis, ...), with redis.incompatible.reason. Connect to RedisDeadLetterWriter.")
+            .autoTerminateDefault(true)
+            .build();
+
+    private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_SUCCESS, REL_FAILURE, REL_UNSUPPORTED);
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
@@ -163,16 +172,11 @@ public class ModuleTypeHandler extends AbstractProcessor {
     public void onTrigger(ProcessContext context, ProcessSession session) throws ProcessException {
         int batchSize = context.getProperty(BATCH_SIZE).asInteger();
         long batchTimeoutMs = context.getProperty(BATCH_TIMEOUT_MS).asLong();
-        // Read here (not down with the other properties below) because the batch pull right
-        // below needs it - ModuleBatchFilter's own category classification (json/topk/
-        // bloom-cms/default) has to mirror the exact same dflyToDfly-gated logic the per-item
-        // loop below uses, or the two would disagree about which category a key belongs to.
-        boolean dflyToDflyForBatching = context.getProperty(DFLY_TO_DFLY).asBoolean();
         Map<String, Integer> categoryBatchSize = new HashMap<>();
         putIfSet(categoryBatchSize, "json", context, BATCH_SIZE_JSON);
         putIfSet(categoryBatchSize, "topk", context, BATCH_SIZE_TOPK);
         putIfSet(categoryBatchSize, "bloomcms", context, BATCH_SIZE_BLOOM_CMS);
-        List<FlowFile> batch = session.get(new ModuleBatchFilter(batchSize, categoryBatchSize, dflyToDflyForBatching));
+        List<FlowFile> batch = session.get(new ModuleBatchFilter(batchSize, categoryBatchSize));
         if (batch.isEmpty()) {
             context.yield();
             return;
@@ -182,7 +186,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
         DragonflyConnectionPoolService targetPool = context.getProperty(TARGET_CONNECTION_POOL).asControllerService(DragonflyConnectionPoolService.class);
         String prefix = context.getProperty(KEY_PREFIX).getValue();
         String separator = context.getProperty(KEY_PREFIX_SEPARATOR).getValue();
-        boolean dflyToDfly = dflyToDflyForBatching;
+        boolean dflyToDfly = context.getProperty(DFLY_TO_DFLY).asBoolean();
         ComponentLog logger = getLogger();
 
         List<Item> jsonItems = new ArrayList<>();
@@ -200,18 +204,11 @@ public class ModuleTypeHandler extends AbstractProcessor {
             byte[] sourceKey = key.getBytes(StandardCharsets.UTF_8);
             byte[] targetKey = ((prefix == null || prefix.isEmpty()) ? key : prefix + separator + key).getBytes(StandardCharsets.UTF_8);
             Item item = new Item(flowFile, sourceKey, targetKey, ttlMs);
-            switch (classifyForBatch(moduleType, dflyToDfly)) {
-                case "json" -> jsonItems.add(item);
-                case "topk" -> topkItems.add(item);
-                case "bloomcms" ->
-                    // No read/reconstruct command exists for these in this processor - DUMP/RESTORE
-                    // is the only way they're migrated at all, so they're only reachable here.
-                        dumpRestoreOnlyItems.add(item);
-                default -> {
-                    FlowFile updated = session.putAttribute(flowFile, "redis.incompatible.reason", "module_type:" + moduleType);
-                    logger.warn("Unsupported module type '{}' for key {}", moduleType, key);
-                    session.transfer(updated, REL_FAILURE);
-                }
+            switch (ModuleCopy.of(moduleType)) {
+                case JSON_REBUILD -> jsonItems.add(item);
+                case TOPK_REBUILD -> topkItems.add(item);
+                case RESTORE_ONLY -> dumpRestoreOnlyItems.add(item);
+                case NOT_SUPPORTED_BY_DRAGONFLY -> notCopied(context, session, item, ModuleCopy.notCopiedReason(moduleType, null));
             }
         }
 
@@ -222,20 +219,36 @@ public class ModuleTypeHandler extends AbstractProcessor {
             reconstructTopKBatch(sourcePool, targetPool, topkItems, batchTimeoutMs, session, logger, dflyToDfly);
         }
         if (!dumpRestoreOnlyItems.isEmpty()) {
-            List<Item> failed = dumpRestoreBatch(sourcePool, targetPool, dumpRestoreOnlyItems, batchTimeoutMs, session, logger);
-            for (Item item : failed) {
-                FlowFile updated = session.putAttribute(item.flowFile, "redis.incompatible.reason", "dump_restore_failed");
-                session.transfer(session.penalize(updated), REL_FAILURE);
-            }
+            Map<Item, String> failed = dumpRestoreBatch(sourcePool, targetPool, dumpRestoreOnlyItems, batchTimeoutMs, session, logger);
+            failed.forEach((item, error) -> {
+                if (error.startsWith(RESTORE_REJECTED)) {
+                    notCopied(context, session, item, ModuleCopy.notCopiedReason(item.flowFile.getAttribute("redis.type"),
+                            error.substring(RESTORE_REJECTED.length())));
+                } else {
+                    FlowFile updated = session.putAttribute(item.flowFile, "redis.incompatible.reason", error);
+                    session.transfer(session.penalize(updated), REL_FAILURE);
+                }
+            });
         }
         session.commit();
+    }
+
+    private static final String RESTORE_REJECTED = "RESTORE rejected: ";
+
+    /** Permanent for this key on this target, so it leaves for the dead-letter queue rather than being retried. */
+    private void notCopied(ProcessContext context, ProcessSession session, Item item, String reason) {
+        String type = item.flowFile.getAttribute("redis.type");
+        getLogger().warn("Key {} not copied: {}", keyString(item), reason);
+        session.adjustCounter("Module Keys Not Copied (" + type + ")", 1, false);
+        FlowFile updated = session.putAttribute(item.flowFile, "redis.incompatible.reason", reason);
+        session.transfer(updated, context.hasConnection(REL_UNSUPPORTED) ? REL_UNSUPPORTED : REL_FAILURE);
     }
 
     private void reconstructJsonBatch(RedisConnectionPoolService sourcePool, DragonflyConnectionPoolService targetPool,
                                        List<Item> inputItems, long batchTimeoutMs, ProcessSession session, ComponentLog logger,
                                        boolean dflyToDfly) {
         List<Item> items = dflyToDfly
-                ? dumpRestoreBatch(sourcePool, targetPool, inputItems, batchTimeoutMs, session, logger)
+                ? new ArrayList<>(dumpRestoreBatch(sourcePool, targetPool, inputItems, batchTimeoutMs, session, logger).keySet())
                 : inputItems;
         if (items.isEmpty()) {
             return;
@@ -296,7 +309,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
         // two real Dragonfly instances) - the TOPK.INCRBY path further down is exact too now, so
         // either way this method's output is exact, not approximate.
         List<Item> items = dflyToDfly
-                ? dumpRestoreBatch(sourcePool, targetPool, inputItems, batchTimeoutMs, session, logger)
+                ? new ArrayList<>(dumpRestoreBatch(sourcePool, targetPool, inputItems, batchTimeoutMs, session, logger).keySet())
                 : inputItems;
         if (items.isEmpty()) {
             return;
@@ -460,8 +473,9 @@ public class ModuleTypeHandler extends AbstractProcessor {
      * between scan and now) - the caller decides what to do with them: fall back to a
      * type-specific reconstruction (JSON, TopK), or route straight to failure (Bloom, CMS, which
      * have no other reconstruction path in this processor). */
-    private List<Item> dumpRestoreBatch(RedisConnectionPoolService sourcePool, DragonflyConnectionPoolService targetPool,
-                                         List<Item> items, long batchTimeoutMs, ProcessSession session, ComponentLog logger) {
+    /** Returns each item not copied, with why: a RESTORE_REJECTED error is the target refusing the payload. */
+    private Map<Item, String> dumpRestoreBatch(RedisConnectionPoolService sourcePool, DragonflyConnectionPoolService targetPool,
+                                               List<Item> items, long batchTimeoutMs, ProcessSession session, ComponentLog logger) {
         Map<Item, RedisFuture<byte[]>> dumpFutures = sourcePool.withConnection(cmds -> {
             Map<Item, RedisFuture<byte[]>> futures = new LinkedHashMap<>();
             for (Item item : items) {
@@ -471,7 +485,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
             return futures;
         });
 
-        List<Item> failed = new ArrayList<>();
+        Map<Item, String> failed = new LinkedHashMap<>();
         List<Item> toRestore = new ArrayList<>();
         Map<Item, byte[]> payloadByItem = new LinkedHashMap<>();
         for (Item item : items) {
@@ -486,7 +500,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
             }
             if (payload == null) {
                 logger.warn("DUMP failed for key {}: {}", keyString(item), future == null ? "no future" : future.getError());
-                failed.add(item);
+                failed.put(item, "DUMP failed: " + (future == null ? "no reply" : future.getError()));
                 continue;
             }
             payloadByItem.put(item, payload);
@@ -512,7 +526,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
                 session.transfer(item.flowFile, REL_SUCCESS);
             } else {
                 logger.warn("RESTORE failed for key {}: {}", keyString(item), future == null ? "no future" : future.getError());
-                failed.add(item);
+                failed.put(item, future != null && future.isDone() ? RESTORE_REJECTED + future.getError() : "RESTORE timed out");
             }
         }
         return failed;
@@ -606,28 +620,18 @@ public class ModuleTypeHandler extends AbstractProcessor {
         }
     }
 
-    /** Classifies a redis.type value into the same buckets onTrigger's own dispatch loop routes
-     * on ("json", "topk", "bloomcms", or "other" for anything unsupported) - shared by
-     * ModuleBatchFilter below so the batch pull can never disagree with the dispatch loop about
-     * which category a key belongs to. Mirrors that loop's matching exactly: ReJSON-RL by exact
-     * case-insensitive name, TopK by a loose "topk" substring (the real TYPE reply for RedisBloom
-     * TopK keys couldn't be confirmed without a live server), Bloom/Cuckoo Filter/CMS only when
-     * dflyToDfly is on (they have no other reconstruction path in this processor). */
-    private static String classifyForBatch(String moduleType, boolean dflyToDfly) {
+    /** The batch-size bucket of a redis.type, from the same ModuleCopy table onTrigger dispatches on;
+     * "bloomcms" is every RESTORE-only type, unknown modules included, and "other" the ones never tried. */
+    private static String classifyForBatch(String moduleType) {
         if (moduleType == null) {
             return "other";
         }
-        String lower = moduleType.toLowerCase();
-        if ("rejson-rl".equals(lower)) {
-            return "json";
-        }
-        if (lower.contains("topk")) {
-            return "topk";
-        }
-        if (dflyToDfly && (lower.contains("bloom") || lower.contains("cms"))) {
-            return "bloomcms";
-        }
-        return "other";
+        return switch (ModuleCopy.of(moduleType)) {
+            case JSON_REBUILD -> "json";
+            case TOPK_REBUILD -> "topk";
+            case RESTORE_ONLY -> "bloomcms";
+            case NOT_SUPPORTED_BY_DRAGONFLY -> "other";
+        };
     }
 
     // ModuleBatchFilter buckets by classifyForBatch's category: a category with its own
@@ -645,20 +649,18 @@ public class ModuleTypeHandler extends AbstractProcessor {
 
         private final int defaultBatchSize;
         private final Map<String, Integer> categoryLimits;
-        private final boolean dflyToDfly;
         private final Map<String, Integer> acceptedByBucket = new HashMap<>();
         private int scanned = 0;
 
-        ModuleBatchFilter(int defaultBatchSize, Map<String, Integer> categoryLimits, boolean dflyToDfly) {
+        ModuleBatchFilter(int defaultBatchSize, Map<String, Integer> categoryLimits) {
             this.defaultBatchSize = defaultBatchSize;
             this.categoryLimits = categoryLimits;
-            this.dflyToDfly = dflyToDfly;
         }
 
         @Override
         public FlowFileFilterResult filter(FlowFile flowFile) {
             scanned++;
-            String category = classifyForBatch(flowFile.getAttribute("redis.type"), dflyToDfly);
+            String category = classifyForBatch(flowFile.getAttribute("redis.type"));
             Integer overrideLimit = categoryLimits.get(category);
             String bucket = overrideLimit != null ? category : DEFAULT_BUCKET;
             int limit = overrideLimit != null ? overrideLimit : defaultBatchSize;

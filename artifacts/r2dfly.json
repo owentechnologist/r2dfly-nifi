@@ -557,6 +557,53 @@
         "maxBackoffPeriod": "10 mins",
         "componentType": "PROCESSOR",
         "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "67873273-4d2b-40c7-9b46-ca833588c86f",
+        "instanceIdentifier": "8ba48698-6d77-4131-996f-9b5817a0efd3",
+        "name": "RedisDeadLetterWriter",
+        "comments": "",
+        "position": {
+          "x": 850.0,
+          "y": 300.0
+        },
+        "type": "io.dragonfly.nifi.redis.processors.RedisDeadLetterWriter",
+        "bundle": {
+          "group": "io.dragonfly.nifi.redis",
+          "artifact": "nifi-redis-migration-nar",
+          "version": "1.0.0-SNAPSHOT"
+        },
+        "properties": {
+          "output-directory": "./r2dfly-dead-letter"
+        },
+        "propertyDescriptors": {
+          "output-directory": {
+            "name": "output-directory",
+            "displayName": "Output Directory",
+            "identifiesControllerService": false,
+            "sensitive": false,
+            "dynamic": false
+          }
+        },
+        "style": {},
+        "schedulingPeriod": "0 sec",
+        "schedulingStrategy": "TIMER_DRIVEN",
+        "executionNode": "ALL",
+        "penaltyDuration": "30 sec",
+        "yieldDuration": "1 sec",
+        "bulletinLevel": "WARN",
+        "runDurationMillis": 0,
+        "concurrentlySchedulableTaskCount": 1,
+        "autoTerminatedRelationships": [
+          "success"
+        ],
+        "scheduledState": "ENABLED",
+        "retryCount": 10,
+        "retriedRelationships": [],
+        "backoffMechanism": "PENALIZE_FLOWFILE",
+        "maxBackoffPeriod": "10 mins",
+        "componentType": "PROCESSOR",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
       }
     ],
     "inputPorts": [],
@@ -726,6 +773,74 @@
         "zIndex": 0,
         "selectedRelationships": [
           "retry"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "d8f07f5b-9502-48a1-af22-8f980ad94c69",
+        "instanceIdentifier": "037d7884-88d3-4a41-b0ca-56a81d13a786",
+        "source": {
+          "id": "b8dba330-42ab-3c25-a4fd-0959f879b9de",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "ModuleTypeHandler",
+          "comments": "",
+          "instanceIdentifier": "5eed6c1d-01a0-1000-6228-77b3e59c4c18"
+        },
+        "destination": {
+          "id": "67873273-4d2b-40c7-9b46-ca833588c86f",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisDeadLetterWriter",
+          "comments": "",
+          "instanceIdentifier": "8ba48698-6d77-4131-996f-9b5817a0efd3"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "unsupported"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "79eea8ea-0a06-47f2-9bff-c1deb243488c",
+        "instanceIdentifier": "b1599ae7-dc93-4a6a-b00b-329a0889341c",
+        "source": {
+          "id": "67873273-4d2b-40c7-9b46-ca833588c86f",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisDeadLetterWriter",
+          "comments": "",
+          "instanceIdentifier": "8ba48698-6d77-4131-996f-9b5817a0efd3"
+        },
+        "destination": {
+          "id": "67873273-4d2b-40c7-9b46-ca833588c86f",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisDeadLetterWriter",
+          "comments": "",
+          "instanceIdentifier": "8ba48698-6d77-4131-996f-9b5817a0efd3"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "failure"
         ],
         "backPressureObjectThreshold": 10000,
         "backPressureDataSizeThreshold": "1 GB",

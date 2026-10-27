@@ -52,6 +52,25 @@ public class RedisDeadLetterWriter extends AbstractProcessor {
         return RELATIONSHIPS;
     }
 
+    /**
+     * Named by key when there is one, so a key that fails again (a reconcile pass retrying a Bloom
+     * filter the target can never hold, say) replaces its own record instead of adding another.
+     * The record itself carries the key.
+     */
+    private static String fileName(FlowFile flowFile) {
+        String key = flowFile.getAttribute("redis.key");
+        if (key == null) {
+            return flowFile.getAttribute("uuid") + ".json";
+        }
+        try {
+            // A hash, not the key itself: a key can be longer than a file name may be.
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(key.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return "key-" + java.util.HexFormat.of().formatHex(digest) + ".json";
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     @Override
     public void onTrigger(ProcessContext context, ProcessSession session) throws ProcessException {
         FlowFile flowFile = session.get();
@@ -69,7 +88,7 @@ public class RedisDeadLetterWriter extends AbstractProcessor {
             record.put("attributes", flowFile.getAttributes());
             record.put("content_base64", Base64.getEncoder().encodeToString(content));
 
-            Path file = outputDir.resolve(flowFile.getAttribute("uuid") + ".json");
+            Path file = outputDir.resolve(fileName(flowFile));
             Files.write(file, OBJECT_MAPPER.writeValueAsBytes(record));
 
             getLogger().error("Migration failure dead-lettered: key={} reason={} file={}",

@@ -1,6 +1,7 @@
 package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
+import io.dragonfly.nifi.redis.util.ClusterTopologySnapshot;
 import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.PartitionAssigner;
 import io.lettuce.core.KeyScanCursor;
@@ -281,6 +282,7 @@ public class RedisScanReader extends AbstractProcessor {
                 flowFile = session.putAllAttributes(flowFile, entry.attributes(partitionIndex, page.cursorAfterPage, databaseIndex));
                 session.transfer(flowFile, relationshipFor(entry.type));
             }
+            page.skippedByType.forEach((type, count) -> session.adjustCounter("Scan Keys Skipped by Type Filter (" + type + ")", count, false));
             for (ScanEntry failed : page.failures) {
                 FlowFile flowFile = session.create();
                 flowFile = session.putAllAttributes(flowFile, failed.attributes(partitionIndex, page.cursorAfterPage, databaseIndex));
@@ -336,8 +338,11 @@ public class RedisScanReader extends AbstractProcessor {
         if (!pool.isClusterMode()) {
             return partitionIndex == 0 ? List.of(STANDALONE) : List.of();
         }
+        // Slot owners only: a node that briefly reads as a slotless master while the cluster is
+        // still converging can be a replica holding a copy of another master's keys.
         List<String> masters = pool.currentTopology().orElseThrow(() -> new ProcessException("Cluster topology unavailable"))
-                .mastersById().keySet().stream().sorted().toList();
+                .mastersById().values().stream().filter(m -> !m.slots().isEmpty())
+                .map(ClusterTopologySnapshot.MasterNode::nodeId).sorted().toList();
         List<String> mine = new ArrayList<>();
         for (int i = partitionIndex; i < masters.size(); i += partitionCount) {
             mine.add(masters.get(i));
@@ -495,6 +500,7 @@ public class RedisScanReader extends AbstractProcessor {
 
         List<ScanEntry> entries = new ArrayList<>();
         List<ScanEntry> failures = new ArrayList<>();
+        java.util.Map<String, Long> skippedByType = new java.util.TreeMap<>();
         List<byte[]> ttlKeys = new ArrayList<>();
         List<String> ttlTypes = new ArrayList<>();
         List<RedisFuture<Long>> ttlFutures = new ArrayList<>();
@@ -510,6 +516,7 @@ public class RedisScanReader extends AbstractProcessor {
                 continue;
             }
             if (!filter.allowsType(type)) {
+                skippedByType.merge(type, 1L, Long::sum);
                 continue;
             }
             ttlKeys.add(key);
@@ -543,10 +550,12 @@ public class RedisScanReader extends AbstractProcessor {
             entries.add(new ScanEntry(ttlKeys.get(i), ttlTypes.get(i), ttlMs, encoding));
         }
 
-        return new ScanPage(entries, failures, result);
+        return new ScanPage(entries, failures, result, skippedByType);
     }
 
-    private record ScanPage(List<ScanEntry> entries, List<ScanEntry> failures, ScanCursor cursorAfterPage) {
+    /** skippedByType: keys the type filter left out, which otherwise vanish without a trace. */
+    private record ScanPage(List<ScanEntry> entries, List<ScanEntry> failures, ScanCursor cursorAfterPage,
+                            java.util.Map<String, Long> skippedByType) {
     }
 
     private record ScanEntry(byte[] key, String type, long ttlMs, String encoding) {

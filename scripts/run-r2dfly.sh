@@ -581,15 +581,12 @@ if [[ -n "$DISALLOW_KEY_TYPES" ]]; then
   fi
 fi
 
-# Reject any --key-types token this tool can't actually migrate WITHOUT --dfly-to-dfly - but
-# only when --dfly-to-dfly is off. With it on, anything ModuleTypeHandler can't handle already
-# fails safely and per-key at the processor (redis.incompatible.reason: module_type or
-# dump_restore_failed) - the same runtime safety net --dfly-to-dfly already relies on for
-# Bloom/Cuckoo Filter/CMS, so it's pointless to duplicate that check here for a mode that
-# already self-diagnoses.
+# Say up front which --key-types tokens have no rebuild path from a non-Dragonfly source. They are
+# still migrated where possible: ModuleTypeHandler tries each with DUMP/RESTORE and sends what the
+# target rejects (or cannot hold at all) to RedisDeadLetterWriter with redis.incompatible.reason,
+# so the run continues and every such key is accounted for in the summary.
 if [[ "$DFLY_TO_DFLY" != "true" ]]; then
   UNIVERSAL_KEY_TYPES=(string hash set zset list stream rejson-rl topk-type)
-  BAD_TYPES=()
   IFS=',' read -ra KEY_TYPES_CHECK <<< "$KEY_TYPES"
   for kt in "${KEY_TYPES_CHECK[@]}"; do
     kt_lower="$(tr '[:upper:]' '[:lower:]' <<< "$kt")"
@@ -597,24 +594,16 @@ if [[ "$DFLY_TO_DFLY" != "true" ]]; then
     for u in "${UNIVERSAL_KEY_TYPES[@]}"; do
       [[ "$kt_lower" == "$u" ]] && { match=true; break; }
     done
-    [[ "$match" == "true" ]] || BAD_TYPES+=("$kt")
+    [[ "$match" == "true" ]] && continue
+    case "$kt_lower" in
+      mbbloom--|mbbloomcf|cmsk-type)
+        echo "warning: $kt keys are copied only by DUMP/RESTORE, which Dragonfly 2.0.2 rejects from Redis; rejected keys are dead-lettered with the reason" >&2 ;;
+      tsdb-type|tdis-type|graphdata|vectorset)
+        echo "warning: $kt is not supported by Dragonfly; its keys are dead-lettered, not copied" >&2 ;;
+      *)
+        echo "warning: $kt is not a type this tool rebuilds; its keys are tried with DUMP/RESTORE and dead-lettered if the target rejects them" >&2 ;;
+    esac
   done
-  if [[ ${#BAD_TYPES[@]} -gt 0 ]]; then
-    echo "error: --key-types includes type(s) with no reconstruction path unless both source and target are Dragonfly:" >&2
-    for bt in "${BAD_TYPES[@]}"; do
-      case "$(tr '[:upper:]' '[:lower:]' <<< "$bt")" in
-        mbbloomcf)
-          echo "  - $bt: Cuckoo Filter keys only reconstruct via --dfly-to-dfly's DUMP/RESTORE fast path (both sides must be Dragonfly, and both must actually support Cuckoo Filter - it's version-gated, e.g. present in df-v1.40.2 but not df-v1.39.0) - pass --dfly-to-dfly, or drop this type" >&2 ;;
-        mbbloom--)
-          echo "  - $bt: Bloom Filter keys only reconstruct via --dfly-to-dfly's DUMP/RESTORE fast path (both sides must be Dragonfly) - pass --dfly-to-dfly, or drop this type" >&2 ;;
-        cmsk-type)
-          echo "  - $bt: Count-Min Sketch keys only reconstruct via --dfly-to-dfly's DUMP/RESTORE fast path (both sides must be Dragonfly) - pass --dfly-to-dfly, or drop this type" >&2 ;;
-        *)
-          echo "  - $bt: not a recognized/supported Redis type for this tool" >&2 ;;
-      esac
-    done
-    usage; exit 1
-  fi
 fi
 
 # Connection strings deliberately excluded (may carry passwords) - everything else here is
