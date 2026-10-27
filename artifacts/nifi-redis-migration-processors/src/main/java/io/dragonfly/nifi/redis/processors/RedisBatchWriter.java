@@ -23,7 +23,9 @@ import org.apache.nifi.processor.util.StandardValidators;
 
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -264,30 +266,31 @@ public class RedisBatchWriter extends AbstractProcessor {
             session.commit();
             return;
         }
+        List<PendingWrite> writes = latestPerKey(session, ready);
 
         List<CommandBuilder.WriteOutcome> outcomes;
         if (writeConfirmation) {
-            outcomes = new ArrayList<>(ready.size());
-            for (int start = 0; start < ready.size(); start += maxPipelineDepth) {
-                List<PendingWrite> group = ready.subList(start, Math.min(start + maxPipelineDepth, ready.size()));
+            outcomes = new ArrayList<>(writes.size());
+            for (int start = 0; start < writes.size(); start += maxPipelineDepth) {
+                List<PendingWrite> group = writes.subList(start, Math.min(start + maxPipelineDepth, writes.size()));
                 outcomes.addAll(dragonflyPool.withConnectionAndRaw((cmds, rawConn) -> dispatchAndAwait(
                         cmds, rawConn, group, keyPrefix, keyPrefixSeparator, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize, batchTimeoutMs, getLogger())));
             }
         } else {
             dragonflyPool.withConnectionAndRaw((cmds, rawConn) -> {
-                for (PendingWrite pending : ready) {
+                for (PendingWrite pending : writes) {
                     CommandBuilder.write(cmds, rawConn, pending.record, keyPrefix, keyPrefixSeparator, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize);
                 }
                 return null;
             });
             outcomes = new ArrayList<>();
-            for (int i = 0; i < ready.size(); i++) {
+            for (int i = 0; i < writes.size(); i++) {
                 outcomes.add(CommandBuilder.WriteOutcome.SUCCESS);
             }
         }
 
-        for (int i = 0; i < ready.size(); i++) {
-            FlowFile flowFile = ready.get(i).flowFile;
+        for (int i = 0; i < writes.size(); i++) {
+            FlowFile flowFile = writes.get(i).flowFile;
             CommandBuilder.WriteOutcome outcome = outcomes.get(i);
             if (outcome == null) {
                 routeRetryOrFailure(session, flowFile, retryPolicy);
@@ -297,7 +300,7 @@ public class RedisBatchWriter extends AbstractProcessor {
                     case SKIPPED -> session.transfer(flowFile, REL_SKIPPED);
                     case CONFLICT -> session.transfer(flowFile, REL_FAILURE);
                     case RESTORE_REJECTED -> {
-                        getLogger().warn("Target rejected the DUMP payload for key {}; sending it back for a typed copy", ready.get(i).record.key);
+                        getLogger().warn("Target rejected the DUMP payload for key {}; sending it back for a typed copy", writes.get(i).record.key);
                         FlowFile rejected = session.putAttribute(flowFile, "redis.restore.rejected", "true");
                         session.transfer(rejected, context.hasConnection(REL_RESTORE_REJECTED) ? REL_RESTORE_REJECTED : REL_FAILURE);
                     }
@@ -345,6 +348,28 @@ public class RedisBatchWriter extends AbstractProcessor {
             }
         }
         return outcomes;
+    }
+
+    /**
+     * Keeps the last record of each key and sends the earlier ones to success, superseded. The
+     * replication flow can queue several reads of one key, each a whole value read later than the
+     * one before; writing them all would let an earlier write's follow-up command (its PEXPIRE,
+     * chained after its replies) land after the later write.
+     */
+    private List<PendingWrite> latestPerKey(ProcessSession session, List<PendingWrite> ready) {
+        Set<String> seen = new HashSet<>();
+        List<PendingWrite> kept = new ArrayList<>(ready.size());
+        for (int i = ready.size() - 1; i >= 0; i--) {
+            PendingWrite pending = ready.get(i);
+            if (seen.add(pending.record.key)) {
+                kept.add(pending);
+            } else {
+                session.adjustCounter("Writes Superseded by a Later Read", 1, false);
+                session.transfer(pending.flowFile, REL_SUCCESS);
+            }
+        }
+        Collections.reverse(kept);
+        return kept;
     }
 
     private void routeRetryOrFailure(ProcessSession session, FlowFile flowFile, RetryPolicy retryPolicy) {
@@ -412,6 +437,8 @@ public class RedisBatchWriter extends AbstractProcessor {
         private final Map<String, Integer> perTypeLimits;
         private final long now;
         private final Map<String, Integer> acceptedByBucket = new HashMap<>();
+        /** Keys passed over in this scan: a later FlowFile of the same key must not overtake them. */
+        private final Set<String> heldBack = new HashSet<>();
         private int scanned = 0;
 
         ReadyBatchFilter(int defaultBatchSize, Map<String, Integer> perTypeLimits, long now) {
@@ -423,6 +450,18 @@ public class RedisBatchWriter extends AbstractProcessor {
         @Override
         public FlowFileFilterResult filter(FlowFile flowFile) {
             scanned++;
+            String key = flowFile.getAttribute("redis.key");
+            if (key != null && heldBack.contains(key)) {
+                return FlowFileFilterResult.REJECT_AND_CONTINUE;
+            }
+            FlowFileFilterResult result = decide(flowFile);
+            if (result != FlowFileFilterResult.ACCEPT_AND_CONTINUE && key != null) {
+                heldBack.add(key);
+            }
+            return result;
+        }
+
+        private FlowFileFilterResult decide(FlowFile flowFile) {
             String type = flowFile.getAttribute("redis.type");
             String typeKey = type == null ? "" : type.toLowerCase();
             Integer overrideLimit = perTypeLimits.get(typeKey);

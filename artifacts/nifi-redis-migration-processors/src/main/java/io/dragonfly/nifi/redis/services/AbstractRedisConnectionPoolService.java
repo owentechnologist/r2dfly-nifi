@@ -138,6 +138,9 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
     private RedisClusterClient redisClusterClient;
     private GenericObjectPool<StatefulRedisConnection<byte[], byte[]>> standalonePool;
     private GenericObjectPool<StatefulRedisClusterConnection<byte[], byte[]>> clusterPool;
+    /** Null in cluster mode. */
+    private volatile RedisURI standaloneUri;
+    private volatile javax.net.ssl.SSLSocketFactory replicationSocketFactory;
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
@@ -200,6 +203,8 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
                 // above); DATABASE_INDEX's own description promises both, so it applies here
                 // unconditionally.
                 uri.setDatabase(databaseIndex);
+                standaloneUri = uri;
+                replicationSocketFactory = requireTls ? replicationSocketFactory(sslContextService) : null;
                 redisClient = RedisClient.create(uri);
                 ClientOptions.Builder optionsBuilder = ClientOptions.builder();
                 applySocketAndSsl(optionsBuilder, connectTimeout, sslOptions);
@@ -216,12 +221,44 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
         }
     }
 
+    public Optional<ReplicationEndpoint> replicationEndpoint() {
+        RedisURI uri = standaloneUri;
+        if (uri == null) {
+            return Optional.empty();
+        }
+        String host = uri.getHost();
+        int port = uri.getPort();
+        if (!uri.getSentinels().isEmpty()) {
+            try (var sentinel = redisClient.connectSentinel()) {
+                java.net.SocketAddress master = sentinel.sync().getMasterAddrByName(uri.getSentinelMasterId());
+                if (!(master instanceof java.net.InetSocketAddress address)) {
+                    throw new IllegalStateException("Sentinel reports no master for " + uri.getSentinelMasterId());
+                }
+                host = address.getHostString();
+                port = address.getPort();
+            }
+        }
+        return Optional.of(new ReplicationEndpoint(host, port, uri.getUsername(), uri.getPassword(), uri.getDatabase(),
+                replicationSocketFactory));
+    }
+
+    private static javax.net.ssl.SSLSocketFactory replicationSocketFactory(SSLContextService sslContextService) {
+        try {
+            return sslContextService != null ? sslContextService.createContext().getSocketFactory()
+                    : javax.net.ssl.SSLContext.getDefault().getSocketFactory();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("No default TLS context", e);
+        }
+    }
+
     @OnDisabled
     public void onDisabled() {
         releaseResources();
     }
 
     private void releaseResources() {
+        standaloneUri = null;
+        replicationSocketFactory = null;
         if (standalonePool != null) {
             standalonePool.close();
             standalonePool = null;

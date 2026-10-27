@@ -410,7 +410,6 @@
         "autoTerminatedRelationships": [
           "success",
           "failure",
-          "retry",
           "skipped"
         ],
         "scheduledState": "ENABLED",
@@ -693,6 +692,40 @@
         "zIndex": 0,
         "selectedRelationships": [
           "restore_rejected"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "04c90942-d022-4760-9373-4ba994c556c9",
+        "instanceIdentifier": "4ed11baf-47f6-4d4b-ae7b-b0378bccc777",
+        "source": {
+          "id": "20ee6727-0fe2-3a0b-8c3a-f3525c04f480",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisBatchWriter",
+          "comments": "",
+          "instanceIdentifier": "0fbaec2b-24d2-360a-c727-bcfb2669ae57"
+        },
+        "destination": {
+          "id": "20ee6727-0fe2-3a0b-8c3a-f3525c04f480",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisBatchWriter",
+          "comments": "",
+          "instanceIdentifier": "0fbaec2b-24d2-360a-c727-bcfb2669ae57"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "retry"
         ],
         "backPressureObjectThreshold": 10000,
         "backPressureDataSizeThreshold": "1 GB",

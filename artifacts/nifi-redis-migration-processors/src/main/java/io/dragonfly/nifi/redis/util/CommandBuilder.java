@@ -126,6 +126,7 @@ public final class CommandBuilder {
             case "zset" -> writeZset(target, key, record, ttlMs, writeChunkSize);
             case "stream" -> writeStream(target, key, record, ttlMs);
             case "json" -> writeJson(target, rawConn, key, record, ttlMs);
+            case KeyRecord.DELETED -> toCf(target.del(key)).thenApply(v -> null);
             default -> CompletableFuture.failedFuture(new IllegalArgumentException("Unsupported type: " + record.type));
         };
     }

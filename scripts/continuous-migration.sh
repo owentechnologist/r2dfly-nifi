@@ -42,6 +42,12 @@ Required:
   --target-connection-string S  same format, for the Dragonfly target
 
 Live Phase options:
+  --live-source SOURCE           keyspace (default) or replication (env LIVE_SOURCE). replication
+                                 follows the source as a replica (PSYNC): it sees every write,
+                                 including JSON/TopK/Bloom module commands that publish no keyspace
+                                 notification, resumes after a restart with a partial resync, and
+                                 takes its own snapshot instead of RedisScanReader. The source must
+                                 accept PSYNC from NiFi (managed services often block it).
   --keyspace-pattern P           pub/sub channel pattern the keyspace-event consumer subscribes
                                  to (env KEYSPACE_PATTERN, default: the processor's own default,
                                  __keyevent@*__:*, which covers every database on the source).
@@ -284,6 +290,7 @@ EVENT_TYPES="${EVENT_TYPES:-}"
 MAX_QUEUE_DEPTH="${MAX_QUEUE_DEPTH:-}"
 SKIP_KEYSPACE_CHECK="${SKIP_KEYSPACE_CHECK:-false}"
 REQUIRE_CONFIG_CHECK="${REQUIRE_CONFIG_CHECK:-false}"
+LIVE_SOURCE="${LIVE_SOURCE:-keyspace}"
 RECONCILIATION_SIGNALS="${RECONCILIATION_SIGNALS:-false}"
 ASSUME_DEFAULTS="${ASSUME_DEFAULTS:-false}"
 DISABLE_PROVENANCE="${DISABLE_PROVENANCE:-true}"
@@ -364,6 +371,7 @@ MAPPING = {
     ("live", "max-queue-depth"): "MAX_QUEUE_DEPTH",
     ("live", "skip-keyspace-check"): "SKIP_KEYSPACE_CHECK",
     ("live", "require-config-check"): "REQUIRE_CONFIG_CHECK",
+    ("live", "source"): "LIVE_SOURCE",
     ("live", "reconciliation-signals"): "RECONCILIATION_SIGNALS",
     ("run", "defaults"): "ASSUME_DEFAULTS",
     ("run", "verbose"): "VERBOSE",
@@ -491,6 +499,7 @@ while [[ $# -gt 0 ]]; do
     --max-queue-depth) require_value "$@"; MAX_QUEUE_DEPTH="$2"; shift 2 ;;
     --skip-keyspace-check) SKIP_KEYSPACE_CHECK="true"; shift ;;
     --require-config-check) REQUIRE_CONFIG_CHECK="true"; shift ;;
+    --live-source) require_value "$@"; LIVE_SOURCE="$2"; shift 2 ;;
     --reconciliation-signals) RECONCILIATION_SIGNALS="true"; shift ;;
     --defaults) ASSUME_DEFAULTS="true"; shift ;;
     --disable-provenance) DISABLE_PROVENANCE="true"; shift ;;
@@ -665,7 +674,13 @@ fi
 echo "  source currently has $SOURCE_DBSIZE_START keys"
 echo "  target currently has $TARGET_DBSIZE_START keys"
 
-if [[ "$SKIP_KEYSPACE_CHECK" != "true" ]]; then
+case "$LIVE_SOURCE" in
+  keyspace|replication) ;;
+  *) echo "error: --live-source must be keyspace or replication (got '$LIVE_SOURCE')" >&2; exit 1 ;;
+esac
+if [[ "$LIVE_SOURCE" == "replication" ]]; then
+  echo "  live source: replication (PSYNC) - keyspace notifications are not needed"
+elif [[ "$SKIP_KEYSPACE_CHECK" != "true" ]]; then
   KEYSPACE_CHECK_RC=0
   KEYSPACE_EVENTS_VALUE="$(redis_lib_check_keyspace_events "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")" || KEYSPACE_CHECK_RC=$?
   if [[ $KEYSPACE_CHECK_RC -eq 0 ]]; then
@@ -1012,7 +1027,7 @@ echo "=================================================="
 # a side effect, and a user's migration run has no business rewriting a checked-in project
 # artifact. An export taken mid-run would also have this run's connection strings, parallelism and
 # Live Phase tuning baked into it, which is not what that baseline is supposed to represent.
-BUILD_LIVE_ARGS=()
+BUILD_LIVE_ARGS=(--live-source "$LIVE_SOURCE")
 [[ "$RECONCILIATION_SIGNALS" == "true" ]] && BUILD_LIVE_ARGS+=(--reconciliation-signals)
 # ${arr+"${arr[@]}"}: expanding an empty array as "${arr[@]}" is an unbound-variable error under
 # set -u on bash 3.2, the same trap the --toml-file filtering above guards against.
@@ -1025,6 +1040,7 @@ BUILD_LIVE_ARGS=()
 # re-parsing the same JSON) - each py3 call is a container exec via the toolbox, not free.
 # Pre-seeding every name to '' keeps the '|'-joined field count constant, so the read below
 # always lands each id in the right variable even when one processor is missing.
+if [[ "$LIVE_SOURCE" == "keyspace" ]]; then
 LIVE_PROC_LIST_JSON="$(nifi_api_get "process-groups/$PG_ID/processors")" || true
 LIVE_PROC_IDS="$(echo "$LIVE_PROC_LIST_JSON" | py3 "
 import json, sys
@@ -1048,6 +1064,37 @@ if [[ -z "$PROC_FETCH" ]]; then
 fi
 if [[ -z "$PROC_DELETE" ]]; then
   echo "error: could not find the DeleteRedisKey processor in $PG_ID - build-live-phase-flow.sh should have created it" >&2; exit 1
+fi
+LIVE_PROCS_DOWNSTREAM_FIRST=("$PROC_DELETE:DeleteRedisKey" "$PROC_FETCH:RedisSingleKeyFetch" "$PROC_KEYSPACE:RedisKeyspaceEventConsumer")
+else
+REPL_PROC_IDS="$(nifi_api_get "process-groups/$PG_ID/processors" | py3 "
+import json, sys
+d = json.load(sys.stdin)
+reader = deser = ''
+for p in d['processors']:
+    c = p['component']
+    if c['type'].endswith('RedisReplicationReader'):
+        reader = c['id']
+    elif c['type'].endswith('RedisTypeDeserializer') and c['name'] == 'RedisTypeDeserializer (live)':
+        deser = c['id']
+print(reader + '|' + deser)
+")" || true
+IFS='|' read -r PROC_READER PROC_LIVE_DESER <<< "$REPL_PROC_IDS"
+if [[ -z "$PROC_READER" || -z "$PROC_LIVE_DESER" ]]; then
+  echo "error: could not find RedisReplicationReader and RedisTypeDeserializer (live) in $PG_ID - build-live-phase-flow.sh should have created them" >&2; exit 1
+fi
+LIVE_PROCS_DOWNSTREAM_FIRST=("$PROC_LIVE_DESER:RedisTypeDeserializer (live)" "$PROC_READER:RedisReplicationReader")
+# Each run starts from a full snapshot. The saved offset only means something together with the
+# keys queued behind it, and STAGE 6 has just dropped those (and the target may be a new one).
+CLEAR_RESP="$(nifi_api_post "processors/$PROC_READER/state/clear-requests" '{}')" || true
+if ! echo "$CLEAR_RESP" | py3 "import json,sys; json.load(sys.stdin)" >/dev/null 2>&1; then
+  echo "error: could not clear RedisReplicationReader's saved replication offset: $CLEAR_RESP" >&2; exit 1
+fi
+echo "  cleared RedisReplicationReader's saved offset; this run starts with a full snapshot"
+if [[ "$WRITER_CONCURRENCY" -gt 1 ]]; then
+  echo "warning: --writer-concurrency $WRITER_CONCURRENCY lets two reads of one key be written out of order by" >&2
+  echo "         different writer tasks; with --live-source replication, 1 is the setting that keeps every key exact." >&2
+fi
 fi
 
 # json_or_null <value> - "null" (unquoted, NiFi's way of explicitly clearing an optional property
@@ -1079,6 +1126,7 @@ nifi_api_put_checked() {
   echo "$resp"
 }
 
+if [[ "$LIVE_SOURCE" == "keyspace" ]]; then
 echo "  keyspace-pattern=${KEYSPACE_PATTERN:-<processor default>}  event-types=${EVENT_TYPES:-<all>}  max-queue-depth=${MAX_QUEUE_DEPTH:-<processor default>}"
 CONSUMER_VER="$(nifi_current_version "processors/$PROC_KEYSPACE")" || true
 LIVE_PROPS="\"keyspace-pattern\":$(json_or_null "$KEYSPACE_PATTERN")"
@@ -1087,6 +1135,7 @@ LIVE_PROPS="$LIVE_PROPS,\"max-queue-depth\":$(json_or_null "$MAX_QUEUE_DEPTH")"
 LIVE_PROPS="$LIVE_PROPS,\"require-config-check\":\"$REQUIRE_CONFIG_CHECK\""
 LIVE_BODY="{\"revision\":{\"version\":$CONSUMER_VER},\"component\":{\"id\":\"$PROC_KEYSPACE\",\"config\":{\"properties\":{$LIVE_PROPS}}}}"
 nifi_api_put_checked "processors/$PROC_KEYSPACE" "$LIVE_BODY" > /dev/null
+fi
 
 # Wired, not started. The two connection-pool controller services these processors depend on are
 # still blank and DISABLED at this point - deploy-to-nifi.sh leaves them that way deliberately
@@ -1208,7 +1257,7 @@ start_and_wait_running() {
 # processor is stopped.
 echo
 echo "  verifying the Live Phase came up with the flow"
-for live_proc in "$PROC_DELETE:DeleteRedisKey" "$PROC_FETCH:RedisSingleKeyFetch" "$PROC_KEYSPACE:RedisKeyspaceEventConsumer"; do
+for live_proc in "${LIVE_PROCS_DOWNSTREAM_FIRST[@]}"; do
   LIVE_PROC_ID="${live_proc%%:*}"
   LIVE_PROC_LABEL="${live_proc#*:}"
   LIVE_PROC_STATUS="$(processor_run_status "$LIVE_PROC_ID")" || LIVE_PROC_STATUS=""

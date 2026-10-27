@@ -659,17 +659,21 @@ PROC_IDS="$(echo "$PROC_LIST_JSON" | py3 "
 import json, sys
 d = json.load(sys.stdin)
 order = ['RedisScanReader', 'RedisBatchWriter', 'ModuleTypeHandler', 'RedisTypeDeserializer', 'SearchIndexExporter', 'SearchIndexRehydrator',
-         'RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch']
+         'RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'RedisReplicationReader', 'RedisTypeDeserializer (live)']
 ids = {name: '' for name in order}
 for p in d['processors']:
     t = p['component']['type']
+    # The replication Live Phase adds a second deserializer, told apart from the scan path's by name.
+    if t.endswith('RedisTypeDeserializer') and p['component']['name'] == 'RedisTypeDeserializer (live)':
+        ids['RedisTypeDeserializer (live)'] = p['component']['id']
+        continue
     for name in order:
         if not ids[name] and t.endswith(name):
             ids[name] = p['component']['id']
             break
 print('|'.join(ids[name] for name in order))
 ")" || true
-IFS='|' read -r PROC_SCAN PROC_WRITER PROC_MTH PROC_DESER PROC_SIDX_EXPORT PROC_SIDX_REHYDRATE PROC_LIVE_CONSUMER PROC_LIVE_FETCH <<< "$PROC_IDS"
+IFS='|' read -r PROC_SCAN PROC_WRITER PROC_MTH PROC_DESER PROC_SIDX_EXPORT PROC_SIDX_REHYDRATE PROC_LIVE_CONSUMER PROC_LIVE_FETCH PROC_REPL_READER PROC_REPL_DESER <<< "$PROC_IDS"
 if [[ -z "$PROC_SCAN" ]]; then
   echo "error: could not find the RedisScanReader processor in $PG_ID" >&2; exit 1
 fi
@@ -816,6 +820,15 @@ if [[ -n "$PROC_LIVE_CONSUMER" && -n "$PROC_LIVE_FETCH" ]]; then
   PROC_BODY="{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_LIVE_FETCH\",\"config\":{\"properties\":{\"key-type-filter\":\"$KEY_TYPES\"}}}}"
   nifi_api_put_checked "processors/$PROC_LIVE_FETCH" "$PROC_BODY" > /dev/null
 fi
+if [[ -n "$PROC_REPL_READER" && -n "$PROC_REPL_DESER" ]]; then
+  echo "==> applying the same prefix and type filters to the replication Live Phase"
+  PROC_VER="$(nifi_current_version "processors/$PROC_REPL_READER")" || true
+  PROC_BODY="{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_REPL_READER\",\"config\":{\"properties\":{\"prefix-deny-list\":$PREFIX_DENY_JSON,\"prefix-only-list\":$PREFIX_ONLY_JSON}}}}"
+  nifi_api_put_checked "processors/$PROC_REPL_READER" "$PROC_BODY" > /dev/null
+  PROC_VER="$(nifi_current_version "processors/$PROC_REPL_DESER")" || true
+  PROC_BODY="{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_REPL_DESER\",\"config\":{\"properties\":{\"key-type-filter\":\"$KEY_TYPES\"}}}}"
+  nifi_api_put_checked "processors/$PROC_REPL_DESER" "$PROC_BODY" > /dev/null
+fi
 
 echo "==> setting RedisTypeDeserializer's parallelism and dfly-to-dfly optimizations"
 echo "  parallelism=$PARALLELISM  dfly-to-dfly=$DFLY_TO_DFLY  max-dump-payload-bytes=$MAX_DUMP_PAYLOAD_BYTES"
@@ -842,6 +855,12 @@ echo "  restore-fast-path=$RESTORE_FAST_PATH  probe-target=$PROBE_TARGET_JSON"
 DESER_PROPS="\"dfly-to-dfly\":\"$DFLY_TO_DFLY\",\"max-dump-payload-bytes\":\"$MAX_DUMP_PAYLOAD_BYTES\",\"restore-probe-target\":$PROBE_TARGET_JSON"
 PROC_BODY="{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_DESER\",\"config\":{\"properties\":{$DESER_PROPS},\"concurrentlySchedulableTaskCount\":$PARALLELISM}}}"
 nifi_api_put_checked "processors/$PROC_DESER" "$PROC_BODY" > /dev/null
+# Its rejected payloads take the same restore_rejected loop, so the same probe decision applies.
+if [[ -n "$PROC_REPL_DESER" ]]; then
+  PROC_VER="$(nifi_current_version "processors/$PROC_REPL_DESER")" || true
+  PROC_BODY="{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_REPL_DESER\",\"config\":{\"properties\":{$DESER_PROPS}}}}"
+  nifi_api_put_checked "processors/$PROC_REPL_DESER" "$PROC_BODY" > /dev/null
+fi
 
 # json_or_null <value> - "null" (unquoted, NiFi's way of explicitly clearing an optional
 # property - see the prefix-deny-list/prefix-only-list comment above, same partial-merge PUT

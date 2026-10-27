@@ -29,9 +29,10 @@ public final class RestoreProbe {
     public record Verdict(boolean accepted, String detail) {
     }
 
-    /** Idle and activity times move between the two reads, so they never match. */
+    /** Idle and activity times move between the two reads, and delivered_at_ms is derived from
+     * the moment of each read, so none of them ever match exactly. */
     private static final Set<String> TIME_DEPENDENT_FIELDS = Set.of(
-            "ms_since_last_delivery", "idle", "inactive", "seen-time", "active-time");
+            "ms_since_last_delivery", "delivered_at_ms", "idle", "inactive", "seen-time", "active-time");
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 

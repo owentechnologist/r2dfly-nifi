@@ -51,4 +51,13 @@ public interface RedisConnectionPoolService extends ControllerService {
      * when the service is not in cluster mode and therefore has no topology to report.
      */
     Optional<ClusterTopologySnapshot> currentTopology();
+
+    /**
+     * The master a replication reader should connect to, resolved at call time so a reconnect
+     * after a Sentinel failover reaches the new master. Empty in cluster mode, where every shard
+     * has its own master.
+     */
+    default Optional<ReplicationEndpoint> replicationEndpoint() {
+        return Optional.empty();
+    }
 }

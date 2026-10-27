@@ -2,6 +2,7 @@ package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService;
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
+import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.KeyRecord;
 import io.dragonfly.nifi.redis.util.RedisTypeSerializer;
 import io.dragonfly.nifi.redis.util.RedisValueFetcher;
@@ -176,7 +177,7 @@ public class RedisTypeDeserializer extends AbstractProcessor {
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
             REDIS_CONNECTION_POOL, HASH_FIELD_BATCH_SIZE, LIST_CHUNK_SIZE, STREAM_READ_COUNT,
             INCLUDE_CONSUMER_GROUPS, BATCH_SIZE, BATCH_TIMEOUT_MS, DFLY_TO_DFLY, MAX_DUMP_PAYLOAD_BYTES,
-            RESTORE_PROBE_TARGET);
+            RESTORE_PROBE_TARGET, RedisSingleKeyFetch.KEY_TYPE_FILTER);
 
     private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_SUCCESS, REL_KEY_MISSING, REL_MODULE_TYPE, REL_FAILURE);
 
@@ -226,6 +227,8 @@ public class RedisTypeDeserializer extends AbstractProcessor {
         boolean dflyToDfly = context.getProperty(DFLY_TO_DFLY).asBoolean();
         long maxDumpPayloadBytes = context.getProperty(MAX_DUMP_PAYLOAD_BYTES).asLong();
         ComponentLog logger = getLogger();
+        batch = resolveMissingTypes(redisPool, batch, batchTimeoutMs, session,
+                KeyFilter.parse(context.getProperty(RedisSingleKeyFetch.KEY_TYPE_FILTER).getValue(), null, null));
 
         List<Item> dumpItems = new ArrayList<>();
         List<Item> pipelineItems = new ArrayList<>();
@@ -275,6 +278,79 @@ public class RedisTypeDeserializer extends AbstractProcessor {
             processStream(redisPool, item, streamReadCount, includeConsumerGroups, session, logger);
         }
         session.commit();
+    }
+
+    /**
+     * FlowFiles from RedisReplicationReader carry only redis.key: their type is whatever the key is
+     * now, read here with PTTL in one pipelined round. A key that is gone becomes a tombstone on
+     * success rather than going to key_missing: on its own relationship a delete could overtake, or
+     * be overtaken by, a later write of the same key, while on success both travel through the
+     * writer's one queue in order. Key Type Filter applies to these only (scan FlowFiles were
+     * filtered by RedisScanReader already), and a key whose type is now outside it is deleted the
+     * same way: it may be an earlier copy, made while the key still had an allowed type.
+     */
+    private List<FlowFile> resolveMissingTypes(RedisConnectionPoolService redisPool, List<FlowFile> batch, long batchTimeoutMs,
+                                               ProcessSession session, KeyFilter typeFilter) {
+        List<FlowFile> untyped = batch.stream().filter(f -> f.getAttribute("redis.type") == null).toList();
+        if (untyped.isEmpty()) {
+            return batch;
+        }
+        Map<FlowFile, RedisFuture<String>> types = new LinkedHashMap<>();
+        Map<FlowFile, RedisFuture<Long>> ttls = new HashMap<>();
+        Map<FlowFile, RedisFuture<String>> encodings = new HashMap<>();
+        redisPool.withConnection(cmds -> {
+            for (FlowFile flowFile : untyped) {
+                byte[] key = flowFile.getAttribute("redis.key").getBytes(StandardCharsets.UTF_8);
+                types.put(flowFile, cmds.type(key));
+                ttls.put(flowFile, cmds.pttl(key));
+                encodings.put(flowFile, cmds.objectEncoding(key));
+            }
+            List<RedisFuture<?>> all = new ArrayList<>(types.values());
+            all.addAll(ttls.values());
+            all.addAll(encodings.values());
+            awaitAllTolerantly(all.toArray(new RedisFuture[0]), batchTimeoutMs);
+            return null;
+        });
+        List<FlowFile> resolved = new ArrayList<>(batch.size());
+        for (FlowFile flowFile : batch) {
+            if (!types.containsKey(flowFile)) {
+                resolved.add(flowFile);
+                continue;
+            }
+            String type;
+            long ttlMs;
+            try {
+                type = types.get(flowFile).get();
+                ttlMs = ttls.get(flowFile).get();
+            } catch (Exception e) {
+                getLogger().error("Failed to read TYPE/PTTL for key {}", flowFile.getAttribute("redis.key"), e);
+                session.transfer(session.penalize(flowFile), REL_FAILURE);
+                continue;
+            }
+            if ("none".equals(type) || !typeFilter.allowsType(type)) {
+                if (!"none".equals(type)) {
+                    session.adjustCounter("Keys Skipped (Type Filter)", 1, false);
+                }
+                String key = flowFile.getAttribute("redis.key");
+                FlowFile tombstone = session.write(session.putAttribute(flowFile, "redis.type", KeyRecord.DELETED),
+                        out -> RedisTypeSerializer.writeJson(new KeyRecord(key, KeyRecord.DELETED, -1, null, null), out));
+                session.transfer(tombstone, REL_SUCCESS);
+            } else {
+                Map<String, String> attrs = new HashMap<>(Map.of("redis.type", type, "redis.ttl.ms", String.valueOf(ttlMs)));
+                // The RESTORE probe keys its verdicts by encoding (a Redis 7.4 hash with field TTLs is
+                // listpackex and restores nowhere); a source without OBJECT ENCODING only loses that detail.
+                try {
+                    String encoding = encodings.get(flowFile).get();
+                    if (encoding != null) {
+                        attrs.put("redis.encoding", encoding);
+                    }
+                } catch (Exception ignored) {
+                    // the verdict falls back to type/unknown, and the restore_rejected loop covers a wrong guess
+                }
+                resolved.add(session.putAllAttributes(flowFile, attrs));
+            }
+        }
+        return resolved;
     }
 
     private void reportVerdict(String typeAndEncoding, String sampleKey, RestoreProbe.Verdict verdict) {

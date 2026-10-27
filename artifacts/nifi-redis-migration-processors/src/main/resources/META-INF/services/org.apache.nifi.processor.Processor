@@ -12,3 +12,4 @@ io.dragonfly.nifi.redis.processors.RecordToKeyRecord
 io.dragonfly.nifi.redis.processors.ExecuteSQLIncremental
 io.dragonfly.nifi.redis.processors.SearchIndexExporter
 io.dragonfly.nifi.redis.processors.SearchIndexRehydrator
+io.dragonfly.nifi.redis.processors.RedisReplicationReader

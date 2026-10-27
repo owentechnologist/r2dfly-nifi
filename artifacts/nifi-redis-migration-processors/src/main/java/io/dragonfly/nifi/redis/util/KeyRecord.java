@@ -19,6 +19,9 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class KeyRecord {
 
+    /** Type of a record that deletes its key: the key was gone when it was read. */
+    public static final String DELETED = "deleted";
+
     public String key;
     public String type;
 

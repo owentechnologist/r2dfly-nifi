@@ -28,6 +28,13 @@ NiFi connection/auth:
   --nifi-token TOKEN           use an existing bearer token instead of user/password (env NIFI_TOKEN)
 
 Options:
+  --live-source SOURCE         keyspace (default) or replication. keyspace subscribes to keyspace
+                                notifications (RedisKeyspaceEventConsumer -> RedisSingleKeyFetch).
+                                replication connects to the source as a replica with PSYNC
+                                (RedisReplicationReader -> "RedisTypeDeserializer (live)"), which
+                                sees every write, resumes after a restart, and takes its own snapshot,
+                                so RedisScanReader is DISABLED in this mode. Needs a source that
+                                accepts PSYNC from this client; the flow must be stopped.
   --no-export-baseline         don't re-export the updated flow over artifacts/r2dfly.json
                                 (the export is taken from the live flow, so it carries whatever
                                 properties the running flow currently has - including a previous
@@ -56,6 +63,7 @@ NIFI_PASS="${NIFI_PASS:-}"
 NIFI_TOKEN="${NIFI_TOKEN:-}"
 EXPORT_BASELINE="true"
 RECONCILIATION_SIGNALS="false"
+LIVE_SOURCE="keyspace"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -65,10 +73,16 @@ while [[ $# -gt 0 ]]; do
     --nifi-token) NIFI_TOKEN="$2"; shift 2 ;;
     --no-export-baseline) EXPORT_BASELINE="false"; shift ;;
     --reconciliation-signals) RECONCILIATION_SIGNALS="true"; shift ;;
+    --live-source) LIVE_SOURCE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 1 ;;
   esac
 done
+
+case "$LIVE_SOURCE" in
+  keyspace|replication) ;;
+  *) echo "error: --live-source must be keyspace or replication (got '$LIVE_SOURCE')" >&2; usage; exit 1 ;;
+esac
 
 if [[ -z "$NIFI_TOKEN" && ( -z "$NIFI_USER" || -z "$NIFI_PASS" ) ]]; then
   echo "error: NiFi credentials required - pass --nifi-token, or both --nifi-user and --nifi-password" >&2; usage; exit 1
@@ -236,6 +250,33 @@ fi
 connection_present() {
   [[ -n "$1" && -n "$2" ]] && grep -Fqx -- "$1>$2" <<< "$CONN_PAIRS"
 }
+
+# set_run_status <id> <label> <STOPPED|DISABLED> - NiFi only moves a stopped processor to DISABLED
+# and back, so a running flow fails here with NiFi's own message rather than half-applying.
+set_run_status() {
+  local id="$1" label="$2" state="$3" ver resp
+  ver="$(nifi_current_version "processors/$id")" || true
+  resp="$(nifi_api_put "processors/$id/run-status" "{\"revision\":{\"version\":$ver},\"state\":\"$state\"}")" || true
+  if ! py3 "import json,sys; sys.exit(0 if json.load(sys.stdin).get('id') else 1)" <<< "$resp" >/dev/null 2>&1; then
+    echo "error: could not set $label to $state (stop the flow first). NiFi's response: $resp" >&2
+    exit 1
+  fi
+}
+
+
+# Back on the keyspace path after a replication run, the two processors that mode disabled come
+# back; DISABLED is otherwise never a state this project leaves them in.
+RESTORE_IDS="$(nifi_api_get "process-groups/$PG_ID/processors" | py3 "
+import json, sys
+d = json.load(sys.stdin)
+for p in d['processors']:
+    c = p['component']
+    if c.get('state') == 'DISABLED' and (c['type'].endswith('RedisScanReader') or c['type'].endswith('RedisKeyspaceEventConsumer')):
+        print(c['id'])
+")" || true
+for restore_id in $RESTORE_IDS; do
+  set_run_status "$restore_id" "processor $restore_id" STOPPED
+done
 
 # Processors present but unconnected is a real state to land in: a run that died between creating
 # them and wiring them leaves exactly that. Treating "all three exist" as "already wired" would
@@ -447,6 +488,70 @@ ensure_connection() {
   fi
   echo "  connected: $label"
 }
+
+if [[ "$LIVE_SOURCE" == "replication" ]]; then
+  echo "==> wiring the replication Live Phase"
+  REPL_IDS="$(nifi_api_get "process-groups/$PG_ID/processors" | py3 "
+import json, sys
+d = json.load(sys.stdin)
+ids = {'reader': '', 'deser': '', 'scan': '', 'consumer': '', 'scan_state': '', 'consumer_state': ''}
+for p in d['processors']:
+    c = p['component']
+    if c['type'].endswith('RedisReplicationReader'):
+        ids['reader'] = c['id']
+    elif c['type'].endswith('RedisTypeDeserializer') and c['name'] == 'RedisTypeDeserializer (live)':
+        ids['deser'] = c['id']
+    elif c['type'].endswith('RedisScanReader'):
+        ids['scan'], ids['scan_state'] = c['id'], c.get('state', '')
+    elif c['type'].endswith('RedisKeyspaceEventConsumer'):
+        ids['consumer'], ids['consumer_state'] = c['id'], c.get('state', '')
+print('|'.join(ids[k] for k in ['reader', 'deser', 'scan', 'consumer', 'scan_state', 'consumer_state']))
+")" || true
+  IFS='|' read -r PROC_READER PROC_LIVE_DESER PROC_SCAN PROC_KSN PROC_SCAN_STATE PROC_KSN_STATE <<< "$REPL_IDS"
+  if [[ -z "$PROC_READER" ]]; then
+    echo "==> creating RedisReplicationReader"
+    PROC_READER="$(create_processor "io.dragonfly.nifi.redis.processors.RedisReplicationReader" "RedisReplicationReader" 0 1600)" || exit 1
+  fi
+  if [[ -z "$PROC_LIVE_DESER" ]]; then
+    echo "==> creating RedisTypeDeserializer (live)"
+    PROC_LIVE_DESER="$(create_processor "io.dragonfly.nifi.redis.processors.RedisTypeDeserializer" "RedisTypeDeserializer (live)" 400 1600)" || exit 1
+  fi
+  # flush is auto-terminated: nothing in this project deletes the target's copy of a flushed
+  # database yet, which the summary below says out loud.
+  configure_processor "$PROC_READER" "RedisReplicationReader" \
+    "\"redis-connection-pool\":\"$SVC_SOURCE\"" '"flush"'
+  # key_missing never fires for the reader's FlowFiles (a vanished key becomes a tombstone on
+  # success), and failure matches the scan path's deserializer.
+  # failure loops back, penalized, rather than being dropped: the reader has already saved its
+  # offset past this key, so a dropped FlowFile is a change lost until the key changes again.
+  configure_processor "$PROC_LIVE_DESER" "RedisTypeDeserializer (live)" \
+    "\"redis-connection-pool\":\"$SVC_SOURCE\",\"restore-probe-target\":\"$SVC_TARGET\",\"hash-field-batch-size\":\"10000\",\"list-chunk-size\":\"5000\",\"stream-read-count\":\"1000\",\"include-consumer-groups\":\"true\"" \
+    '"key_missing"'
+  ensure_connection "$PROC_LIVE_DESER" "$PROC_LIVE_DESER" "RedisTypeDeserializer (live) failure -> itself" '"failure"'
+  # RedisBatchWriter's retry is meant to loop back to it; flows imported before artifacts/r2dfly.json
+  # did that auto-terminate it, which drops every write that fails transiently.
+  if ! connection_present "$PROC_WRITER" "$PROC_WRITER"; then
+    WRITER_AUTO_TERMINATED="$(nifi_api_get "processors/$PROC_WRITER" | py3 "
+import json, sys
+rels = json.load(sys.stdin)['component']['config'].get('autoTerminatedRelationships') or []
+print(','.join('\"' + r + '\"' for r in rels if r != 'retry'))
+")" || exit 1
+    configure_processor "$PROC_WRITER" "RedisBatchWriter" "" "$WRITER_AUTO_TERMINATED"
+    ensure_connection "$PROC_WRITER" "$PROC_WRITER" "RedisBatchWriter retry -> itself" '"retry"'
+  fi
+  ensure_connection "$PROC_READER" "$PROC_LIVE_DESER" "RedisReplicationReader key_changed -> RedisTypeDeserializer (live)" '"key_changed"'
+  ensure_connection "$PROC_LIVE_DESER" "$PROC_WRITER" "RedisTypeDeserializer (live) success -> RedisBatchWriter" '"success"'
+  ensure_connection "$PROC_LIVE_DESER" "$PROC_MODULE" "RedisTypeDeserializer (live) module_type -> ModuleTypeHandler" '"module_type"'
+  # Two writers of one key can land an older read after a newer one, so the scan path and the
+  # keyspace consumer stand down while the reader, which takes its own snapshot, is in charge.
+  [[ -n "$PROC_SCAN" && "$PROC_SCAN_STATE" != "DISABLED" ]] && set_run_status "$PROC_SCAN" "RedisScanReader" DISABLED
+  [[ -n "$PROC_KSN" && "$PROC_KSN_STATE" != "DISABLED" ]] && set_run_status "$PROC_KSN" "RedisKeyspaceEventConsumer" DISABLED
+  echo "  RedisReplicationReader:        $PROC_READER"
+  echo "  RedisTypeDeserializer (live):  $PROC_LIVE_DESER"
+  echo "  RedisScanReader and RedisKeyspaceEventConsumer: DISABLED (re-run with --live-source keyspace to restore them)"
+  echo "  note: FLUSHALL/FLUSHDB on the source are reported on the reader's flush relationship but not applied to the target"
+  exit 0
+fi
 
 # drift_wire_failed <what-failed> <nifi-response> - both halves of wiring the signals queue can
 # fail into the same partial state, and it must never be silent: by the time either runs, the
