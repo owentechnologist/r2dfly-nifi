@@ -42,8 +42,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * one to one, so the cluster bus works inside the container and the client reaches every node from
  * outside. SCAN load is counted on each node (INFO commandstats). Failover is off: on a loaded host
  * a master once missed the default 15 s node timeout mid-suite, its replica took over, and the
- * scan counts and keys moved with it (failover during a scan is WP7's topology recovery, untested
- * here). Requires Docker.
+ * scan counts and keys moved with it (failover during a scan is ClusterTopologyIT's subject).
+ * Requires Docker.
  */
 @Testcontainers
 class ClusterScanIT {

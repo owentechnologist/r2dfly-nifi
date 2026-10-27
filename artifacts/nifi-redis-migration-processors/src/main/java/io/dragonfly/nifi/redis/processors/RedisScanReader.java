@@ -263,45 +263,67 @@ public class RedisScanReader extends AbstractProcessor {
         Throttle throttle = new Throttle(context.getProperty(MAX_SOURCE_LATENCY_MS).asLong(),
                 context.getProperty(MAX_SOURCE_OPS_PER_SEC).asLong());
 
-        List<String> nodes = scanTargets(redisPool, partitionIndex, partitionCount);
-        String[] checkpoint = restoreCheckpoint(assigner, partitionIndex);
-        int nodeIndex = Math.max(0, nodes.indexOf(checkpoint[0]));
-        ScanCursor scanCursor = nodes.indexOf(checkpoint[0]) >= 0 ? ScanCursor.of(checkpoint[1]) : ScanCursor.INITIAL;
-        getLogger().info("Scanning partition {} of {} for migration '{}': nodes {} from cursor '{}' (allowedTypes={}, pattern='{}')",
-                partitionIndex, partitionCount, migrationId, nodes, scanCursor.getCursor(), filter.allowedTypes(), pattern);
+        Plan plan = plan(redisPool, assigner, partitionIndex, partitionCount);
+        Place place = restorePlace(assigner, partitionIndex, plan.targets());
+        getLogger().info("Scanning partition {} of {} for migration '{}': shards {} from {} (allowedTypes={}, pattern='{}')",
+                partitionIndex, partitionCount, migrationId, plan.targets(), place, filter.allowedTypes(), pattern);
 
-        while (nodeIndex < nodes.size() && !Thread.currentThread().isInterrupted()) {
-            String node = nodes.get(nodeIndex);
-            ScanCursor currentCursor = scanCursor;
+        Topology topology = new Topology(redisPool);
+        while (place != null && !Thread.currentThread().isInterrupted()) {
+            Place at = place;
             long startedAt = System.nanoTime();
-            ScanPage page = redisPool.withConnectionAndRaw((cmds, raw) ->
-                    scanPage(node.equals(STANDALONE) ? cmds : nodeCommands(raw, node, redisPool.prefersReplicas()), cmds, currentCursor, scanCount, pattern,
-                            filter, emitTtl, skipVolatile, volatileThresholdMs, readEncoding));
+            ScanPage page;
+            Place next;
+            if (at.target().equals(STANDALONE)) {
+                page = redisPool.withConnectionAndRaw((cmds, raw) -> scanPage(cmds, cmds, ScanCursor.of(at.step()), scanCount, pattern,
+                        filter, emitTtl, skipVolatile, volatileThresholdMs, readEncoding));
+                next = page.cursorAfterPage.isFinished() ? null : new Place(STANDALONE, STANDALONE, page.cursorAfterPage.getCursor());
+            } else {
+                ClusterTopologySnapshot current = topology.current();
+                Set<Integer> shardSlots = plan.baseline().mastersById().get(at.target()).slots();
+                if (!at.rescanningSlots()) {
+                    String node = scanNode(at.target(), shardSlots, current);
+                    Place scanning = at;
+                    if (!node.equals(at.node())) {
+                        if (at.node() != null) {
+                            session.adjustCounter("Scan Shards Restarted After Failover", 1, false);
+                            getLogger().info("Shard {}: its slots moved from {} to {}, so its scan restarts on {}; other shards are unaffected",
+                                    at.target(), at.node(), node, node);
+                        }
+                        scanning = new Place(at.target(), node, ScanCursor.INITIAL.getCursor());
+                    }
+                    Place from = scanning;
+                    page = redisPool.withConnectionAndRaw((cmds, raw) -> scanPage(nodeCommands(raw, node, redisPool.prefersReplicas()), cmds,
+                            ScanCursor.of(from.step()), scanCount, pattern, filter, emitTtl, skipVolatile, volatileThresholdMs, readEncoding));
+                    next = page.cursorAfterPage.isFinished() ? new Place(at.target(), node, Place.SLOTS + 0)
+                            : new Place(at.target(), node, page.cursorAfterPage.getCursor());
+                } else {
+                    List<Integer> sorted = shardSlots.stream().sorted().toList();
+                    int index = at.slotIndex();
+                    while (index < sorted.size() && at.node().equals(ownerOf(sorted.get(index), current))) {
+                        index++;
+                    }
+                    if (index == sorted.size()) {
+                        page = null;
+                        next = nextTarget(plan.targets(), at.target());
+                    } else {
+                        int slot = sorted.get(index);
+                        page = rescanSlot(redisPool, topology, slot, scanCount, pattern, filter, emitTtl, skipVolatile, volatileThresholdMs, readEncoding);
+                        session.adjustCounter("Scan Slots Rescanned", 1, false);
+                        getLogger().info("Shard {}: slot {} moved off {} during or before its scan; read again on its new owner ({} keys)",
+                                at.target(), slot, at.node(), page.entries.size());
+                        next = new Place(at.target(), at.node(), Place.SLOTS + (index + 1));
+                    }
+                }
+            }
             long pageMs = (System.nanoTime() - startedAt) / 1_000_000;
-
-            for (ScanEntry entry : page.entries) {
-                FlowFile flowFile = session.create();
-                flowFile = session.putAllAttributes(flowFile, entry.attributes(partitionIndex, page.cursorAfterPage, databaseIndex));
-                session.transfer(flowFile, relationshipFor(entry.type));
+            if (page != null) {
+                emit(session, page, partitionIndex, databaseIndex);
+                gauges.set(session, "Source Latency (ms)", pageMs);
             }
-            page.skippedByType.forEach((type, count) -> session.adjustCounter("Scan Keys Skipped by Type Filter (" + type + ")", count, false));
-            session.adjustCounter("Keys Scanned", page.entries.size() + page.failures.size()
-                    + page.skippedByType.values().stream().mapToLong(Long::longValue).sum(), false);
-            gauges.set(session, "Source Latency (ms)", pageMs);
-            for (ScanEntry failed : page.failures) {
-                FlowFile flowFile = session.create();
-                flowFile = session.putAllAttributes(flowFile, failed.attributes(partitionIndex, page.cursorAfterPage, databaseIndex));
-                session.transfer(flowFile, REL_FAILURE);
-            }
-
-            scanCursor = page.cursorAfterPage;
-            if (scanCursor.isFinished()) {
-                nodeIndex++;
-                scanCursor = ScanCursor.INITIAL;
-            }
+            place = next;
             try {
-                String next = nodeIndex < nodes.size() ? nodes.get(nodeIndex) + "|" + scanCursor.getCursor() : "";
-                assigner.checkpointCursor(partitionIndex, next);
+                assigner.checkpointCursor(partitionIndex, place == null ? "" : place.encode());
                 assigner.heartbeat(partitionIndex);
             } catch (IOException e) {
                 throw new ProcessException("Unable to checkpoint SCAN cursor", e);
@@ -318,7 +340,7 @@ public class RedisScanReader extends AbstractProcessor {
             }
         }
 
-        if (nodeIndex >= nodes.size()) {
+        if (place == null) {
             try {
                 assigner.markPartitionComplete(partitionIndex);
             } catch (IOException e) {
@@ -330,43 +352,227 @@ public class RedisScanReader extends AbstractProcessor {
         }
     }
 
-    /** The node name of a standalone or Sentinel source, which has a single keyspace to scan. */
+    private void emit(ProcessSession session, ScanPage page, int partitionIndex, Integer databaseIndex) {
+        for (ScanEntry entry : page.entries) {
+            FlowFile flowFile = session.create();
+            flowFile = session.putAllAttributes(flowFile, entry.attributes(partitionIndex, page.cursorAfterPage, databaseIndex));
+            session.transfer(flowFile, relationshipFor(entry.type));
+        }
+        page.skippedByType.forEach((type, count) -> session.adjustCounter("Scan Keys Skipped by Type Filter (" + type + ")", count, false));
+        session.adjustCounter("Keys Scanned", page.entries.size() + page.failures.size()
+                + page.skippedByType.values().stream().mapToLong(Long::longValue).sum(), false);
+        for (ScanEntry failed : page.failures) {
+            FlowFile flowFile = session.create();
+            flowFile = session.putAllAttributes(flowFile, failed.attributes(partitionIndex, page.cursorAfterPage, databaseIndex));
+            session.transfer(flowFile, REL_FAILURE);
+        }
+    }
+
+    /** The shard name of a standalone or Sentinel source, which has a single keyspace to scan. */
     private static final String STANDALONE = "-";
 
     /**
-     * What this partition SCANs. One SCAN of a standalone source covers everything, so partition 0
+     * What this partition scans: shards of the baseline topology (a cluster's masters, with their
+     * slots, when the scan began; recorded once and shared by every partition), dealt out
+     * round-robin by node id. One SCAN of a standalone source covers everything, so partition 0
      * takes it all and the rest have nothing to do; their parallelism belongs downstream, in
-     * RedisTypeDeserializer's concurrent tasks. A cluster's masters are dealt out round-robin by
-     * node id, and each is scanned on its own connection, so every key is read once, on its node.
+     * RedisTypeDeserializer's concurrent tasks.
      */
-    private static List<String> scanTargets(RedisConnectionPoolService pool, int partitionIndex, int partitionCount) {
+    record Plan(ClusterTopologySnapshot baseline, List<String> targets) {
+    }
+
+    private static Plan plan(RedisConnectionPoolService pool, PartitionAssigner assigner, int partitionIndex, int partitionCount) {
         if (!pool.isClusterMode()) {
-            return partitionIndex == 0 ? List.of(STANDALONE) : List.of();
+            return new Plan(null, partitionIndex == 0 ? List.of(STANDALONE) : List.of());
+        }
+        ClusterTopologySnapshot baseline;
+        try {
+            String proposed = pool.refreshedTopology().orElseThrow(() -> new ProcessException("Cluster topology unavailable")).encode();
+            baseline = ClusterTopologySnapshot.decode(assigner.baselineTopology(proposed));
+        } catch (IOException e) {
+            throw new ProcessException("Unable to read the scan's baseline topology", e);
         }
         // Slot owners only: a node that briefly reads as a slotless master while the cluster is
         // still converging can be a replica holding a copy of another master's keys.
-        List<String> masters = pool.currentTopology().orElseThrow(() -> new ProcessException("Cluster topology unavailable"))
-                .mastersById().values().stream().filter(m -> !m.slots().isEmpty())
+        List<String> masters = baseline.mastersById().values().stream().filter(m -> !m.slots().isEmpty())
                 .map(ClusterTopologySnapshot.MasterNode::nodeId).sorted().toList();
         List<String> mine = new ArrayList<>();
         for (int i = partitionIndex; i < masters.size(); i += partitionCount) {
             mine.add(masters.get(i));
         }
-        return mine;
+        return new Plan(baseline, mine);
     }
 
     /**
-     * A node's own cursor is a plain string, unlike Lettuce's cluster-wide one, so a cluster scan
-     * now resumes after a restart too. "node|cursor"; an unknown node (the topology changed) or an
-     * empty checkpoint restarts the partition from its first node.
+     * Where a partition is: the baseline shard it works on, the node it reads that shard on, and
+     * its step there, a SCAN cursor or "slots:index" while it reads the shard's slots that moved
+     * off that node. Encoded "target|node|step"; the "node|cursor" of earlier versions reads as a
+     * shard scanned on its own node.
      */
-    private static String[] restoreCheckpoint(PartitionAssigner assigner, int partitionIndex) {
+    record Place(String target, String node, String step) {
+        static final String SLOTS = "slots:";
+
+        boolean rescanningSlots() {
+            return step.startsWith(SLOTS);
+        }
+
+        int slotIndex() {
+            return Integer.parseInt(step.substring(SLOTS.length()));
+        }
+
+        String encode() {
+            return target + "|" + node + "|" + step;
+        }
+
+        static Place decode(String saved) {
+            String[] parts = saved.split("\\|", -1);
+            return parts.length == 3 ? new Place(parts[0], parts[1], parts[2]) : new Place(parts[0], parts[0], parts[1]);
+        }
+
+        @Override
+        public String toString() {
+            return encode();
+        }
+    }
+
+    private static Place restorePlace(PartitionAssigner assigner, int partitionIndex, List<String> targets) {
+        if (targets.isEmpty()) {
+            return null;
+        }
         try {
-            String saved = assigner.restoreCursor(partitionIndex).orElse("");
-            int bar = saved.lastIndexOf('|');
-            return bar < 0 ? new String[]{"", "0"} : new String[]{saved.substring(0, bar), saved.substring(bar + 1)};
+            Optional<Place> saved = assigner.restoreCursor(partitionIndex).filter(s -> !s.isEmpty()).map(Place::decode);
+            if (saved.isPresent() && targets.contains(saved.get().target())) {
+                return saved.get();
+            }
         } catch (IOException e) {
             throw new ProcessException("Unable to restore SCAN cursor", e);
+        }
+        String first = targets.get(0);
+        return new Place(first, first.equals(STANDALONE) ? STANDALONE : null, ScanCursor.INITIAL.getCursor());
+    }
+
+    private static Place nextTarget(List<String> targets, String done) {
+        int index = targets.indexOf(done) + 1;
+        return index < targets.size() ? new Place(targets.get(index), null, ScanCursor.INITIAL.getCursor()) : null;
+    }
+
+    /** The shard's own master while it still holds some of the shard's slots, otherwise the master holding most of them (after a failover, the promoted replica). */
+    private static String scanNode(String target, Set<Integer> shardSlots, ClusterTopologySnapshot current) {
+        ClusterTopologySnapshot.MasterNode own = current.mastersById().get(target);
+        if (own != null && own.slots().stream().anyMatch(shardSlots::contains)) {
+            return target;
+        }
+        return current.mastersById().values().stream()
+                .max(java.util.Comparator.comparingLong(m -> m.slots().stream().filter(shardSlots::contains).count()))
+                .filter(m -> m.slots().stream().anyMatch(shardSlots::contains))
+                .map(ClusterTopologySnapshot.MasterNode::nodeId)
+                .orElseThrow(() -> new ProcessException("No master serves the slots of shard " + target));
+    }
+
+    /** SCAN MATCH's glob (* ? [...] and \\ escapes), for keys read without SCAN. */
+    static boolean globMatches(String glob, String key) {
+        StringBuilder regex = new StringBuilder();
+        for (int i = 0; i < glob.length(); i++) {
+            char c = glob.charAt(i);
+            switch (c) {
+                case '*' -> regex.append(".*");
+                case '?' -> regex.append('.');
+                case '[' -> {
+                    // Redis's [abc], [^a] and [a-z] read the same as a regex character class.
+                    int close = glob.indexOf(']', i + 1);
+                    if (close < 0) {
+                        regex.append("\\[");
+                    } else {
+                        regex.append(glob, i, close + 1);
+                        i = close;
+                    }
+                }
+                case '\\' -> {
+                    if (i + 1 < glob.length()) {
+                        regex.append(java.util.regex.Pattern.quote(String.valueOf(glob.charAt(++i))));
+                    }
+                }
+                default -> regex.append(java.util.regex.Pattern.quote(String.valueOf(c)));
+            }
+        }
+        return key.matches("(?s)" + regex);
+    }
+
+    private static String ownerOf(int slot, ClusterTopologySnapshot current) {
+        for (ClusterTopologySnapshot.MasterNode master : current.mastersById().values()) {
+            if (master.slots().contains(slot)) {
+                return master.nodeId();
+            }
+        }
+        return null;
+    }
+
+    /** The cluster as the client sees it, asked afresh at most every two seconds. */
+    private static final class Topology {
+        private final RedisConnectionPoolService pool;
+        private ClusterTopologySnapshot snapshot;
+        private long refreshedAtMs;
+
+        Topology(RedisConnectionPoolService pool) {
+            this.pool = pool;
+        }
+
+        ClusterTopologySnapshot current() {
+            long now = System.currentTimeMillis();
+            if (snapshot == null || now - refreshedAtMs >= 2000) {
+                snapshot = pool.refreshedTopology().orElseThrow(() -> new ProcessException("Cluster topology unavailable"));
+                refreshedAtMs = now;
+            }
+            return snapshot;
+        }
+
+        ClusterTopologySnapshot refreshed() {
+            refreshedAtMs = 0;
+            return current();
+        }
+    }
+
+    /**
+     * Every key of one slot, read on the slot's current owner once no migration is moving it: a
+     * slot mid-migration has some keys on each side. Returns a page with no SCAN cursor of its own.
+     */
+    private ScanPage rescanSlot(RedisConnectionPoolService pool, Topology topology, int slot, int scanCount, String pattern, KeyFilter filter,
+                                boolean emitTtl, boolean skipVolatile, long volatileThresholdMs, boolean readEncoding) {
+        long deadline = System.currentTimeMillis() + 60_000;
+        while (true) {
+            String owner = ownerOf(slot, topology.refreshed());
+            if (owner == null) {
+                throw new ProcessException("Slot " + slot + " has no owner");
+            }
+            ScanPage page = pool.withConnectionAndRaw((cmds, raw) -> {
+                RedisClusterAsyncCommands<byte[], byte[]> node = nodeCommands(raw, owner, false);
+                try {
+                    if (node.clusterNodes().get().matches("(?s).*\\[" + slot + "-[<>]-.*")) {
+                        return null;
+                    }
+                    long count = node.clusterCountKeysInSlot(slot).get();
+                    List<byte[]> keys = count == 0 ? List.of() : node.clusterGetKeysInSlot(slot, (int) count).get();
+                    List<byte[]> matching = pattern == null || pattern.equals("*") ? keys
+                            : keys.stream().filter(k -> globMatches(pattern, new String(k, StandardCharsets.UTF_8))).toList();
+                    return describe(cmds, matching, ScanCursor.of("slot:" + slot), filter, emitTtl, skipVolatile, volatileThresholdMs, readEncoding);
+                } catch (ProcessException e) {
+                    throw e;
+                } catch (Exception e) {
+                    throw new ProcessException("Reading the keys of slot " + slot + " failed", e);
+                }
+            });
+            if (page != null) {
+                return page;
+            }
+            if (System.currentTimeMillis() > deadline) {
+                throw new ProcessException("Slot " + slot + " is still being migrated; its keys are read once it settles");
+            }
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new ProcessException(e);
+            }
         }
     }
 
@@ -475,8 +681,14 @@ public class RedisScanReader extends AbstractProcessor {
             throw new ProcessException("SCAN failed", e);
         }
 
+        return describe(cmds, result.getKeys(), result, filter, emitTtl, skipVolatile, volatileThresholdMs, readEncoding);
+    }
+
+    /** The keys the filter allows, with their type, TTL and encoding read through {@code cmds}. */
+    private static ScanPage describe(RedisClusterAsyncCommands<byte[], byte[]> cmds, List<byte[]> keys, ScanCursor cursorAfter, KeyFilter filter,
+                                     boolean emitTtl, boolean skipVolatile, long volatileThresholdMs, boolean readEncoding) {
         List<byte[]> candidateKeys = new ArrayList<>();
-        for (byte[] key : result.getKeys()) {
+        for (byte[] key : keys) {
             if (!filter.allowsKey(key)) {
                 continue;
             }
@@ -541,7 +753,7 @@ public class RedisScanReader extends AbstractProcessor {
             entries.add(new ScanEntry(ttlKeys.get(i), ttlTypes.get(i), ttlMs, encoding, null));
         }
 
-        return new ScanPage(entries, failures, result, skippedByType);
+        return new ScanPage(entries, failures, cursorAfter, skippedByType);
     }
 
     /** skippedByType: keys the type filter left out, which otherwise vanish without a trace. */

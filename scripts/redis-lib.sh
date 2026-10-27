@@ -66,7 +66,9 @@ redis_cli() {
   # The `|| rc=$?` is load-bearing under the callers' `set -e`: a bare `out=$(...)`
   # assignment propagates a failing command's exit status as its own, which would abort the
   # whole script right here instead of ever reaching the fallback below.
-  out="$($RUNTIME exec -i "$container" redis-cli "$@" 2>&1)" || rc=$?
+  # The server's own port inside its container: a cluster node or any server not on 6379 is
+  # otherwise asked on the wrong port and always falls through to the toolbox.
+  out="$($RUNTIME exec -i "$container" redis-cli -p "$(redis_lib_extract_port "$connstr")" "$@" 2>&1)" || rc=$?
   if [[ $rc -eq 0 ]]; then
     printf '%s\n' "$out"
     return 0

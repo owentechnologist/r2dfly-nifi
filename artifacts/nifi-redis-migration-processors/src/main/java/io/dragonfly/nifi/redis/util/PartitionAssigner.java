@@ -107,6 +107,16 @@ public class PartitionAssigner {
         return Optional.ofNullable(cache.get(cursorKey(partitionIndex), STRING_SERIALIZER, STRING_DESERIALIZER));
     }
 
+    /**
+     * The cluster's topology when this migration's scan began, shared by every partition so they
+     * divide the same shards between them whatever has moved since: the first to ask records
+     * {@code proposed}, and everyone gets what was recorded.
+     */
+    public String baselineTopology(String proposed) throws IOException {
+        cache.putIfAbsent(baselineKey(), proposed, STRING_SERIALIZER, STRING_SERIALIZER);
+        return cache.get(baselineKey(), STRING_SERIALIZER, STRING_DESERIALIZER);
+    }
+
     public void markPartitionComplete(int partitionIndex) throws IOException {
         cache.put(completeKey(partitionIndex), COMPLETE_MARKER, STRING_SERIALIZER, STRING_SERIALIZER);
     }
@@ -121,6 +131,10 @@ public class PartitionAssigner {
 
     private String cursorKey(int partitionIndex) {
         return "redis.migration.cursor." + migrationId + "." + partitionIndex;
+    }
+
+    private String baselineKey() {
+        return "redis.migration.topology." + migrationId;
     }
 
     private String completeKey(int partitionIndex) {

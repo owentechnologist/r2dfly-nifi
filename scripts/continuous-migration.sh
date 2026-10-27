@@ -52,8 +52,11 @@ Live Phase options:
                                  follows the source as a replica (PSYNC): it sees every write,
                                  including JSON/TopK/Bloom module commands that publish no keyspace
                                  notification, resumes after a restart with a partial resync, and
-                                 takes its own snapshot instead of RedisScanReader. The source must
-                                 accept PSYNC from NiFi (managed services often block it).
+                                 takes its own snapshot instead of RedisScanReader. A cluster source
+                                 gets one replica connection per master; a failover continues the
+                                 shard's stream on the promoted replica, a new master gets a snapshot
+                                 of its own keys, and resharded keys are copied as they move. The
+                                 source must accept PSYNC from NiFi (managed services often block it).
                                  reconcile has no change stream: each reconcile pass copies what
                                  differs, so changes land within one --reconcile-interval-ms. It is
                                  the rollback path after cutover, with Dragonfly as the source and
@@ -246,9 +249,11 @@ LIMITATIONS - read these before planning a cutover around continuous mode:
      live path fetches the key's CURRENT value, so a live update can be overwritten by the
      scanner's older in-flight batch for the same key. That key stays stale until it changes
      again. This is a known narrow window in this first wiring pass.
-  4. Cluster topology drift is detected and counted, but nothing acts on it. The topology_drift
-     relationship is auto-terminated by default; --reconciliation-signals queues it at a funnel
-     instead, which keeps the signals but still leaves nothing reading them.
+  4. With --live-source keyspace, cluster topology drift is detected and counted, but nothing
+     acts on it. The topology_drift relationship is auto-terminated by default;
+     --reconciliation-signals queues it at a funnel instead, which keeps the signals but still
+     leaves nothing reading them. --live-source replication follows failovers, resharding and
+     new shards itself.
   5. The Live Phase starts together with the initial scan, when run-r2dfly.sh starts the flow,
      so changes made on the source between this script starting and that moment are not captured
      by the Live Phase (the initial snapshot covers whatever is on the source when it scans).
@@ -1383,8 +1388,9 @@ echo "    3. During the initial snapshot the Live Phase and the scanner both wri
 echo "       The live path fetches the key's CURRENT value, so a live update can be overwritten by"
 echo "       the scanner's older in-flight batch for the same key. That key stays stale until it"
 echo "       changes again. This is a known narrow window in this first wiring pass."
-echo "    4. Cluster topology drift is detected and counted but the topology_drift relationship is"
-echo "       auto-terminated - nothing acts on it."
+echo "    4. With --live-source keyspace, cluster topology drift is detected and counted but the"
+echo "       topology_drift relationship is auto-terminated - nothing acts on it. --live-source"
+echo "       replication follows failovers, resharding and new shards itself."
 echo "    5. The Live Phase starts together with the initial scan, when run-r2dfly.sh starts the"
 echo "       flow, so changes made on the source between this script starting and that moment are"
 echo "       not captured by the Live Phase (the initial snapshot covers whatever is on the source"
@@ -1396,10 +1402,6 @@ echo "    6. RedisBatchWriter batches its writes: its deployed defaults are batc
 echo "       batch-timeout-ms 30000, so a single live change can wait up to 30 seconds on the"
 echo "       target before it lands. That is throughput tuning, not a correctness bug, but it"
 echo "       means 'continuous' is not 'immediate'."
-echo "    7. RedisSingleKeyFetch's module_type relationship is auto-terminated, not routed to"
-echo "       ModuleTypeHandler. A live change to a non-core-type key (ReJSON-RL, TopK-TYPE, and"
-echo "       other module types) is silently dropped - no counter, no bulletin. This only affects"
-echo "       changes made DURING continuous mode; the initial snapshot handles these types fully."
 echo
 echo "  Stop the Live Phase with:"
 echo "    ./stop-continuous-migration.sh --nifi-container $NIFI_CONTAINER_NAME --nifi-user $NIFI_USER --nifi-password <the password you used>"

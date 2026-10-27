@@ -5,6 +5,7 @@ import io.lettuce.core.api.StatefulConnection;
 import io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands;
 import org.apache.nifi.controller.ControllerService;
 
+import java.util.Map;
 import java.util.Optional;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -52,17 +53,26 @@ public interface RedisConnectionPoolService extends ControllerService {
      */
     Optional<ClusterTopologySnapshot> currentTopology();
 
-    /**
-     * The master a replication reader should connect to, resolved at call time so a reconnect
-     * after a Sentinel failover reaches the new master. Empty in cluster mode, where every shard
-     * has its own master.
-     */
+    /** {@link #currentTopology()} after asking the cluster for its current view, which costs a CLUSTER NODES. */
+    default Optional<ClusterTopologySnapshot> refreshedTopology() {
+        return currentTopology();
+    }
+
     /** Whether this pool reads from replicas (its Read From property); the scan follows it to a replica of each master. */
     default boolean prefersReplicas() {
         return false;
     }
 
-    default Optional<ReplicationEndpoint> replicationEndpoint() {
-        return Optional.empty();
+    /** The shard key {@link #replicationEndpoints()} uses for a source that is not a cluster. */
+    String STANDALONE_SHARD = "-";
+
+    /**
+     * The masters a replication reader should connect to, by shard: each slot-owning master's node
+     * id in a cluster, {@link #STANDALONE_SHARD} otherwise. Resolved at call time, from a refreshed
+     * cluster topology or the Sentinel's current master, so a reader that asks again after a
+     * failover reaches the new master.
+     */
+    default Map<String, ReplicationEndpoint> replicationEndpoints() {
+        return Map.of();
     }
 }

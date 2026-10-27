@@ -33,6 +33,7 @@ import java.io.File;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.BiFunction;
@@ -155,6 +156,8 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
     private GenericObjectPool<StatefulRedisClusterConnection<byte[], byte[]>> clusterPool;
     /** Null in cluster mode. */
     private volatile RedisURI standaloneUri;
+    /** The first cluster seed, whose credentials every node's replica connection uses. Null outside cluster mode. */
+    private volatile RedisURI seedUri;
     private volatile javax.net.ssl.SSLSocketFactory replicationSocketFactory;
 
     @Override
@@ -201,8 +204,13 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
                     uri.setSsl(requireTls);
                     seedUris.add(uri);
                 }
+                seedUri = seedUris.get(0);
+                replicationSocketFactory = requireTls ? replicationSocketFactory(sslContextService) : null;
                 redisClusterClient = RedisClusterClient.create(seedUris);
+                // A redirect to a master that joined since the last refresh (a new shard taking
+                // slots) is followed, rather than refused until the view catches up.
                 ClusterClientOptions.Builder optionsBuilder = ClusterClientOptions.builder()
+                        .validateClusterNodeMembership(false)
                         .topologyRefreshOptions(ClusterTopologyRefreshOptions.builder()
                                 .enableAllAdaptiveRefreshTriggers()
                                 .build());
@@ -250,11 +258,21 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
         }
     }
 
-    public Optional<ReplicationEndpoint> replicationEndpoint() {
-        RedisURI uri = standaloneUri;
-        if (uri == null) {
-            return Optional.empty();
+    public Map<String, ReplicationEndpoint> replicationEndpoints() {
+        if (clusterMode) {
+            // The client's view is otherwise refreshed only by redirects and reconnects, which a
+            // reader that issues no commands to a failed-over shard would never cause.
+            redisClusterClient.refreshPartitions();
+            Map<String, ReplicationEndpoint> endpoints = new java.util.TreeMap<>();
+            for (RedisClusterNode node : redisClusterClient.getPartitions()) {
+                if (isServingMaster(node) && !node.getSlots().isEmpty()) {
+                    endpoints.put(node.getNodeId(), new ReplicationEndpoint(node.getUri().getHost(), node.getUri().getPort(),
+                            seedUri.getUsername(), seedUri.getPassword(), 0, replicationSocketFactory));
+                }
+            }
+            return endpoints;
         }
+        RedisURI uri = standaloneUri;
         String host = uri.getHost();
         int port = uri.getPort();
         if (!uri.getSentinels().isEmpty()) {
@@ -267,7 +285,7 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
                 port = address.getPort();
             }
         }
-        return Optional.of(new ReplicationEndpoint(host, port, uri.getUsername(), uri.getPassword(), uri.getDatabase(),
+        return Map.of(RedisConnectionPoolService.STANDALONE_SHARD, new ReplicationEndpoint(host, port, uri.getUsername(), uri.getPassword(), uri.getDatabase(),
                 replicationSocketFactory));
     }
 
@@ -287,6 +305,7 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
 
     private void releaseResources() {
         standaloneUri = null;
+        seedUri = null;
         replicationSocketFactory = null;
         if (standalonePool != null) {
             standalonePool.close();
@@ -372,6 +391,13 @@ public abstract class AbstractRedisConnectionPoolService extends AbstractControl
                     node.getNodeId(), node.getUri().getHost(), node.getUri().getPort(), Set.copyOf(node.getSlots())));
         }
         return Optional.of(ClusterTopologySnapshot.of(System.currentTimeMillis(), masters));
+    }
+
+    public Optional<ClusterTopologySnapshot> refreshedTopology() {
+        if (clusterMode) {
+            redisClusterClient.refreshPartitions();
+        }
+        return currentTopology();
     }
 
     /**
