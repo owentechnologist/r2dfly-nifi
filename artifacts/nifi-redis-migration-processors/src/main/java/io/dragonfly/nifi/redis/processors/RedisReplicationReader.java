@@ -122,9 +122,9 @@ public class RedisReplicationReader extends AbstractProcessor {
     public static final Relationship REL_KEY_CHANGED = new Relationship.Builder().name("key_changed")
             .description("A key that the snapshot found or a command changed; RedisTypeDeserializer copies its current value").build();
     public static final Relationship REL_FLUSH = new Relationship.Builder().name("flush")
-            .description("FLUSHALL, FLUSHDB or SWAPDB on the replicated database. Keys written afterwards still arrive "
-                    + "on key_changed, but the target only loses the flushed keys if something acts on this "
-                    + "(redis.flush.command, redis.event.db)").build();
+            .description("FLUSHALL, FLUSHDB or SWAPDB on the replicated database (redis.flush.command, redis.event.db). "
+                    + "Keys written afterwards still arrive on key_changed; the flushed keys leave the target when "
+                    + "MigrationReconciler sees the DBSIZE drop and runs a full pass.").build();
 
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
             REDIS_CONNECTION_POOL, RedisScanReader.PREFIX_DENY_LIST, RedisScanReader.PREFIX_ONLY_LIST, SCAN_COUNT,

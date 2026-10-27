@@ -1096,6 +1096,16 @@ if [[ "$WRITER_CONCURRENCY" -gt 1 ]]; then
   echo "         different writer tasks; with --live-source replication, 1 is the setting that keeps every key exact." >&2
 fi
 fi
+# The reconciler is what removes keys a FLUSHALL deleted, and it must not quietly sit INVALID while
+# this run reports a healthy Live Phase, so it is checked with the rest.
+PROC_RECONCILER="$(nifi_api_get "process-groups/$PG_ID/processors" | py3 "
+import json, sys
+print(next((p['component']['id'] for p in json.load(sys.stdin)['processors'] if p['component']['type'].endswith('MigrationReconciler')), ''))
+")" || true
+if [[ -z "$PROC_RECONCILER" ]]; then
+  echo "error: could not find MigrationReconciler in $PG_ID - build-live-phase-flow.sh should have created it" >&2; exit 1
+fi
+LIVE_PROCS_DOWNSTREAM_FIRST+=("$PROC_RECONCILER:MigrationReconciler")
 
 # json_or_null <value> - "null" (unquoted, NiFi's way of explicitly clearing an optional property
 # back to its own default) or the value quoted as a JSON string. NiFi's processor-property PUT is

@@ -1,18 +1,13 @@
 package io.dragonfly.nifi.redis.util;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.lettuce.core.RestoreArgs;
 
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -28,13 +23,6 @@ public final class RestoreProbe {
 
     public record Verdict(boolean accepted, String detail) {
     }
-
-    /** Idle and activity times move between the two reads, and delivered_at_ms is derived from
-     * the moment of each read, so none of them ever match exactly. */
-    private static final Set<String> TIME_DEPENDENT_FIELDS = Set.of(
-            "ms_since_last_delivery", "delivered_at_ms", "idle", "inactive", "seen-time", "active-time");
-
-    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final RedisConnectionPoolService source;
     private final RedisConnectionPoolService target;
@@ -87,8 +75,8 @@ public final class RestoreProbe {
             if (actual.isEmpty()) {
                 return new Verdict(false, "RESTORE succeeded but the scratch key reads back empty");
             }
-            JsonNode want = comparable(expected.get().get(0));
-            JsonNode got = comparable(actual.get().get(0));
+            JsonNode want = ComparableValue.of(expected.get().get(0));
+            JsonNode got = ComparableValue.of(actual.get().get(0));
             return want.equals(got)
                     ? new Verdict(true, "restored value matches the source")
                     : new Verdict(false, "restored value differs from the source: expected " + want + " but read " + got);
@@ -107,30 +95,6 @@ public final class RestoreProbe {
     private static Optional<List<KeyRecord>> fetchWhole(
             io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands<byte[], byte[]> cmds, String key, String type) throws Exception {
         return RedisValueFetcher.fetch(cmds, key, type, -1L, null, Integer.MAX_VALUE, Integer.MAX_VALUE, 1000, true);
-    }
-
-    private static JsonNode comparable(KeyRecord record) {
-        ObjectNode node = MAPPER.createObjectNode();
-        node.put("type", record.type);
-        node.set("value", MAPPER.valueToTree(record.value));
-        node.set("consumer_groups", MAPPER.valueToTree(record.consumerGroups));
-        if ("set".equals(record.type) && node.get("value") instanceof ArrayNode members) {
-            List<String> sorted = new ArrayList<>();
-            members.forEach(m -> sorted.add(m.asText()));
-            sorted.sort(null);
-            node.set("value", MAPPER.valueToTree(sorted));
-        }
-        stripTimeDependentFields(node);
-        return node;
-    }
-
-    private static void stripTimeDependentFields(JsonNode node) {
-        if (node instanceof ObjectNode object) {
-            object.remove(TIME_DEPENDENT_FIELDS);
-            object.forEach(RestoreProbe::stripTimeDependentFields);
-        } else if (node instanceof ArrayNode array) {
-            array.forEach(RestoreProbe::stripTimeDependentFields);
-        }
     }
 
     private interface Call<T> {

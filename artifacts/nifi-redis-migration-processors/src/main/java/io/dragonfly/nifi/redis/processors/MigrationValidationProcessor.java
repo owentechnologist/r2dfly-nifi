@@ -9,6 +9,7 @@ import io.lettuce.core.ScanArgs;
 import io.lettuce.core.ScanCursor;
 import io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
+import org.apache.nifi.annotation.documentation.DeprecationNotice;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.flowfile.FlowFile;
@@ -29,6 +30,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
+@DeprecationNotice(alternatives = MigrationReconciler.class,
+        reason = "Spot-checks one SCAN page and only reports; MigrationReconciler compares the whole keyspace in both directions and repairs what differs")
 @Tags({"redis", "dragonfly", "migration", "validation"})
 @CapabilityDescription("Post-migration spot-check: samples keys from the source, compares them against "
         + "the target, and emits a validation report FlowFile. Spec section 4.6.")
