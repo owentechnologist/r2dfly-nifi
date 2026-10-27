@@ -1,6 +1,7 @@
 package io.dragonfly.nifi.redis.processors;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.dragonfly.nifi.redis.util.FailureReason;
 import io.dragonfly.nifi.redis.util.KeyRecord;
 import io.dragonfly.nifi.redis.util.RedisTypeSerializer;
 import org.apache.nifi.components.AllowableValue;
@@ -183,7 +184,7 @@ public class RecordToKeyRecord extends AbstractProcessor {
             for (FlowFile child : created) {
                 session.remove(child);
             }
-            session.transfer(session.penalize(original), REL_FAILURE);
+            session.transfer(session.penalize(FailureReason.tag(session, original, "converting the records failed", e)), REL_FAILURE);
             return;
         }
 

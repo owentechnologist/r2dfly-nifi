@@ -35,6 +35,10 @@ Options:
                                 sees every write, resumes after a restart, and takes its own snapshot,
                                 so RedisScanReader is DISABLED in this mode. Needs a source that
                                 accepts PSYNC from this client; the flow must be stopped.
+                                reconcile has no change stream at all: MigrationReconciler's passes
+                                find every difference and repair it, and RedisKeyspaceEventConsumer
+                                is DISABLED. It is the rollback path from Dragonfly back to Redis,
+                                since Dragonfly publishes only expiry notifications and serves no PSYNC.
   --no-export-baseline         don't re-export the updated flow over artifacts/r2dfly.json
                                 (the export is taken from the live flow, so it carries whatever
                                 properties the running flow currently has - including a previous
@@ -80,8 +84,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$LIVE_SOURCE" in
-  keyspace|replication) ;;
-  *) echo "error: --live-source must be keyspace or replication (got '$LIVE_SOURCE')" >&2; usage; exit 1 ;;
+  keyspace|replication|reconcile) ;;
+  *) echo "error: --live-source must be keyspace, replication or reconcile (got '$LIVE_SOURCE')" >&2; usage; exit 1 ;;
 esac
 
 if [[ -z "$NIFI_TOKEN" && ( -z "$NIFI_USER" || -z "$NIFI_PASS" ) ]]; then
@@ -110,9 +114,10 @@ proc_create_body() {
 # <properties-json-members> is the inside of the properties object ("k":"v",...) and
 # <auto-terminated-json-members> the inside of the array ("failure",...), so callers keep control
 # of which values are quoted strings and which are unquoted JSON null.
+# [extra-config-json-members] are further ProcessorConfigDTO fields (",\"retryCount\":10"), or nothing.
 proc_config_body() {
-  printf '{"revision":{"version":%s},"component":{"id":"%s","config":{"properties":{%s},"autoTerminatedRelationships":[%s]}}}' \
-    "$2" "$1" "$3" "$4"
+  printf '{"revision":{"version":%s},"component":{"id":"%s","config":{"properties":{%s},"autoTerminatedRelationships":[%s]%s}}}' \
+    "$2" "$1" "$3" "$4" "${5:-}"
 }
 
 # conn_create_body <pg-id> <source-proc-id> <destination-id> <relationships-json-members> [destination-type]
@@ -194,7 +199,7 @@ PROC_IDS="$(nifi_api_get "process-groups/$PG_ID/processors" | py3 "
 import json, sys
 d = json.load(sys.stdin)
 order = ['RedisBatchWriter', 'ModuleTypeHandler', 'RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'DeleteRedisKey',
-         'MigrationReconciler', 'RedisTypeDeserializer (live)']
+         'MigrationReconciler', 'RedisTypeDeserializer (live)', 'RedisDeadLetterWriter']
 ids = {name: '' for name in order}
 for p in d['processors']:
     t = p['component']['type']
@@ -207,9 +212,13 @@ for p in d['processors']:
             break
 print('|'.join(ids[name] for name in order))
 ")" || true
-IFS='|' read -r PROC_WRITER PROC_MODULE PROC_CONSUMER PROC_FETCH PROC_DELETE PROC_RECONCILER PROC_LIVE_DESER_FOUND <<< "$PROC_IDS"
+IFS='|' read -r PROC_WRITER PROC_MODULE PROC_CONSUMER PROC_FETCH PROC_DELETE PROC_RECONCILER PROC_LIVE_DESER_FOUND PROC_DEAD_LETTER <<< "$PROC_IDS"
 if [[ -z "$PROC_WRITER" ]]; then
   echo "error: could not find the RedisBatchWriter processor in $PG_ID - the Live Phase reuses the scan path's writer rather than creating its own. Run ./deploy-to-nifi.sh first." >&2
+  exit 1
+fi
+if [[ -z "$PROC_DEAD_LETTER" ]]; then
+  echo "error: could not find the RedisDeadLetterWriter processor in $PG_ID - every Live Phase failure ends there. Run ./deploy-to-nifi.sh first." >&2
   exit 1
 fi
 if [[ -z "$PROC_MODULE" ]]; then
@@ -271,14 +280,19 @@ set_run_status() {
 # Back on the keyspace path after a replication run, the two processors that mode disabled come
 # back, and the replication reader stands down so only one live source feeds the flow. Applied
 # once the flow is stopped below: NiFi only changes DISABLED on a stopped processor.
+# --live-source reconcile keeps the consumer disabled too: the reconciler's passes are its only
+# change source.
 SWITCH_IDS="$(nifi_api_get "process-groups/$PG_ID/processors" | py3 "
 import json, sys
 d = json.load(sys.stdin)
 for p in d['processors']:
     c = p['component']
-    if c.get('state') == 'DISABLED' and (c['type'].endswith('RedisScanReader') or c['type'].endswith('RedisKeyspaceEventConsumer')):
+    disabled = c.get('state') == 'DISABLED'
+    consumer = c['type'].endswith('RedisKeyspaceEventConsumer')
+    wanted = c['type'].endswith('RedisScanReader') or consumer and '$LIVE_SOURCE' == 'keyspace'
+    if disabled and wanted:
         print('STOPPED ' + c['id'])
-    elif c.get('state') != 'DISABLED' and c['type'].endswith('RedisReplicationReader'):
+    elif not disabled and not wanted and (consumer or c['type'].endswith('RedisReplicationReader')):
         print('DISABLED ' + c['id'])
 ")" || true
 
@@ -299,11 +313,13 @@ elif [[ "$DRIFT_ACTION" != "none" ]]; then
   NEEDS_WORK="true"
 elif [[ -z "$PROC_RECONCILER" ]] || ! connection_present "$PROC_RECONCILER" "$PROC_FETCH"; then
   NEEDS_WORK="true"
+elif ! connection_present "$PROC_FETCH" "$PROC_DEAD_LETTER" || ! connection_present "$PROC_WRITER" "$PROC_DEAD_LETTER"; then
+  NEEDS_WORK="true"
 fi
 # The replication branch below converges idempotently, and the "already wired" exit would skip it
 # for a flow whose keyspace Live Phase was wired earlier.
 [[ "$LIVE_SOURCE" == "replication" ]] && NEEDS_WORK="true"
-[[ "$LIVE_SOURCE" == "keyspace" && -n "$SWITCH_IDS" ]] && NEEDS_WORK="true"
+[[ "$LIVE_SOURCE" != "replication" && -n "$SWITCH_IDS" ]] && NEEDS_WORK="true"
 
 # live_validation_report - per-processor PASS/FAIL for the three Live Phase processors plus every
 # validation error verbatim, returning non-zero unless all three are VALID. Matched on the type
@@ -439,7 +455,7 @@ print(d['processGroupStatus']['aggregateSnapshot']['activeThreadCount'])
 echo "==> stopping the flow so NiFi will accept the new processors and connections"
 nifi_cli pg-stop -pgid "$PG_ID" || true
 wait_for_processors_stopped
-if [[ "$LIVE_SOURCE" == "keyspace" ]]; then
+if [[ "$LIVE_SOURCE" != "replication" ]]; then
   while read -r switch_state switch_id; do
     [[ -n "$switch_id" ]] && set_run_status "$switch_id" "processor $switch_id" "$switch_state"
   done <<< "$SWITCH_IDS"
@@ -475,7 +491,7 @@ create_processor() {
   echo "$id"
 }
 
-# configure_processor <id> <label> <properties-json-members> <auto-terminated-json-members>
+# configure_processor <id> <label> <properties-json-members> <auto-terminated-json-members> [extra-config-json-members]
 configure_processor() {
   local id="$1" label="$2" ver
   ver="$(nifi_current_version "processors/$id")" || true
@@ -483,7 +499,7 @@ configure_processor() {
     echo "error: could not read the current revision of $label (processors/$id)" >&2
     exit 1
   fi
-  nifi_api_put_checked "processors/$id" "$(proc_config_body "$id" "$ver" "$3" "$4")" > /dev/null
+  nifi_api_put_checked "processors/$id" "$(proc_config_body "$id" "$ver" "$3" "$4" "${5:-}")" > /dev/null
 }
 
 # ensure_connection <source-id> <destination-id> <label> <relationships-json-members> - creates
@@ -543,6 +559,45 @@ wire_reconciler() {
     "\"source-connection-pool\":\"$SVC_SOURCE\",\"target-connection-pool\":\"$SVC_TARGET\"" '"report"'
   ensure_connection "$PROC_RECONCILER" "$1" "MigrationReconciler repair -> $2" '"repair"'
 }
+
+# route_to_dead_letter <proc-id> <label> <relationship> - takes the relationship off the
+# processor's auto-terminated list and connects it to RedisDeadLetterWriter, adding it to a
+# connection the pair already has (ModuleTypeHandler's unsupported one) rather than a second.
+route_to_dead_letter() {
+  local id="$1" label="$2" rel="$3" auto conn resp conn_id conn_ver conn_rels
+  auto="$(nifi_api_get "processors/$id" | py3 "
+import json, sys
+rels = json.load(sys.stdin)['component']['config'].get('autoTerminatedRelationships') or []
+print(('drop|' if '$rel' in rels else 'keep|') + ','.join('\"' + r + '\"' for r in rels if r != '$rel'))
+")" || exit 1
+  [[ "${auto%%|*}" == "drop" ]] && configure_processor "$id" "$label" "" "${auto#*|}"
+  conn="$(nifi_api_get "process-groups/$PG_ID/connections" | py3 "
+import json, sys
+for c in json.load(sys.stdin)['connections']:
+    comp = c['component']
+    if comp['source']['id'] == '$id' and comp['destination']['id'] == '$PROC_DEAD_LETTER':
+        rels = comp.get('selectedRelationships') or []
+        print(comp['id'] + '|' + str(c['revision']['version']) + '|' + ('has' if '$rel' in rels else ','.join('\"' + r + '\"' for r in rels + ['$rel'])))
+        break
+")" || exit 1
+  if [[ -z "$conn" ]]; then
+    resp="$(nifi_api_post "process-groups/$PG_ID/connections" "$(conn_create_body "$PG_ID" "$id" "$PROC_DEAD_LETTER" "\"$rel\"")")" || true
+    if ! py3 "import json,sys; sys.exit(0 if json.load(sys.stdin).get('id') else 1)" <<< "$resp" >/dev/null 2>&1; then
+      echo "error: could not connect $label $rel to RedisDeadLetterWriter. NiFi's response: $resp" >&2
+      exit 1
+    fi
+    echo "  connected: $label $rel -> RedisDeadLetterWriter"
+  elif [[ "${conn##*|}" != "has" ]]; then
+    IFS='|' read -r conn_id conn_ver conn_rels <<< "$conn"
+    nifi_api_put_checked "connections/$conn_id" \
+      "{\"revision\":{\"version\":$conn_ver},\"component\":{\"id\":\"$conn_id\",\"selectedRelationships\":[$conn_rels]}}" > /dev/null
+    echo "  connected: $label $rel -> RedisDeadLetterWriter"
+  fi
+}
+
+# Shared by both live modes: the writer and the module handler that every live path feeds.
+route_to_dead_letter "$PROC_WRITER" "RedisBatchWriter" "failure"
+route_to_dead_letter "$PROC_MODULE" "ModuleTypeHandler" "failure"
 
 if [[ "$LIVE_SOURCE" == "replication" ]]; then
   echo "==> wiring the replication Live Phase"
@@ -688,10 +743,13 @@ fi
 # computed from a half-built flow would get exactly that wrong on a re-run. key_changed,
 # key_deleted and key_expired are wired below, so none of them ever appears here - and neither
 # does topology_drift under --reconciliation-signals, which connects it to a funnel instead.
-CONSUMER_AUTO_TERMINATED='"failure","topology_drift"'
+CONSUMER_AUTO_TERMINATED='"topology_drift"'
 if [[ "$RECONCILIATION_SIGNALS" == "true" ]]; then
-  CONSUMER_AUTO_TERMINATED='"failure"'
+  CONSUMER_AUTO_TERMINATED=''
 fi
+# A fetch or a delete that fails is retried by NiFi itself, with backoff, before it is
+# dead-lettered: most of those failures are a source or target that is briefly unreachable.
+RETRY_THEN_DEAD_LETTER=',"retriedRelationships":["failure"],"retryCount":10,"backoffMechanism":"PENALIZE_FLOWFILE","maxBackoffPeriod":"10 mins"'
 
 echo "==> configuring the Live Phase processors"
 # topology-state-cache is deliberately left unset: nothing consumes topology_drift, whether it is
@@ -705,10 +763,10 @@ configure_processor "$PROC_CONSUMER" "RedisKeyspaceEventConsumer" \
 # or a live-path key would land on the target shaped differently from a scanned one.
 configure_processor "$PROC_FETCH" "RedisSingleKeyFetch" \
   "\"redis-connection-pool\":\"$SVC_SOURCE\",\"hash-field-batch-size\":\"10000\",\"list-chunk-size\":\"5000\",\"stream-read-count\":\"1000\",\"include-consumer-groups\":\"true\"" \
-  '"failure"'
+  '' "$RETRY_THEN_DEAD_LETTER"
 configure_processor "$PROC_DELETE" "DeleteRedisKey" \
   "\"dragonfly-connection-pool\":\"$SVC_TARGET\"" \
-  '"success","failure"'
+  '"success"' "$RETRY_THEN_DEAD_LETTER"
 
 echo "==> wiring the Live Phase"
 ensure_connection "$PROC_CONSUMER" "$PROC_FETCH" "RedisKeyspaceEventConsumer key_changed -> RedisSingleKeyFetch" \
@@ -724,6 +782,9 @@ ensure_connection "$PROC_FETCH" "$PROC_MODULE" "RedisSingleKeyFetch module_type 
 # A key deleted between its change event and the fetch still has to leave the target.
 ensure_connection "$PROC_FETCH" "$PROC_DELETE" "RedisSingleKeyFetch key_missing -> DeleteRedisKey" \
   '"key_missing"'
+route_to_dead_letter "$PROC_CONSUMER" "RedisKeyspaceEventConsumer" "failure"
+route_to_dead_letter "$PROC_FETCH" "RedisSingleKeyFetch" "failure"
+route_to_dead_letter "$PROC_DELETE" "DeleteRedisKey" "failure"
 wire_reconciler "$PROC_FETCH" "RedisSingleKeyFetch"
 remove_connection "$PROC_RECONCILER" "$PROC_LIVE_DESER_FOUND" "MigrationReconciler repair -> RedisTypeDeserializer (live)"
 

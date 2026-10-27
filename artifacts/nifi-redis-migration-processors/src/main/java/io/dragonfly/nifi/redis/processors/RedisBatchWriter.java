@@ -3,6 +3,7 @@ package io.dragonfly.nifi.redis.processors;
 import io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService;
 import io.dragonfly.nifi.redis.util.ChunkReassembler;
 import io.dragonfly.nifi.redis.util.CommandBuilder;
+import io.dragonfly.nifi.redis.util.FailureReason;
 import io.dragonfly.nifi.redis.util.KeyRecord;
 import io.dragonfly.nifi.redis.util.RedisTypeSerializer;
 import io.dragonfly.nifi.redis.util.RetryPolicy;
@@ -229,7 +230,7 @@ public class RedisBatchWriter extends AbstractProcessor {
                     payload = in.readAllBytes();
                 } catch (Exception e) {
                     getLogger().error("Failed to read DUMP payload from FlowFile", e);
-                    session.transfer(session.penalize(flowFile), REL_FAILURE);
+                    session.transfer(session.penalize(FailureReason.tag(session, flowFile, "reading the DUMP payload failed", e)), REL_FAILURE);
                     continue;
                 }
                 KeyRecord dumpRecord = new KeyRecord(
@@ -245,7 +246,7 @@ public class RedisBatchWriter extends AbstractProcessor {
                 record = RedisTypeSerializer.readJson(in);
             } catch (Exception e) {
                 getLogger().error("Failed to parse key record from FlowFile", e);
-                session.transfer(session.penalize(flowFile), REL_FAILURE);
+                session.transfer(session.penalize(FailureReason.tag(session, flowFile, "parsing the key record failed", e)), REL_FAILURE);
                 continue;
             }
 
@@ -268,7 +269,7 @@ public class RedisBatchWriter extends AbstractProcessor {
         }
         List<PendingWrite> writes = latestPerKey(session, ready);
 
-        List<CommandBuilder.WriteOutcome> outcomes;
+        List<Written> outcomes;
         if (writeConfirmation) {
             outcomes = new ArrayList<>(writes.size());
             for (int start = 0; start < writes.size(); start += maxPipelineDepth) {
@@ -285,24 +286,31 @@ public class RedisBatchWriter extends AbstractProcessor {
             });
             outcomes = new ArrayList<>();
             for (int i = 0; i < writes.size(); i++) {
-                outcomes.add(CommandBuilder.WriteOutcome.SUCCESS);
+                outcomes.add(new Written(CommandBuilder.WriteOutcome.SUCCESS, null));
             }
         }
 
+        session.adjustCounter("Keys Written", outcomes.stream().filter(w -> w.outcome() == CommandBuilder.WriteOutcome.SUCCESS).count(), false);
+        session.adjustCounter("Write Errors", outcomes.stream().filter(w -> w.outcome() == null).count(), false);
         for (int i = 0; i < writes.size(); i++) {
             FlowFile flowFile = writes.get(i).flowFile;
-            CommandBuilder.WriteOutcome outcome = outcomes.get(i);
+            CommandBuilder.WriteOutcome outcome = outcomes.get(i).outcome();
             if (outcome == null) {
-                routeRetryOrFailure(session, flowFile, retryPolicy);
+                routeRetryOrFailure(session, FailureReason.tag(session, flowFile, outcomes.get(i).error()), retryPolicy);
             } else {
                 switch (outcome) {
                     case SUCCESS -> session.transfer(flowFile, REL_SUCCESS);
                     case SKIPPED -> session.transfer(flowFile, REL_SKIPPED);
-                    case CONFLICT -> session.transfer(flowFile, REL_FAILURE);
+                    case CONFLICT -> session.transfer(FailureReason.tag(session, flowFile,
+                            "the key already exists on the target and conflict-strategy is FAIL"), REL_FAILURE);
                     case RESTORE_REJECTED -> {
                         getLogger().warn("Target rejected the DUMP payload for key {}; sending it back for a typed copy", writes.get(i).record.key);
                         FlowFile rejected = session.putAttribute(flowFile, "redis.restore.rejected", "true");
-                        session.transfer(rejected, context.hasConnection(REL_RESTORE_REJECTED) ? REL_RESTORE_REJECTED : REL_FAILURE);
+                        if (context.hasConnection(REL_RESTORE_REJECTED)) {
+                            session.transfer(rejected, REL_RESTORE_REJECTED);
+                        } else {
+                            session.transfer(FailureReason.tag(session, rejected, "the target rejected the DUMP payload"), REL_FAILURE);
+                        }
                     }
                 }
             }
@@ -310,7 +318,11 @@ public class RedisBatchWriter extends AbstractProcessor {
         session.commit();
     }
 
-    private static List<CommandBuilder.WriteOutcome> dispatchAndAwait(
+    /** A write's outcome, or a null outcome and why it failed. */
+    private record Written(CommandBuilder.WriteOutcome outcome, String error) {
+    }
+
+    private static List<Written> dispatchAndAwait(
             RedisClusterAsyncCommands<byte[], byte[]> cmds, StatefulConnection<byte[], byte[]> rawConn, List<PendingWrite> ready, String keyPrefix,
             String keyPrefixSeparator, CommandBuilder.TtlStrategy ttlStrategy, long ttlResetOffsetMs,
             CommandBuilder.ConflictStrategy conflictStrategy, int writeChunkSize, long batchTimeoutMs, ComponentLog logger) {
@@ -326,13 +338,12 @@ public class RedisBatchWriter extends AbstractProcessor {
             logger.warn("Batch of {} writes to Dragonfly did not all complete within {}ms: {}",
                     ready.size(), batchTimeoutMs, e.toString());
         }
-        List<CommandBuilder.WriteOutcome> outcomes = new ArrayList<>(futures.size());
+        List<Written> outcomes = new ArrayList<>(futures.size());
         for (int i = 0; i < futures.size(); i++) {
             CompletableFuture<CommandBuilder.WriteOutcome> future = futures.get(i);
             if (future.isDone() && !future.isCompletedExceptionally()) {
-                outcomes.add(future.join());
+                outcomes.add(new Written(future.join(), null));
             } else {
-                outcomes.add(null);
                 String key = ready.get(i).record.key;
                 if (future.isCompletedExceptionally()) {
                     Throwable cause = null;
@@ -342,8 +353,10 @@ public class RedisBatchWriter extends AbstractProcessor {
                         cause = e.getCause() != null ? e.getCause() : e;
                     }
                     logger.warn("Write failed for key {}", key, cause);
+                    outcomes.add(new Written(null, "writing to the target failed: " + FailureReason.describe(cause)));
                 } else {
                     logger.warn("Write for key {} did not complete within {}ms (still pending)", key, batchTimeoutMs);
+                    outcomes.add(new Written(null, "the write did not complete within " + batchTimeoutMs + " ms"));
                 }
             }
         }

@@ -2,12 +2,13 @@ package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService;
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
+import io.dragonfly.nifi.redis.util.FailureReason;
+import io.dragonfly.nifi.redis.util.Futures;
 import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.KeyRecord;
 import io.dragonfly.nifi.redis.util.RedisTypeSerializer;
 import io.dragonfly.nifi.redis.util.RedisValueFetcher;
 import io.dragonfly.nifi.redis.util.RestoreProbe;
-import io.lettuce.core.LettuceFutures;
 import io.lettuce.core.RedisFuture;
 import io.lettuce.core.ScoredValue;
 import io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands;
@@ -25,7 +26,6 @@ import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
 
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -308,7 +308,7 @@ public class RedisTypeDeserializer extends AbstractProcessor {
             List<RedisFuture<?>> all = new ArrayList<>(types.values());
             all.addAll(ttls.values());
             all.addAll(encodings.values());
-            awaitAllTolerantly(all.toArray(new RedisFuture[0]), batchTimeoutMs);
+            Futures.awaitAll(all.toArray(new RedisFuture[0]), batchTimeoutMs);
             return null;
         });
         List<FlowFile> resolved = new ArrayList<>(batch.size());
@@ -324,12 +324,12 @@ public class RedisTypeDeserializer extends AbstractProcessor {
                 ttlMs = ttls.get(flowFile).get();
             } catch (Exception e) {
                 getLogger().error("Failed to read TYPE/PTTL for key {}", flowFile.getAttribute("redis.key"), e);
-                session.transfer(session.penalize(flowFile), REL_FAILURE);
+                session.transfer(session.penalize(FailureReason.tag(session, flowFile, "TYPE or PTTL on the source failed", e)), REL_FAILURE);
                 continue;
             }
             if ("none".equals(type) || !typeFilter.allowsType(type)) {
                 if (!"none".equals(type)) {
-                    session.adjustCounter("Keys Skipped (Type Filter)", 1, false);
+                    session.adjustCounter("Keys Skipped by Type Filter (" + type + ")", 1, false);
                 }
                 String key = flowFile.getAttribute("redis.key");
                 FlowFile tombstone = session.write(session.putAttribute(flowFile, "redis.type", KeyRecord.DELETED),
@@ -371,7 +371,7 @@ public class RedisTypeDeserializer extends AbstractProcessor {
             for (Item item : items) {
                 f.put(item, cmds.dump(item.key().getBytes(StandardCharsets.UTF_8)));
             }
-            awaitAllTolerantly(f.values().toArray(new RedisFuture[0]), batchTimeoutMs);
+            Futures.awaitAll(f.values().toArray(new RedisFuture[0]), batchTimeoutMs);
             return f;
         });
 
@@ -386,7 +386,7 @@ public class RedisTypeDeserializer extends AbstractProcessor {
                 dumpPayload = future.get();
             } catch (Exception e) {
                 logger.error("Failed to DUMP key {}", item.key(), e);
-                session.transfer(session.penalize(item.flowFile()), REL_FAILURE);
+                session.transfer(session.penalize(FailureReason.tag(session, item.flowFile(), "DUMP on the source failed", e)), REL_FAILURE);
                 continue;
             }
 
@@ -416,7 +416,7 @@ public class RedisTypeDeserializer extends AbstractProcessor {
             for (Item item : items) {
                 f.put(item, dispatch(cmds, item));
             }
-            awaitAllTolerantly(f.values().toArray(new RedisFuture[0]), batchTimeoutMs);
+            Futures.awaitAll(f.values().toArray(new RedisFuture[0]), batchTimeoutMs);
             return f;
         });
         Map<Item, Map<String, Long>> fieldExpiries = readFieldExpiries(redisPool, items, futures, batchTimeoutMs, logger);
@@ -431,7 +431,7 @@ public class RedisTypeDeserializer extends AbstractProcessor {
                 raw = future.get();
             } catch (Exception e) {
                 logger.error("Failed to read value for key {}", item.key(), e);
-                session.transfer(session.penalize(item.flowFile()), REL_FAILURE);
+                session.transfer(session.penalize(FailureReason.tag(session, item.flowFile(), "reading the value from the source failed", e)), REL_FAILURE);
                 continue;
             }
 
@@ -440,7 +440,7 @@ public class RedisTypeDeserializer extends AbstractProcessor {
                 records = buildRecords(item, raw, hashFieldBatchSize, listChunkSize, fieldExpiries.getOrDefault(item, Map.of()));
             } catch (Exception e) {
                 logger.error("Failed to serialize value for key {}", item.key(), e);
-                session.transfer(session.penalize(item.flowFile()), REL_FAILURE);
+                session.transfer(session.penalize(FailureReason.tag(session, item.flowFile(), "serializing the value failed", e)), REL_FAILURE);
                 continue;
             }
 
@@ -498,7 +498,7 @@ public class RedisTypeDeserializer extends AbstractProcessor {
                     }
                 }
             }
-            awaitAllTolerantly(r.values().stream().flatMap(List::stream).map(Map.Entry::getValue).toArray(RedisFuture[]::new), batchTimeoutMs);
+            Futures.awaitAll(r.values().stream().flatMap(List::stream).map(Map.Entry::getValue).toArray(RedisFuture[]::new), batchTimeoutMs);
             return r;
         });
         Map<Item, Map<String, Long>> expiries = new HashMap<>();
@@ -543,7 +543,7 @@ public class RedisTypeDeserializer extends AbstractProcessor {
             });
         } catch (Exception e) {
             logger.error("Failed to read value for key {}", item.key(), e);
-            session.transfer(session.penalize(item.flowFile()), REL_FAILURE);
+            session.transfer(session.penalize(FailureReason.tag(session, item.flowFile(), "reading the value from the source failed", e)), REL_FAILURE);
             return;
         }
 
@@ -562,7 +562,7 @@ public class RedisTypeDeserializer extends AbstractProcessor {
                 child = session.write(child, out -> RedisTypeSerializer.writeJson(record, out));
             } catch (Exception e) {
                 getLogger().error("Failed to serialize value for key {}", key, e);
-                session.transfer(session.penalize(child), REL_FAILURE);
+                session.transfer(session.penalize(FailureReason.tag(session, child, "serializing the value failed", e)), REL_FAILURE);
                 continue;
             }
             if (chunks.size() > 1) {
@@ -574,17 +574,6 @@ public class RedisTypeDeserializer extends AbstractProcessor {
             session.transfer(child, REL_SUCCESS);
         }
         session.remove(original);
-    }
-
-    // LettuceFutures.awaitAll throws if any future completed exceptionally, which would
-    // otherwise abort this whole batch instead of letting each item's failure be routed
-    // individually below (same fix as RedisScanReader.awaitAllTolerantly).
-    private static void awaitAllTolerantly(RedisFuture<?>[] futures, long timeoutMs) {
-        try {
-            LettuceFutures.awaitAll(Duration.ofMillis(timeoutMs), futures);
-        } catch (Exception ignored) {
-            // resolved (and any failure handled) per-future below
-        }
     }
 
     private static long parseLong(String value, long defaultValue) {

@@ -2,9 +2,10 @@ package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService;
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
+import io.dragonfly.nifi.redis.util.FailureReason;
+import io.dragonfly.nifi.redis.util.Futures;
 import io.dragonfly.nifi.redis.util.ModuleCopy;
 import io.dragonfly.nifi.redis.util.RawModuleCommands;
-import io.lettuce.core.LettuceFutures;
 import io.lettuce.core.RedisFuture;
 import io.lettuce.core.RestoreArgs;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
@@ -21,11 +22,8 @@ import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
 
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -198,7 +196,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
             String moduleType = flowFile.getAttribute("redis.type");
             long ttlMs = parseLong(flowFile.getAttribute("redis.ttl.ms"), -1);
             if (key == null || moduleType == null) {
-                session.transfer(session.penalize(flowFile), REL_FAILURE);
+                session.transfer(session.penalize(FailureReason.tag(session, flowFile, "no redis.key or redis.type attribute")), REL_FAILURE);
                 continue;
             }
             byte[] sourceKey = key.getBytes(StandardCharsets.UTF_8);
@@ -225,8 +223,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
                     notCopied(context, session, item, ModuleCopy.notCopiedReason(item.flowFile.getAttribute("redis.type"),
                             error.substring(RESTORE_REJECTED.length())));
                 } else {
-                    FlowFile updated = session.putAttribute(item.flowFile, "redis.incompatible.reason", error);
-                    session.transfer(session.penalize(updated), REL_FAILURE);
+                    session.transfer(session.penalize(FailureReason.tag(session, item.flowFile, error)), REL_FAILURE);
                 }
             });
         }
@@ -258,7 +255,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
             for (Item item : items) {
                 futures.put(item, RawModuleCommands.jsonGet(conn, item.sourceKey));
             }
-            awaitAll(futures.values(), batchTimeoutMs);
+            Futures.awaitAll(futures.values(), batchTimeoutMs);
             return futures;
         });
 
@@ -281,7 +278,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
             for (Item item : toWrite) {
                 futures.put(item, RawModuleCommands.jsonSet(conn, item.targetKey, jsonByItem.get(item)));
             }
-            awaitAll(futures.values(), batchTimeoutMs);
+            Futures.awaitAll(futures.values(), batchTimeoutMs);
             return futures;
         });
 
@@ -319,7 +316,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
             for (Item item : items) {
                 futures.put(item, RawModuleCommands.topkInfo(conn, item.sourceKey));
             }
-            awaitAll(futures.values(), batchTimeoutMs);
+            Futures.awaitAll(futures.values(), batchTimeoutMs);
             return futures;
         });
         Map<Item, CompletableFuture<List<Map.Entry<String, Long>>>> listFutures = sourcePool.withRawConnection(conn -> {
@@ -327,7 +324,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
             for (Item item : items) {
                 futures.put(item, RawModuleCommands.topkListWithCount(conn, item.sourceKey));
             }
-            awaitAll(futures.values(), batchTimeoutMs);
+            Futures.awaitAll(futures.values(), batchTimeoutMs);
             return futures;
         });
 
@@ -368,7 +365,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
             }
             List<CompletableFuture<?>> allDispatched = new ArrayList<>(delFutures);
             allDispatched.addAll(futures.values());
-            awaitAll(allDispatched, batchTimeoutMs);
+            Futures.awaitAll(allDispatched, batchTimeoutMs);
             return futures;
         });
 
@@ -400,17 +397,16 @@ public class ModuleTypeHandler extends AbstractProcessor {
             for (IncrByBatch batch : incrByBatches) {
                 futures.put(batch, RawModuleCommands.topkIncrBy(conn, batch.item.targetKey, batch.pairs));
             }
-            awaitAll(futures.values(), batchTimeoutMs);
+            Futures.awaitAll(futures.values(), batchTimeoutMs);
             return futures;
         });
 
-        Set<Item> failedItems = new HashSet<>();
+        Map<Item, String> failedItems = new HashMap<>();
         for (IncrByBatch batch : incrByBatches) {
             CompletableFuture<String> future = incrByFutures.get(batch);
             if (future != null && future.isDone() && !future.isCompletedExceptionally()) {
                 continue;
             }
-            failedItems.add(batch.item);
             Throwable cause = null;
             if (future != null && future.isCompletedExceptionally()) {
                 try {
@@ -419,13 +415,14 @@ public class ModuleTypeHandler extends AbstractProcessor {
                     cause = e.getCause() != null ? e.getCause() : e;
                 }
             }
+            failedItems.put(batch.item, "TOPK.INCRBY on the target failed: " + (cause == null ? "did not complete in time" : FailureReason.describe(cause)));
             logger.warn("TOPK.INCRBY batch {} failed for key {}", batch.index, keyString(batch.item), cause);
         }
 
         List<Item> succeeded = new ArrayList<>();
         for (Item item : reserved) {
-            if (nonEmpty.contains(item) && failedItems.contains(item)) {
-                session.transfer(session.penalize(item.flowFile), REL_FAILURE);
+            if (nonEmpty.contains(item) && failedItems.containsKey(item)) {
+                session.transfer(session.penalize(FailureReason.tag(session, item.flowFile, failedItems.get(item))), REL_FAILURE);
                 continue;
             }
             succeeded.add(item);
@@ -481,7 +478,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
             for (Item item : items) {
                 futures.put(item, cmds.dump(item.sourceKey));
             }
-            awaitAll(futures.values().toArray(new RedisFuture[0]), batchTimeoutMs);
+            Futures.awaitAll(futures.values().toArray(new RedisFuture[0]), batchTimeoutMs);
             return futures;
         });
 
@@ -516,7 +513,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
                 RestoreArgs args = new RestoreArgs().replace().ttl(item.ttlMs > 0 ? item.ttlMs : 0);
                 futures.put(item, cmds.restore(item.targetKey, payloadByItem.get(item), args));
             }
-            awaitAll(futures.values().toArray(new RedisFuture[0]), batchTimeoutMs);
+            Futures.awaitAll(futures.values().toArray(new RedisFuture[0]), batchTimeoutMs);
             return futures;
         });
 
@@ -548,7 +545,7 @@ public class ModuleTypeHandler extends AbstractProcessor {
             for (Item item : withTtl) {
                 f.put(item, cmds.pexpire(item.targetKey, item.ttlMs));
             }
-            awaitAll(f.values().toArray(new RedisFuture[0]), batchTimeoutMs);
+            Futures.awaitAll(f.values().toArray(new RedisFuture[0]), batchTimeoutMs);
             return f;
         });
         for (Map.Entry<Item, RedisFuture<Boolean>> entry : futures.entrySet()) {
@@ -566,8 +563,10 @@ public class ModuleTypeHandler extends AbstractProcessor {
             return future.join();
         }
         String key = new String(item.sourceKey, StandardCharsets.UTF_8);
+        String reason;
         if (future == null) {
             logger.warn("{} produced no future for key {}", commandName, key);
+            reason = commandName + " was never sent";
         } else if (future.isCompletedExceptionally()) {
             Throwable cause = null;
             try {
@@ -576,31 +575,13 @@ public class ModuleTypeHandler extends AbstractProcessor {
                 cause = e.getCause() != null ? e.getCause() : e;
             }
             logger.warn("{} failed for key {}", commandName, key, cause);
+            reason = commandName + " failed: " + FailureReason.describe(cause);
         } else {
             logger.warn("{} did not complete in time for key {}", commandName, key);
+            reason = commandName + " did not complete in time";
         }
-        session.transfer(session.penalize(item.flowFile), REL_FAILURE);
+        session.transfer(session.penalize(FailureReason.tag(session, item.flowFile, reason)), REL_FAILURE);
         return null;
-    }
-
-    private static void awaitAll(Collection<? extends CompletableFuture<?>> futures, long timeoutMs) {
-        try {
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(timeoutMs, TimeUnit.MILLISECONDS);
-        } catch (Exception e) {
-            // At least one future in this pipeline failed or timed out - which one(s) is
-            // resolved per-future by the caller via resolveOrLogFailure, not here.
-        }
-    }
-
-    // LettuceFutures.awaitAll (unlike CompletableFuture.allOf(...).get above) throws if any
-    // future completed exceptionally, which would otherwise abort the whole DUMP/RESTORE/TTL
-    // batch instead of letting each item's failure be handled individually by its caller.
-    private static void awaitAll(RedisFuture<?>[] futures, long timeoutMs) {
-        try {
-            LettuceFutures.awaitAll(Duration.ofMillis(timeoutMs), futures);
-        } catch (Exception ignored) {
-            // resolved (and any failure handled) per-future below
-        }
     }
 
     private static long parseLong(String value, long defaultValue) {

@@ -85,12 +85,17 @@ class MigrationReconcilerIT {
         s.xgroupCreate(XReadArgs.StreamOffset.from("stream:1", "0"), "g", XGroupCreateArgs.Builder.mkstream(false));
         s.xreadgroup(Consumer.from("g", "c"), XReadArgs.StreamOffset.lastConsumed("stream:1"));
 
+        long startedAt = System.currentTimeMillis() / 1000;
         Pipeline pipeline = new Pipeline("FULL");
         JsonNode first = pipeline.pass();
         assertEquals(405, first.get("keys_checked").asLong());
         assertEquals(Map.of("missing_on_target", 405L), counts(first), "an empty target is one repair per key");
         assertTargetMatchesSource();
+        assertEquals(405L, pipeline.reconciler.getCounterValue("Reconcile Last Pass Differences"));
+        assertEquals(null, pipeline.reconciler.getCounterValue("Reconcile Last Clean Full Pass Started (epoch seconds)"));
         assertEquals(0, pipeline.pass().get("differences").asLong(), "a pass after the repair is clean");
+        assertEquals(0L, pipeline.reconciler.getCounterValue("Reconcile Last Pass Differences"));
+        assertTrue(pipeline.reconciler.getCounterValue("Reconcile Last Clean Full Pass Started (epoch seconds)") >= startedAt);
 
         // Drift no change stream reports: source writes made while no Live Phase was listening, and
         // writes made straight to the target.
@@ -154,6 +159,40 @@ class MigrationReconcilerIT {
         assertEquals(0L, tgt.sync().dbsize());
     }
 
+    /** Rollback after cutover: Dragonfly is now the source and the old Redis the target. */
+    @Test
+    void reverseSyncCopiesDragonflyBackToRedis() throws Exception {
+        RedisCommands<String, String> d = tgt.sync();
+        RedisCommands<String, String> r = src.sync();
+        for (int i = 0; i < 100; i++) {
+            d.set("str:" + i, "v" + i);
+        }
+        d.hset("hash:1", Map.of("f", "v", "g", "w"));
+        d.rpush("list:1", "a", "b", "c");
+        d.sadd("set:1", "a", "b");
+        d.zadd("zset:1", 1.5, "a");
+        d.set("ttl:1", "x", SetArgs.Builder.ex(3600));
+        d.xadd("stream:1", Map.of("n", "1"));
+        d.xgroupCreate(XReadArgs.StreamOffset.from("stream:1", "0"), "g", XGroupCreateArgs.Builder.mkstream(false));
+        d.xreadgroup(Consumer.from("g", "c"), XReadArgs.StreamOffset.lastConsumed("stream:1"));
+        r.set("str:0", "written to Redis before the rollback");
+        r.set("gone:1", "deleted on Dragonfly after cutover");
+
+        Pipeline reverse = new Pipeline("FULL", dragonfly, redis);
+        reverse.pass();
+        assertMatches(d, r);
+        assertEquals(1L, r.xpending("stream:1", "g").getCount(), "the consumer group's pending entry came back too");
+
+        d.set("str:1", "x1");
+        d.del("str:2");
+        d.hset("hash:1", "h", "x");
+        d.set("str:new", "created after cutover");
+        JsonNode changes = reverse.pass();
+        assertEquals(Map.of("value", 1L, "size", 1L, "missing_on_target", 1L, "extra_on_target", 1L), counts(changes));
+        assertMatches(d, r);
+        assertEquals(0, reverse.pass().get("differences").asLong());
+    }
+
     private static Map<String, Long> counts(JsonNode report) {
         Map<String, Long> counts = new TreeMap<>();
         report.get("differences_by_reason").fields().forEachRemaining(e -> counts.put(e.getKey(), e.getValue().asLong()));
@@ -161,8 +200,10 @@ class MigrationReconcilerIT {
     }
 
     private void assertTargetMatchesSource() {
-        RedisCommands<String, String> s = src.sync();
-        RedisCommands<String, String> t = tgt.sync();
+        assertMatches(src.sync(), tgt.sync());
+    }
+
+    private static void assertMatches(RedisCommands<String, String> s, RedisCommands<String, String> t) {
         List<String> keys = s.keys("*").stream().sorted().toList();
         assertEquals(keys, t.keys("*").stream().sorted().toList());
         for (String key : keys) {
@@ -192,10 +233,14 @@ class MigrationReconcilerIT {
         private boolean started;
 
         Pipeline(String mode) throws Exception {
+            this(mode, redis, dragonfly);
+        }
+
+        Pipeline(String mode, GenericContainer<?> from, GenericContainer<?> to) throws Exception {
             reconciler = TestRunners.newTestRunner(MigrationReconciler.class);
             reconciler.setAllowSynchronousSessionCommits(true);
-            addPool(reconciler, "source-pool", new StandardRedisConnectionPoolService(), redis);
-            addPool(reconciler, "target-pool", new StandardDragonflyConnectionPoolService(), dragonfly);
+            addPool(reconciler, "source-pool", new StandardRedisConnectionPoolService(), from);
+            addPool(reconciler, "target-pool", new StandardDragonflyConnectionPoolService(), to);
             reconciler.setProperty(MigrationReconciler.SOURCE_CONNECTION_POOL, "source-pool");
             reconciler.setProperty(MigrationReconciler.TARGET_CONNECTION_POOL, "target-pool");
             reconciler.setProperty(MigrationReconciler.MODE, mode);
@@ -204,11 +249,14 @@ class MigrationReconcilerIT {
             reconciler.setProperty(MigrationReconciler.PASS_INTERVAL_MS, "1");
             deserializer = TestRunners.newTestRunner(RedisTypeDeserializer.class);
             deserializer.setAllowSynchronousSessionCommits(true);
-            addPool(deserializer, "source-pool", new StandardRedisConnectionPoolService(), redis);
+            addPool(deserializer, "source-pool", new StandardRedisConnectionPoolService(), from);
+            addPool(deserializer, "probe-pool", new StandardDragonflyConnectionPoolService(), to);
             deserializer.setProperty(RedisTypeDeserializer.REDIS_CONNECTION_POOL, "source-pool");
+            deserializer.setProperty(RedisTypeDeserializer.RESTORE_PROBE_TARGET, "probe-pool");
+            deserializer.setProperty(RedisTypeDeserializer.INCLUDE_CONSUMER_GROUPS, "true");
             writer = TestRunners.newTestRunner(RedisBatchWriter.class);
             writer.setAllowSynchronousSessionCommits(true);
-            addPool(writer, "target-pool", new StandardDragonflyConnectionPoolService(), dragonfly);
+            addPool(writer, "target-pool", new StandardDragonflyConnectionPoolService(), to);
             writer.setProperty(RedisBatchWriter.DRAGONFLY_CONNECTION_POOL, "target-pool");
         }
 

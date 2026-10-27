@@ -3,6 +3,7 @@ package io.dragonfly.nifi.redis.processors;
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.dragonfly.nifi.redis.services.RedisPubSubHandle;
 import io.dragonfly.nifi.redis.util.ClusterTopologySnapshot;
+import io.dragonfly.nifi.redis.util.FailureReason;
 import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.TopologyDiff;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
@@ -386,6 +387,7 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
         if (parsed == null) {
             FlowFile flowFile = session.create();
             flowFile = session.putAttribute(flowFile, "redis.event.channel", event.channel());
+            flowFile = FailureReason.tag(session, flowFile, "not a keyspace event channel this consumer can parse");
             session.transfer(flowFile, REL_FAILURE);
             return;
         }

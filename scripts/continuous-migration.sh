@@ -43,7 +43,8 @@ Required:
 
 Live Phase options:
   --reconcile-mode MODE          SAMPLE (default) or FULL, MigrationReconciler's standing check (env
-                                 RECONCILE_MODE). A DBSIZE drop always starts a FULL pass.
+                                 RECONCILE_MODE; FULL is the default with --live-source reconcile).
+                                 A DBSIZE drop always starts a FULL pass.
   --reconcile-interval-ms N      time between reconcile passes (env RECONCILE_INTERVAL_MS, default: 600000)
   --reconcile-sample-size N      keys drawn from each side per SAMPLE pass (env RECONCILE_SAMPLE_SIZE,
                                  default: 1000)
@@ -53,6 +54,11 @@ Live Phase options:
                                  notification, resumes after a restart with a partial resync, and
                                  takes its own snapshot instead of RedisScanReader. The source must
                                  accept PSYNC from NiFi (managed services often block it).
+                                 reconcile has no change stream: each reconcile pass copies what
+                                 differs, so changes land within one --reconcile-interval-ms. It is
+                                 the rollback path after cutover, with Dragonfly as the source and
+                                 the old Redis as the target (Dragonfly publishes only expiry
+                                 notifications and does not serve PSYNC). See cutover.sh --help.
   --keyspace-pattern P           pub/sub channel pattern the keyspace-event consumer subscribes
                                  to (env KEYSPACE_PATTERN, default: the processor's own default,
                                  __keyevent@*__:*, which covers every database on the source).
@@ -230,13 +236,12 @@ Optional:
   -h, --help                    this help
 
 LIMITATIONS - read these before planning a cutover around continuous mode:
-  1. Continuous mode captures ongoing changes but does not yet self-heal a dropped connection's
-     gap. If the keyspace pub/sub connection drops, events during the outage are lost; the
-     consumer records "Keyspace Pub/Sub Disconnects" and "Keyspace Pub/Sub Downtime (ms)"
-     counters so the gap is visible, but nothing repairs it. The reconciliation/repair pass
-     this would depend on is not built.
+  1. If the keyspace pub/sub connection drops, events during the outage are lost; the consumer
+     records "Keyspace Pub/Sub Disconnects" and "Keyspace Pub/Sub Downtime (ms)". Only
+     MigrationReconciler repairs that gap: a SAMPLE pass finds part of it each time, a FULL pass
+     all of it. cutover.sh ends with a clean FULL pass before it calls a cutover safe.
   2. If the consumer's internal queue fills (--max-queue-depth), events are dropped and counted
-     as "Keyspace Events Dropped (Queue Full)". Also not repaired.
+     as "Keyspace Events Dropped (Queue Full)", and repaired the same way.
   3. During the initial snapshot the Live Phase and the scanner both write to the target. The
      live path fetches the key's CURRENT value, so a live update can be overwritten by the
      scanner's older in-flight batch for the same key. That key stays stale until it changes
@@ -313,7 +318,7 @@ MAX_QUEUE_DEPTH="${MAX_QUEUE_DEPTH:-}"
 SKIP_KEYSPACE_CHECK="${SKIP_KEYSPACE_CHECK:-false}"
 REQUIRE_CONFIG_CHECK="${REQUIRE_CONFIG_CHECK:-false}"
 LIVE_SOURCE="${LIVE_SOURCE:-keyspace}"
-RECONCILE_MODE="${RECONCILE_MODE:-SAMPLE}"
+RECONCILE_MODE="${RECONCILE_MODE:-}"
 RECONCILE_INTERVAL_MS="${RECONCILE_INTERVAL_MS:-600000}"
 RECONCILE_SAMPLE_SIZE="${RECONCILE_SAMPLE_SIZE:-1000}"
 RECONCILIATION_SIGNALS="${RECONCILIATION_SIGNALS:-false}"
@@ -565,6 +570,10 @@ if ! [[ "$WRITER_CONCURRENCY" =~ ^[0-9]+$ ]] || [[ "$WRITER_CONCURRENCY" -lt 1 ]
   echo "error: --writer-concurrency must be a positive integer (got '$WRITER_CONCURRENCY')" >&2
   usage; exit 1
 fi
+# A sample can miss a change, and with --live-source reconcile the passes are the only change source.
+if [[ -z "$RECONCILE_MODE" ]]; then
+  if [[ "$LIVE_SOURCE" == "reconcile" ]]; then RECONCILE_MODE="FULL"; else RECONCILE_MODE="SAMPLE"; fi
+fi
 if [[ "$SOURCE_READ_FROM" != "master" ]]; then
   echo "error: --source-read-from $SOURCE_READ_FROM is not allowed with a Live Phase: a replica lags its master, so" >&2
   echo "       a key re-read after a change can come back with the value from before it. Use simple-migration.sh" >&2
@@ -722,11 +731,11 @@ echo "  source currently has $SOURCE_DBSIZE_START keys"
 echo "  target currently has $TARGET_DBSIZE_START keys"
 
 case "$LIVE_SOURCE" in
-  keyspace|replication) ;;
-  *) echo "error: --live-source must be keyspace or replication (got '$LIVE_SOURCE')" >&2; exit 1 ;;
+  keyspace|replication|reconcile) ;;
+  *) echo "error: --live-source must be keyspace, replication or reconcile (got '$LIVE_SOURCE')" >&2; exit 1 ;;
 esac
-if [[ "$LIVE_SOURCE" == "replication" ]]; then
-  echo "  live source: replication (PSYNC) - keyspace notifications are not needed"
+if [[ "$LIVE_SOURCE" != "keyspace" ]]; then
+  echo "  live source: $LIVE_SOURCE - keyspace notifications are not needed"
 elif [[ "$SKIP_KEYSPACE_CHECK" != "true" ]]; then
   KEYSPACE_CHECK_RC=0
   KEYSPACE_EVENTS_VALUE="$(redis_lib_check_keyspace_events "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")" || KEYSPACE_CHECK_RC=$?
@@ -1087,7 +1096,7 @@ BUILD_LIVE_ARGS=(--live-source "$LIVE_SOURCE")
 # re-parsing the same JSON) - each py3 call is a container exec via the toolbox, not free.
 # Pre-seeding every name to '' keeps the '|'-joined field count constant, so the read below
 # always lands each id in the right variable even when one processor is missing.
-if [[ "$LIVE_SOURCE" == "keyspace" ]]; then
+if [[ "$LIVE_SOURCE" != "replication" ]]; then
 LIVE_PROC_LIST_JSON="$(nifi_api_get "process-groups/$PG_ID/processors")" || true
 LIVE_PROC_IDS="$(echo "$LIVE_PROC_LIST_JSON" | py3 "
 import json, sys
@@ -1103,7 +1112,7 @@ for p in d['processors']:
 print('|'.join(ids[name] for name in order))
 ")" || true
 IFS='|' read -r PROC_KEYSPACE PROC_FETCH PROC_DELETE <<< "$LIVE_PROC_IDS"
-if [[ -z "$PROC_KEYSPACE" ]]; then
+if [[ -z "$PROC_KEYSPACE" && "$LIVE_SOURCE" == "keyspace" ]]; then
   echo "error: could not find the RedisKeyspaceEventConsumer processor in $PG_ID - build-live-phase-flow.sh should have created it" >&2; exit 1
 fi
 if [[ -z "$PROC_FETCH" ]]; then
@@ -1112,7 +1121,8 @@ fi
 if [[ -z "$PROC_DELETE" ]]; then
   echo "error: could not find the DeleteRedisKey processor in $PG_ID - build-live-phase-flow.sh should have created it" >&2; exit 1
 fi
-LIVE_PROCS_DOWNSTREAM_FIRST=("$PROC_DELETE:DeleteRedisKey" "$PROC_FETCH:RedisSingleKeyFetch" "$PROC_KEYSPACE:RedisKeyspaceEventConsumer")
+LIVE_PROCS_DOWNSTREAM_FIRST=("$PROC_DELETE:DeleteRedisKey" "$PROC_FETCH:RedisSingleKeyFetch")
+[[ "$LIVE_SOURCE" == "keyspace" ]] && LIVE_PROCS_DOWNSTREAM_FIRST+=("$PROC_KEYSPACE:RedisKeyspaceEventConsumer")
 else
 REPL_PROC_IDS="$(nifi_api_get "process-groups/$PG_ID/processors" | py3 "
 import json, sys
@@ -1352,24 +1362,23 @@ echo "  source keys: $SOURCE_DBSIZE_END"
 echo "  target keys: $TARGET_DBSIZE_END (was $TARGET_DBSIZE_START before this run)"
 echo "  keys migrated this run: $MIGRATED"
 # RedisDeadLetterWriter keeps one record per key it could not copy (a time series, a Bloom filter
-# from Redis, ...), each with redis.incompatible.reason.
+# from Redis, a write that kept failing, ...), each with its reason.
 DEAD_LETTERS="$(runtime_exec "$NIFI_CONTAINER_NAME" sh -c 'ls /opt/nifi/nifi-current/r2dfly-dead-letter 2>/dev/null | wc -l' | tr -d '[:space:]')" || true
 if [[ "${DEAD_LETTERS:-0}" -gt 0 ]]; then
-  echo "  keys NOT copied (no copy path to this Dragonfly): $DEAD_LETTERS - one JSON record each, with the reason, in"
+  echo "  keys NOT copied: $DEAD_LETTERS - one JSON record each, with the reason, in"
   echo "    $NIFI_CONTAINER_NAME:/opt/nifi/nifi-current/r2dfly-dead-letter"
 fi
 echo "  the initial snapshot is complete, and the Live Phase is still running."
 echo "  NiFi keeps running unsupervised after this script exits, and the Live Phase keeps applying"
 echo "  source changes to the target until it is stopped."
 echo
-echo "  LIMITATIONS - these are real, and none of them are repaired automatically:"
-echo "    1. Continuous mode captures ongoing changes but does not yet self-heal a dropped"
-echo "       connection's gap. If the keyspace pub/sub connection drops, events during the outage"
-echo "       are lost; the consumer records 'Keyspace Pub/Sub Disconnects' and 'Keyspace Pub/Sub"
-echo "       Downtime (ms)' counters so the gap is visible, but nothing repairs it. The"
-echo "       reconciliation/repair pass this would depend on is not built."
+echo "  LIMITATIONS - these are real:"
+echo "    1. If the keyspace pub/sub connection drops, events during the outage are lost; the"
+echo "       consumer records 'Keyspace Pub/Sub Disconnects' and 'Keyspace Pub/Sub Downtime (ms)'."
+echo "       Only MigrationReconciler repairs that gap: a SAMPLE pass finds part of it each time, a"
+echo "       FULL pass all of it. cutover.sh ends with a clean FULL pass before it calls a cutover safe."
 echo "    2. If the consumer's internal queue fills (--max-queue-depth), events are dropped and"
-echo "       counted as 'Keyspace Events Dropped (Queue Full)'. Also not repaired."
+echo "       counted as 'Keyspace Events Dropped (Queue Full)', and repaired the same way."
 echo "    3. During the initial snapshot the Live Phase and the scanner both write to the target."
 echo "       The live path fetches the key's CURRENT value, so a live update can be overwritten by"
 echo "       the scanner's older in-flight batch for the same key. That key stays stale until it"

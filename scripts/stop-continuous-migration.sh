@@ -21,8 +21,8 @@ NiFi connection/auth:
   --nifi-token TOKEN           use an existing bearer token instead of user/password (env NIFI_TOKEN)
   -h, --help                   this help
 
-Stops only the three Live Phase processors. A snapshot migration running in the same process
-group is left alone, and the flow's other processors keep running.
+Stops only the Live Phase processors, MigrationReconciler included. A snapshot migration
+running in the same process group is left alone, and the flow's other processors keep running.
 
 Example:
   NIFI_USER=... NIFI_PASS=... $(basename "$0")
@@ -81,18 +81,23 @@ echo "found process group: $PG_ID"
 PROC_IDS="$(nifi_api_get "process-groups/$PG_ID/processors" | py3 "
 import json, sys
 d = json.load(sys.stdin)
-order = ['RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'DeleteRedisKey']
+order = ['RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'DeleteRedisKey', 'RedisReplicationReader',
+         'MigrationReconciler', 'RedisTypeDeserializer (live)']
 ids = {name: '' for name in order}
 for p in d['processors']:
     t = p['component']['type']
+    if t.endswith('RedisTypeDeserializer'):
+        if p['component']['name'] == 'RedisTypeDeserializer (live)':
+            ids['RedisTypeDeserializer (live)'] = p['component']['id']
+        continue
     for name in order:
         if not ids[name] and t.endswith(name):
             ids[name] = p['component']['id']
             break
 print('|'.join(ids[name] for name in order))
 ")" || true
-IFS='|' read -r PROC_CONSUMER PROC_FETCH PROC_DELETE <<< "$PROC_IDS"
-if [[ -z "$PROC_CONSUMER" && -z "$PROC_FETCH" && -z "$PROC_DELETE" ]]; then
+IFS='|' read -r PROC_CONSUMER PROC_FETCH PROC_DELETE PROC_READER PROC_RECONCILER PROC_LIVE_DESER <<< "$PROC_IDS"
+if [[ -z "$PROC_CONSUMER$PROC_FETCH$PROC_DELETE$PROC_READER$PROC_RECONCILER$PROC_LIVE_DESER" ]]; then
   echo "==> this flow has no Live Phase - there is nothing to stop."
   echo "    (a continuous migration wires RedisKeyspaceEventConsumer, RedisSingleKeyFetch and DeleteRedisKey into the group)"
   exit 0
@@ -119,7 +124,8 @@ except Exception:
     d = {}
 for c in d.get('counters', {}).get('aggregateSnapshot', {}).get('counters', []):
     name = c.get('name')
-    if name in totals:
+    # NiFi lists each counter twice: per processor, and again under \"All <type>'s\".
+    if name in totals and not c.get('context', '').startswith('All '):
         totals[name] += int(c.get('valueCount') or 0)
 for n in names:
     print(f'{n}|{totals[n]}')
@@ -149,10 +155,12 @@ fi
 echo "  processor run status:"
 nifi_api_get "process-groups/$PG_ID/processors" | py3 "
 import json, sys
-targets = ['RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'DeleteRedisKey']
+targets = ['RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'DeleteRedisKey', 'RedisReplicationReader', 'MigrationReconciler']
 d = json.load(sys.stdin)
 for p in d['processors']:
     c = p['component']
+    if c['name'] == 'RedisTypeDeserializer (live)':
+        print(f\"    {c['name']}: {p.get('status', {}).get('runStatus', 'unknown')}\")
     for name in targets:
         if c['type'].endswith(name):
             print(f\"    {name}: {p.get('status', {}).get('runStatus', 'unknown')}\")
@@ -163,7 +171,7 @@ for p in d['processors']:
 echo "  live queue depth:"
 nifi_api_get "flow/process-groups/$PG_ID/status?recursive=true" | py3 "
 import json, sys
-sources = {'RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch'}
+sources = {'RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'RedisReplicationReader', 'MigrationReconciler', 'RedisTypeDeserializer (live)'}
 d = json.load(sys.stdin)
 snaps = d['processGroupStatus']['aggregateSnapshot'].get('connectionStatusSnapshots', [])
 printed = False
@@ -214,13 +222,17 @@ echo
 echo "=================================================="
 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Stopping the Live Phase"
 echo "=================================================="
-# Only these three, never pg-stop: a snapshot migration may still be running in the same process
-# group, and stopping the whole group would abort it mid-scan. Source first so the chain drains -
-# once the consumer stops emitting, whatever is already queued still gets fetched and written.
+# Only the Live Phase, never pg-stop: a snapshot migration may still be running in the same process
+# group, and stopping the whole group would abort it mid-scan. Sources first so the chain drains -
+# once they stop emitting, whatever is already queued still gets fetched and written. The
+# reconciler stops too: after a cutover it would copy the old source's values back over the
+# application's new writes, and delete the keys created since.
 STOP_RC=0
-stop_one "$PROC_CONSUMER" "RedisKeyspaceEventConsumer" || STOP_RC=1
-stop_one "$PROC_FETCH" "RedisSingleKeyFetch" || STOP_RC=1
-stop_one "$PROC_DELETE" "DeleteRedisKey" || STOP_RC=1
+for live in "$PROC_READER:RedisReplicationReader" "$PROC_RECONCILER:MigrationReconciler" \
+            "$PROC_CONSUMER:RedisKeyspaceEventConsumer" "$PROC_FETCH:RedisSingleKeyFetch" \
+            "$PROC_LIVE_DESER:RedisTypeDeserializer (live)" "$PROC_DELETE:DeleteRedisKey"; do
+  stop_one "${live%%:*}" "${live#*:}" || STOP_RC=1
+done
 
 echo
 echo "=================================================="
@@ -252,8 +264,8 @@ fi
 echo
 echo "The Live Phase is stopped. Source changes are no longer being applied to the target."
 echo "A non-zero 'Keyspace Pub/Sub Disconnects' or 'Keyspace Events Dropped (Queue Full)' count above means"
-echo "source changes were missed during this run, and nothing repaired them - the target is missing those"
-echo "updates until the same keys change again. There is no reconciliation pass yet."
+echo "source changes were missed during this run. MigrationReconciler repairs them only while it runs, so"
+echo "before a cutover use cutover.sh, which ends with a clean full reconcile pass, instead of stopping here."
 echo
 echo "Run simple-troubleshoot.sh or diagnose-r2dfly.sh if the flow looks wrong."
 

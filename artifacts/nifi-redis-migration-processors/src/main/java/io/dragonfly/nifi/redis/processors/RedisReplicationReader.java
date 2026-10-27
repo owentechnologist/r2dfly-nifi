@@ -3,6 +3,7 @@ package io.dragonfly.nifi.redis.processors;
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.dragonfly.nifi.redis.services.ReplicationEndpoint;
 import io.dragonfly.nifi.redis.util.CommandKeyTable;
+import io.dragonfly.nifi.redis.util.CounterGauge;
 import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.ReplicationStream;
 import io.lettuce.core.KeyScanCursor;
@@ -40,7 +41,10 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Follows the source as a replica (PSYNC) and emits the keys that change, so nothing written to the
@@ -143,8 +147,11 @@ public class RedisReplicationReader extends AbstractProcessor {
     private final AtomicLong otherDbCommands = new AtomicLong();
     private final AtomicLong unknownKeyCommands = new AtomicLong();
 
+    private static final Pattern MASTER_REPL_OFFSET = Pattern.compile("(?m)^master_repl_offset:(\\d+)");
+
     /** Null while stopped. */
     private volatile Run run;
+    private final CounterGauge gauges = new CounterGauge();
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
@@ -200,6 +207,7 @@ public class RedisReplicationReader extends AbstractProcessor {
             return;
         }
         Dirty dirty = current.dirty;
+        reportLag(context, session, current);
         for (Map<String, String> flush : dirty.takeFlushes()) {
             session.transfer(session.putAllAttributes(session.create(), flush), REL_FLUSH);
         }
@@ -394,6 +402,53 @@ public class RedisReplicationReader extends AbstractProcessor {
         });
     }
 
+    /**
+     * How far the flow is behind the source, at most once a second: the bytes of the source's
+     * replication stream not yet read, the keys read but not yet emitted, the seconds since both
+     * were last zero (or since this schedule started, if they never were), and whether they are
+     * zero now with the snapshot finished.
+     */
+    private void reportLag(ProcessContext context, ProcessSession session, Run current) {
+        long now = System.currentTimeMillis();
+        if (now - current.lagCheckedAtMs < 1000) {
+            return;
+        }
+        current.lagCheckedAtMs = now;
+        RedisConnectionPoolService pool = context.getProperty(REDIS_CONNECTION_POOL).asControllerService(RedisConnectionPoolService.class);
+        long masterOffset;
+        try {
+            Matcher m = MASTER_REPL_OFFSET.matcher(pool.withConnection(cmds -> {
+                try {
+                    return cmds.info("replication").get(5, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    throw new ProcessException(e);
+                }
+            }));
+            if (!m.find()) {
+                gauges.set(session, "Replication Caught Up", 0);
+                return;
+            }
+            masterOffset = Long.parseLong(m.group(1));
+        } catch (RuntimeException e) {
+            getLogger().debug("Could not read the source's replication offset", e);
+            gauges.set(session, "Replication Caught Up", 0);
+            return;
+        }
+        // Read after INFO answered, so an offset that has reached the master's is caught up.
+        Progress progress = current.dirty.progress();
+        boolean streaming = progress.offset() >= 0;
+        long lagBytes = streaming ? Math.max(0, masterOffset - progress.offset()) : masterOffset;
+        boolean caughtUp = streaming && lagBytes == 0 && progress.pendingKeys() == 0 && progress.snapshotDone();
+        if (caughtUp) {
+            current.caughtUpAtMs = now;
+        }
+        // A zero gauge reads the same as one never reported, so being caught up is its own flag.
+        gauges.set(session, "Replication Caught Up", caughtUp ? 1 : 0);
+        gauges.set(session, "Replication Lag (bytes)", lagBytes);
+        gauges.set(session, "Replication Lag (seconds)", (now - current.caughtUpAtMs) / 1000);
+        gauges.set(session, "Replication Pending Keys", progress.pendingKeys());
+    }
+
     private void reportCounters(ProcessSession session) {
         drain(session, "Replication Full Resyncs", fullResyncs);
         drain(session, "Replication Partial Resyncs", partialResyncs);
@@ -418,6 +473,8 @@ public class RedisReplicationReader extends AbstractProcessor {
     private static final class Run {
         final Dirty dirty = new Dirty();
         volatile boolean running = true;
+        volatile long lagCheckedAtMs;
+        volatile long caughtUpAtMs = System.currentTimeMillis();
         volatile Thread replicationThread;
         volatile Thread snapshotThread;
         private volatile Closeable connection;
@@ -455,6 +512,9 @@ public class RedisReplicationReader extends AbstractProcessor {
                 }
             }
         }
+    }
+
+    record Progress(long offset, int pendingKeys, boolean snapshotDone) {
     }
 
     record Checkpoint(String replId, long offset, int db) {
@@ -540,6 +600,10 @@ public class RedisReplicationReader extends AbstractProcessor {
 
         synchronized int size() {
             return pending.size() + draining.size();
+        }
+
+        synchronized Progress progress() {
+            return new Progress(pendingOffset, size(), snapshotDone);
         }
 
         synchronized List<Map<String, String>> takeFlushes() {

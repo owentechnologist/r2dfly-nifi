@@ -1,6 +1,7 @@
 package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService;
+import io.dragonfly.nifi.redis.util.FailureReason;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.components.PropertyDescriptor;
@@ -55,7 +56,7 @@ public class DeleteRedisKey extends AbstractProcessor {
         String key = flowFile.getAttribute("redis.key");
         if (key == null || key.isEmpty()) {
             getLogger().error("FlowFile is missing the redis.key attribute");
-            session.transfer(session.penalize(flowFile), REL_FAILURE);
+            session.transfer(session.penalize(FailureReason.tag(session, flowFile, "no redis.key attribute")), REL_FAILURE);
             return;
         }
 
@@ -75,7 +76,7 @@ public class DeleteRedisKey extends AbstractProcessor {
             session.transfer(flowFile, REL_SUCCESS);
         } catch (Exception e) {
             getLogger().error("Failed to delete key {}", key, e);
-            session.transfer(session.penalize(flowFile), REL_FAILURE);
+            session.transfer(session.penalize(FailureReason.tag(session, flowFile, "DEL on the target failed", e)), REL_FAILURE);
         }
     }
 }

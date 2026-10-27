@@ -72,8 +72,7 @@
         "runDurationMillis": 0,
         "concurrentlySchedulableTaskCount": 1,
         "autoTerminatedRelationships": [
-          "success",
-          "failure"
+          "success"
         ],
         "scheduledState": "ENABLED",
         "retryCount": 10,
@@ -199,9 +198,7 @@
         "bulletinLevel": "WARN",
         "runDurationMillis": 0,
         "concurrentlySchedulableTaskCount": 1,
-        "autoTerminatedRelationships": [
-          "failure"
-        ],
+        "autoTerminatedRelationships": [],
         "scheduledState": "ENABLED",
         "retryCount": 10,
         "retriedRelationships": [],
@@ -287,9 +284,7 @@
         "runDurationMillis": 0,
         "concurrentlySchedulableTaskCount": 1,
         "autoTerminatedRelationships": [
-          "key_missing",
-          "module_type",
-          "failure"
+          "key_missing"
         ],
         "scheduledState": "ENABLED",
         "retryCount": 10,
@@ -409,7 +404,6 @@
         "concurrentlySchedulableTaskCount": 1,
         "autoTerminatedRelationships": [
           "success",
-          "failure",
           "skipped"
         ],
         "scheduledState": "ENABLED",
@@ -806,6 +800,7 @@
         "labelIndex": 1,
         "zIndex": 0,
         "selectedRelationships": [
+          "failure",
           "unsupported"
         ],
         "backPressureObjectThreshold": 10000,
@@ -828,6 +823,142 @@
           "name": "RedisDeadLetterWriter",
           "comments": "",
           "instanceIdentifier": "8ba48698-6d77-4131-996f-9b5817a0efd3"
+        },
+        "destination": {
+          "id": "67873273-4d2b-40c7-9b46-ca833588c86f",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisDeadLetterWriter",
+          "comments": "",
+          "instanceIdentifier": "8ba48698-6d77-4131-996f-9b5817a0efd3"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "failure"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "e7ede37a-5cc0-5521-836a-f1694ce6750e",
+        "instanceIdentifier": "6a22df45-ce91-5841-a196-4a46684a43ed",
+        "source": {
+          "id": "40f9a69b-858c-37d2-8a3b-9e2e472aafde",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisScanReader",
+          "comments": "",
+          "instanceIdentifier": "29dbf585-d920-33bf-b02b-0373492af3f6"
+        },
+        "destination": {
+          "id": "67873273-4d2b-40c7-9b46-ca833588c86f",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisDeadLetterWriter",
+          "comments": "",
+          "instanceIdentifier": "8ba48698-6d77-4131-996f-9b5817a0efd3"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "failure"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "b2471f86-0bb5-5e52-be3b-7b1e5a15f66d",
+        "instanceIdentifier": "0d8d8dd1-1f6a-5d7b-b604-376c3866a070",
+        "source": {
+          "id": "3d1e8a19-d603-3d5d-bd8a-daf2f4edcc70",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisTypeDeserializer",
+          "comments": "",
+          "instanceIdentifier": "7a782c41-8c7b-3e63-e3d2-6f387456cdd2"
+        },
+        "destination": {
+          "id": "67873273-4d2b-40c7-9b46-ca833588c86f",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisDeadLetterWriter",
+          "comments": "",
+          "instanceIdentifier": "8ba48698-6d77-4131-996f-9b5817a0efd3"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "failure"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "f70422d6-d361-50e6-85f6-266042a9d2ed",
+        "instanceIdentifier": "9e9e98fc-ce30-5b94-a143-7d01512a35d2",
+        "source": {
+          "id": "3d1e8a19-d603-3d5d-bd8a-daf2f4edcc70",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisTypeDeserializer",
+          "comments": "",
+          "instanceIdentifier": "7a782c41-8c7b-3e63-e3d2-6f387456cdd2"
+        },
+        "destination": {
+          "id": "b8dba330-42ab-3c25-a4fd-0959f879b9de",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "ModuleTypeHandler",
+          "comments": "",
+          "instanceIdentifier": "5eed6c1d-01a0-1000-6228-77b3e59c4c18"
+        },
+        "labelIndex": 1,
+        "zIndex": 0,
+        "selectedRelationships": [
+          "module_type"
+        ],
+        "backPressureObjectThreshold": 10000,
+        "backPressureDataSizeThreshold": "1 GB",
+        "flowFileExpiration": "0 sec",
+        "prioritizers": [],
+        "bends": [],
+        "loadBalanceStrategy": "DO_NOT_LOAD_BALANCE",
+        "loadBalanceCompression": "DO_NOT_COMPRESS",
+        "componentType": "CONNECTION",
+        "groupIdentifier": "8c3952f5-84fe-3d0a-81e1-e1e190642902"
+      },
+      {
+        "identifier": "88b89907-0553-5e4b-a1e8-dece2ea00675",
+        "instanceIdentifier": "073f4dba-4279-5c43-825d-00dd37969ae0",
+        "source": {
+          "id": "20ee6727-0fe2-3a0b-8c3a-f3525c04f480",
+          "type": "PROCESSOR",
+          "groupId": "8c3952f5-84fe-3d0a-81e1-e1e190642902",
+          "name": "RedisBatchWriter",
+          "comments": "",
+          "instanceIdentifier": "0fbaec2b-24d2-360a-c727-bcfb2669ae57"
         },
         "destination": {
           "id": "67873273-4d2b-40c7-9b46-ca833588c86f",

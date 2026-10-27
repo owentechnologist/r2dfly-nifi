@@ -124,7 +124,15 @@ class ReplicationReaderIT {
             }
             Thread.sleep(1000);
             assertEquals(0L, pipeline.counter("Replication Disconnects"));
+            pipeline.step();
+            assertEquals(50L, pipeline.counter("Replication Pending Keys"), "the 50 changed keys wait in the reader");
+            assertTrue(pipeline.counter("Replication Lag (seconds)") >= 1, "behind since the burst began");
+            assertEquals(0L, pipeline.counter("Replication Caught Up"));
             pipeline.pumpUntilQuiet();
+            assertEquals(0L, pipeline.counter("Replication Lag (bytes)"));
+            assertEquals(0L, pipeline.counter("Replication Pending Keys"));
+            assertEquals(0L, pipeline.counter("Replication Lag (seconds)"), "caught up again");
+            assertEquals(1L, pipeline.counter("Replication Caught Up"));
 
             assertTargetMatchesSource(src.sync(), tgt.sync(), false);
             assertEquals(1L, pipeline.counter("Replication Full Resyncs"), "the replica connection survived the burst");

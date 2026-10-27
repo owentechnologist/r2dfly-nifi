@@ -2,10 +2,12 @@ package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.dragonfly.nifi.redis.util.ClusterTopologySnapshot;
+import io.dragonfly.nifi.redis.util.CounterGauge;
+import io.dragonfly.nifi.redis.util.FailureReason;
+import io.dragonfly.nifi.redis.util.Futures;
 import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.PartitionAssigner;
 import io.lettuce.core.KeyScanCursor;
-import io.lettuce.core.LettuceFutures;
 import io.lettuce.core.RedisFuture;
 import io.lettuce.core.ScanArgs;
 import io.lettuce.core.ScanCursor;
@@ -24,7 +26,6 @@ import org.apache.nifi.processor.util.StandardValidators;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -212,6 +213,7 @@ public class RedisScanReader extends AbstractProcessor {
             REL_STRING, REL_HASH, REL_LIST, REL_SET, REL_ZSET, REL_STREAM, REL_UNKNOWN, REL_FAILURE);
 
     private final ThreadLocal<Integer> assignedPartition = new ThreadLocal<>();
+    private final CounterGauge gauges = new CounterGauge();
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
@@ -283,6 +285,9 @@ public class RedisScanReader extends AbstractProcessor {
                 session.transfer(flowFile, relationshipFor(entry.type));
             }
             page.skippedByType.forEach((type, count) -> session.adjustCounter("Scan Keys Skipped by Type Filter (" + type + ")", count, false));
+            session.adjustCounter("Keys Scanned", page.entries.size() + page.failures.size()
+                    + page.skippedByType.values().stream().mapToLong(Long::longValue).sum(), false);
+            gauges.set(session, "Source Latency (ms)", pageMs);
             for (ScanEntry failed : page.failures) {
                 FlowFile flowFile = session.create();
                 flowFile = session.putAllAttributes(flowFile, failed.attributes(partitionIndex, page.cursorAfterPage, databaseIndex));
@@ -457,20 +462,6 @@ public class RedisScanReader extends AbstractProcessor {
         };
     }
 
-    // LettuceFutures.awaitAll throws if ANY future completed exceptionally, which would
-    // otherwise propagate out of scanPage/onTrigger and permanently halt this processor on a
-    // single unsupported command (e.g. a source that doesn't implement OBJECT ENCODING) -
-    // every subsequent trigger hits the identical, non-transient failure and yields forever.
-    // This just waits for completion (success or failure); each future is still resolved and
-    // its own failure handled individually right after this call.
-    private static void awaitAllTolerantly(RedisFuture<?>[] futures) {
-        try {
-            LettuceFutures.awaitAll(Duration.ofMinutes(1), futures);
-        } catch (Exception ignored) {
-            // resolved (and any failure handled) per-future below
-        }
-    }
-
     /** {@code scanCmds} SCANs (a single node in cluster mode); {@code cmds} reads each key, following cluster redirects. */
     private static ScanPage scanPage(
             RedisClusterAsyncCommands<byte[], byte[]> scanCmds, RedisClusterAsyncCommands<byte[], byte[]> cmds, ScanCursor cursor,
@@ -496,7 +487,7 @@ public class RedisScanReader extends AbstractProcessor {
         for (byte[] key : candidateKeys) {
             typeFutures.add(cmds.type(key));
         }
-        awaitAllTolerantly(typeFutures.toArray(new RedisFuture<?>[0]));
+        Futures.awaitAll(typeFutures.toArray(new RedisFuture<?>[0]), 60_000);
 
         List<ScanEntry> entries = new ArrayList<>();
         List<ScanEntry> failures = new ArrayList<>();
@@ -512,7 +503,7 @@ public class RedisScanReader extends AbstractProcessor {
             try {
                 type = typeFutures.get(i).get();
             } catch (Exception e) {
-                failures.add(new ScanEntry(key, "unknown", -2, null));
+                failures.add(new ScanEntry(key, "unknown", -2, null, "TYPE on the source failed: " + FailureReason.describe(e)));
                 continue;
             }
             if (!filter.allowsType(type)) {
@@ -525,9 +516,9 @@ public class RedisScanReader extends AbstractProcessor {
             encodingFutures.add(readEncoding ? cmds.objectEncoding(key) : null);
         }
         if (emitTtl) {
-            awaitAllTolerantly(ttlFutures.stream().filter(java.util.Objects::nonNull).toArray(RedisFuture<?>[]::new));
+            Futures.awaitAll(ttlFutures.stream().filter(java.util.Objects::nonNull).toArray(RedisFuture<?>[]::new), 60_000);
         }
-        awaitAllTolerantly(encodingFutures.stream().filter(java.util.Objects::nonNull).toArray(RedisFuture<?>[]::new));
+        Futures.awaitAll(encodingFutures.stream().filter(java.util.Objects::nonNull).toArray(RedisFuture<?>[]::new), 60_000);
 
         for (int i = 0; i < ttlKeys.size(); i++) {
             long ttlMs = -1;
@@ -547,7 +538,7 @@ public class RedisScanReader extends AbstractProcessor {
             } catch (Exception ignored) {
                 // encoding is informational only
             }
-            entries.add(new ScanEntry(ttlKeys.get(i), ttlTypes.get(i), ttlMs, encoding));
+            entries.add(new ScanEntry(ttlKeys.get(i), ttlTypes.get(i), ttlMs, encoding, null));
         }
 
         return new ScanPage(entries, failures, result, skippedByType);
@@ -558,7 +549,7 @@ public class RedisScanReader extends AbstractProcessor {
                             java.util.Map<String, Long> skippedByType) {
     }
 
-    private record ScanEntry(byte[] key, String type, long ttlMs, String encoding) {
+    private record ScanEntry(byte[] key, String type, long ttlMs, String encoding, String failure) {
         java.util.Map<String, String> attributes(int partitionIndex, ScanCursor cursor, Integer databaseIndex) {
             java.util.Map<String, String> attrs = new java.util.HashMap<>();
             attrs.put("redis.key", new String(key, StandardCharsets.UTF_8));
@@ -571,6 +562,9 @@ public class RedisScanReader extends AbstractProcessor {
             }
             if (encoding != null) {
                 attrs.put("redis.encoding", encoding);
+            }
+            if (failure != null) {
+                attrs.put(FailureReason.ATTRIBUTE, failure);
             }
             return attrs;
         }

@@ -177,7 +177,7 @@ class LivePhaseIT {
         assertEquals("{\"a\":2}", target.dispatch(RawCommand.JSON_GET, new ValueOutput<>(StringCodec.UTF8),
                 new CommandArgs<>(StringCodec.UTF8).addKey("user:doc")));
         assertEquals(2L, consumer.getCounterValue("Keyspace Events Skipped (Prefix Filter)"));
-        assertEquals(1L, fetch.getCounterValue("Keys Skipped (Type Filter)"));
+        assertEquals(1L, fetch.getCounterValue("Keys Skipped by Type Filter (set)"));
         assertTrue(consumer.getLogger().getWarnMessages().stream().map(LogMessage::getMsg)
                         .anyMatch(msg -> msg.contains("Unable to read notify-keyspace-events")),
                 "a blocked CONFIG is reported as a warning, not a start failure");

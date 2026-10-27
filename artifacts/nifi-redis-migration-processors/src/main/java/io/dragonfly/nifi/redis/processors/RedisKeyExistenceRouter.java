@@ -1,6 +1,7 @@
 package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
+import io.dragonfly.nifi.redis.util.FailureReason;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.components.PropertyDescriptor;
@@ -77,7 +78,7 @@ public class RedisKeyExistenceRouter extends AbstractProcessor {
         String targetKey = flowFile.getAttribute("redis.key");
         if (targetKey == null || targetKey.isEmpty()) {
             getLogger().error("FlowFile is missing the redis.key attribute");
-            session.transfer(session.penalize(flowFile), REL_FAILURE);
+            session.transfer(session.penalize(FailureReason.tag(session, flowFile, "no redis.key attribute")), REL_FAILURE);
             return;
         }
 
@@ -113,7 +114,7 @@ public class RedisKeyExistenceRouter extends AbstractProcessor {
             }
         } catch (Exception e) {
             getLogger().error("Failed to check existence of key {} on the source", bareKey, e);
-            session.transfer(session.penalize(flowFile), REL_FAILURE);
+            session.transfer(session.penalize(FailureReason.tag(session, flowFile, "EXISTS on the source failed", e)), REL_FAILURE);
         }
     }
 

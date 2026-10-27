@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService;
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.dragonfly.nifi.redis.util.ComparableValue;
+import io.dragonfly.nifi.redis.util.CounterGauge;
 import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.KeyRecord;
 import io.dragonfly.nifi.redis.util.ModuleCopy;
@@ -229,6 +230,7 @@ public class MigrationReconciler extends AbstractProcessor {
     }
 
     private volatile Pass pass;
+    private final CounterGauge gauges = new CounterGauge();
     private volatile String fullPassRequestedBy;
     private volatile long lastPassEndedAtMs;
     private volatile long lastDbsize = -1;
@@ -368,10 +370,15 @@ public class MigrationReconciler extends AbstractProcessor {
             String key = new String(keys.get(i), StandardCharsets.UTF_8);
             String sourceType = sourceTypes.get(i);
             String targetType = targetTypes.get(i);
-            // A type Dragonfly cannot hold is reported once, by ModuleTypeHandler's dead-letter
-            // record, not again as a difference on every pass.
+            // A key the target cannot hold is reported once, by ModuleTypeHandler's dead-letter
+            // record, not again as a difference on every pass: a type Dragonfly lacks, or a
+            // RESTORE-only module key the target rejected. Otherwise no pass could ever be clean.
             if ("none".equals(sourceType) || !filter.allowsType(sourceType)
                     || (!CORE_TYPES.contains(sourceType) && ModuleCopy.of(sourceType) == ModuleCopy.NOT_SUPPORTED_BY_DRAGONFLY)) {
+                continue;
+            }
+            if ("none".equals(targetType) && !CORE_TYPES.contains(sourceType) && ModuleCopy.of(sourceType) == ModuleCopy.RESTORE_ONLY) {
+                session.adjustCounter("Reconcile Module Keys Not on Target", 1, false);
                 continue;
             }
             current.keysChecked++;
@@ -479,6 +486,10 @@ public class MigrationReconciler extends AbstractProcessor {
         session.adjustCounter("Reconcile Passes", 1, false);
         session.adjustCounter("Reconcile Keys Checked", finished.keysChecked, false);
         finished.counts.forEach((reason, count) -> session.adjustCounter("Reconcile Differences (" + reason + ")", count, false));
+        gauges.set(session, "Reconcile Last Pass Differences", finished.differences());
+        if (finished.mode == Mode.FULL && finished.differences() == 0) {
+            gauges.set(session, "Reconcile Last Clean Full Pass Started (epoch seconds)", finished.startedAt.getEpochSecond());
+        }
         session.commit();
         getLogger().info("Reconcile pass finished: {} keys checked, {} differences {} sent to repair",
                 finished.keysChecked, finished.differences(), finished.counts);

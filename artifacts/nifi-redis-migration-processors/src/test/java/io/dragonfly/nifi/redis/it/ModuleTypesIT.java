@@ -2,6 +2,7 @@ package io.dragonfly.nifi.redis.it;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.dragonfly.nifi.redis.processors.MigrationReconciler;
 import io.dragonfly.nifi.redis.processors.ModuleTypeHandler;
 import io.dragonfly.nifi.redis.processors.RedisDeadLetterWriter;
 import io.dragonfly.nifi.redis.processors.RedisScanReader;
@@ -109,6 +110,10 @@ class ModuleTypesIT {
                 try (Stream<Path> files = Files.list(deadLetters)) {
                     assertEquals(expected.size(), files.count());
                 }
+
+                JsonNode report = reconcile(source);
+                assertEquals(0, report.get("differences").asLong(), "keys with a dead-letter record are not drift: " + report);
+                assertEquals(2, report.get("keys_checked").asLong(), "the JSON and TopK keys that were copied are still checked");
             }
         }
     }
@@ -135,8 +140,23 @@ class ModuleTypesIT {
         modules.addConnection(ModuleTypeHandler.REL_UNSUPPORTED);
         scan.getFlowFilesForRelationship(RedisScanReader.REL_UNKNOWN).forEach(f -> modules.enqueue(f.toByteArray(), f.getAttributes()));
         modules.run();
-        assertEquals(List.of(), modules.getFlowFilesForRelationship(ModuleTypeHandler.REL_FAILURE));
+        assertEquals(List.of(), modules.getFlowFilesForRelationship(ModuleTypeHandler.REL_FAILURE).stream()
+                .map(f -> f.getAttribute("redis.key") + ": " + f.getAttribute("redis.failure.reason")).toList());
         return modules;
+    }
+
+    private static JsonNode reconcile(GenericContainer<?> source) throws Exception {
+        TestRunner reconciler = TestRunners.newTestRunner(MigrationReconciler.class);
+        reconciler.setAllowSynchronousSessionCommits(true);
+        addPool(reconciler, "source-pool", new StandardRedisConnectionPoolService(), source);
+        addPool(reconciler, "target-pool", new StandardDragonflyConnectionPoolService(), DRAGONFLY);
+        reconciler.setProperty(MigrationReconciler.SOURCE_CONNECTION_POOL, "source-pool");
+        reconciler.setProperty(MigrationReconciler.TARGET_CONNECTION_POOL, "target-pool");
+        reconciler.setProperty(MigrationReconciler.MODE, "FULL");
+        for (int i = 0; i < 100 && reconciler.getFlowFilesForRelationship(MigrationReconciler.REL_REPORT).isEmpty(); i++) {
+            reconciler.run(1, false, i == 0);
+        }
+        return MAPPER.readTree(reconciler.getFlowFilesForRelationship(MigrationReconciler.REL_REPORT).get(0).toByteArray());
     }
 
     /** Key to reason, read back from the files RedisDeadLetterWriter wrote. */

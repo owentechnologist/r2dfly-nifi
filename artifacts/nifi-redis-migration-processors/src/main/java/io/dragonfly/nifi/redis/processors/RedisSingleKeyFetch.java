@@ -1,6 +1,7 @@
 package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
+import io.dragonfly.nifi.redis.util.FailureReason;
 import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.KeyRecord;
 import io.dragonfly.nifi.redis.util.RedisTypeSerializer;
@@ -85,7 +86,7 @@ public class RedisSingleKeyFetch extends AbstractProcessor {
         String key = flowFile.getAttribute("redis.key");
         if (key == null || key.isEmpty()) {
             getLogger().error("FlowFile is missing the redis.key attribute");
-            session.transfer(session.penalize(flowFile), REL_FAILURE);
+            session.transfer(session.penalize(FailureReason.tag(session, flowFile, "no redis.key attribute")), REL_FAILURE);
             return;
         }
 
@@ -114,7 +115,7 @@ public class RedisSingleKeyFetch extends AbstractProcessor {
                 return;
             }
             if (!filter.allowsType(type)) {
-                session.adjustCounter("Keys Skipped (Type Filter)", 1, false);
+                session.adjustCounter("Keys Skipped by Type Filter (" + type + ")", 1, false);
                 session.remove(flowFile);
                 return;
             }
@@ -153,7 +154,7 @@ public class RedisSingleKeyFetch extends AbstractProcessor {
             session.remove(flowFile);
         } catch (Exception e) {
             getLogger().error("Failed to fetch key {}", key, e);
-            session.transfer(session.penalize(flowFile), REL_FAILURE);
+            session.transfer(session.penalize(FailureReason.tag(session, flowFile, "reading the key from the source failed", e)), REL_FAILURE);
         }
     }
 
