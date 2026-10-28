@@ -194,6 +194,48 @@ class ClusterTopologyIT {
         assertEquals(40L, scan.runner.getCounterValue("Scan Slots Rescanned"));
     }
 
+    @Test
+    void aSlotStillMigratingWhenItsShardsScanEndsIsReadOnceItSettles() throws Exception {
+        String currentId = new ArrayList<>(masters().keySet()).get(1);
+        List<Integer> currentSlots = slotsOf(currentId);
+        String tag = java.util.stream.IntStream.range(0, 100_000).mapToObj(i -> "t" + i)
+                .filter(t -> currentSlots.contains(io.lettuce.core.cluster.SlotHash.getSlot(t))).findFirst().orElseThrow();
+        for (int i = 0; i < 6; i++) {
+            source.sync().set("{" + tag + "}:" + i, "v");
+        }
+        MidScan scan = new MidScan();
+        assertEquals(currentId, scan.current);
+        Map<String, Integer> masters = allMasters();
+        int fromPort = masters.get(scan.current);
+        int toPort = masters.get(scan.done);
+        int slot = io.lettuce.core.cluster.SlotHash.getSlot(tag);
+        List<String> keys = node(fromPort, c -> c.clusterGetKeysInSlot(slot, 10_000));
+        node(toPort, c -> c.clusterSetSlotImporting(slot, scan.current));
+        node(fromPort, c -> c.clusterSetSlotMigrating(slot, scan.done));
+        List<String> movedEarly = keys.subList(0, keys.size() / 2);
+        node(fromPort, c -> c.migrate("127.0.0.1", toPort, 0, 5000, io.lettuce.core.MigrateArgs.Builder.keys(movedEarly)));
+
+        Thread settle = new Thread(() -> {
+            try {
+                Thread.sleep(2000);
+                List<String> rest = node(fromPort, c -> c.clusterGetKeysInSlot(slot, 10_000));
+                if (!rest.isEmpty()) {
+                    node(fromPort, c -> c.migrate("127.0.0.1", toPort, 0, 5000, io.lettuce.core.MigrateArgs.Builder.keys(rest)));
+                }
+                for (int port : masters.values()) {
+                    node(port, c -> c.clusterSetSlotNode(slot, scan.done));
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        settle.start();
+        List<String> emitted = scan.run();
+        settle.join();
+        awaitClusterOk();
+        assertTrue(emitted.containsAll(keys), "every key of the slot, the half moved before the scan ended included");
+    }
+
     /** Seeds keys, records the baseline topology, and leaves a checkpoint partway through the second shard's SCAN. */
     private final class MidScan {
         final String done;

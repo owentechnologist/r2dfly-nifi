@@ -31,6 +31,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Tags({"redis", "migration", "scan", "source"})
 @CapabilityDescription("Scans the source Redis keyspace, partitioned across concurrent tasks by hash-slot "
@@ -303,7 +305,10 @@ public class RedisScanReader extends AbstractProcessor {
                 } else {
                     List<Integer> sorted = shardSlots.stream().sorted().toList();
                     int index = at.slotIndex();
-                    while (index < sorted.size() && at.node().equals(ownerOf(sorted.get(index), current))) {
+                    // A slot still migrating off the scanned node has some keys on the importing node already,
+                    // past where that node's own scan may have gone, so it is read again like a moved slot.
+                    Set<Integer> migrating = migratingSlots(redisPool, at.node());
+                    while (index < sorted.size() && at.node().equals(ownerOf(sorted.get(index), current)) && !migrating.contains(sorted.get(index))) {
                         index++;
                     }
                     if (index == sorted.size()) {
@@ -534,6 +539,29 @@ public class RedisScanReader extends AbstractProcessor {
             refreshedAtMs = 0;
             return current();
         }
+    }
+
+    private static final Pattern MIGRATING_SLOT = Pattern.compile("\\[(\\d+)->-");
+
+    /** The slots {@code node} is migrating to another node, from its own line of CLUSTER NODES. */
+    private static Set<Integer> migratingSlots(RedisConnectionPoolService pool, String node) {
+        String nodes = pool.withConnectionAndRaw((cmds, raw) -> {
+            try {
+                return nodeCommands(raw, node, false).clusterNodes().get();
+            } catch (Exception e) {
+                throw new ProcessException("Reading CLUSTER NODES from " + node + " failed", e);
+            }
+        });
+        Set<Integer> slots = new java.util.HashSet<>();
+        for (String line : nodes.split("\n")) {
+            if (line.contains("myself")) {
+                Matcher m = MIGRATING_SLOT.matcher(line);
+                while (m.find()) {
+                    slots.add(Integer.parseInt(m.group(1)));
+                }
+            }
+        }
+        return slots;
     }
 
     /**
