@@ -156,7 +156,8 @@ if skipped:
 pending_dl = count('Dead-Letter Records Pending')
 reviewed &= report(pending_dl == 0, f'{pending_dl} dead-letter records in {dead_letter_dir} not yet reviewed' + ('; move each reviewed record out of that directory to acknowledge it' if pending_dl else ''))
 clean_at = counters.get('Reconcile Last Clean Full Pass Started (epoch seconds)')
-if clean_at is not None and clean_at >= since:
+# 0 means the latest FULL pass found differences; the reconciler clears the gauge then.
+if clean_at and clean_at >= since:
     report(True, 'a FULL reconcile pass that started ' + time.strftime('%H:%M:%S', time.localtime(clean_at)) + ' found no difference')
 else:
     clean &= report(False, 'no clean FULL reconcile pass yet' + (' since writes stopped' if since else '') + (f' (the last pass found {count(\"Reconcile Last Pass Differences\")} differences)' if count('Reconcile Last Pass Differences') else ''))

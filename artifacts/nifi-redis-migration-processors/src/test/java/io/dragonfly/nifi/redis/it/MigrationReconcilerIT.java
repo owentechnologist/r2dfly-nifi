@@ -109,8 +109,11 @@ class MigrationReconcilerIT {
 
         JsonNode drift = pipeline.pass();
         assertEquals(Map.of("value", 2L, "size", 1L, "missing_on_target", 1L, "ttl", 1L, "extra_on_target", 1L), counts(drift));
+        assertEquals(0L, pipeline.reconciler.getCounterValue("Reconcile Last Clean Full Pass Started (epoch seconds)"),
+                "a FULL pass that found differences withdraws the earlier clean one");
         assertTargetMatchesSource();
         assertEquals(0, pipeline.pass().get("differences").asLong());
+        assertTrue(pipeline.reconciler.getCounterValue("Reconcile Last Clean Full Pass Started (epoch seconds)") >= startedAt);
 
         // A FLUSHDB, which no change stream turns into key-level deletes.
         s.flushdb();
@@ -118,6 +121,22 @@ class MigrationReconcilerIT {
         assertEquals("a DBSIZE drop from 406 to 0", afterFlush.get("triggered_by").asText());
         assertEquals(406L, counts(afterFlush).get("extra_on_target"));
         assertEquals(List.of(), t.keys("*"), "the flushed keys are gone from the target too");
+    }
+
+    @Test
+    void aStreamWithAGroupComparesCleanAfterEntriesWereDeleted() throws Exception {
+        RedisCommands<String, String> s = src.sync();
+        for (int i = 1; i <= 5; i++) {
+            s.xadd("trimmed", new io.lettuce.core.XAddArgs().id(i + "-0"), Map.of("n", String.valueOf(i)));
+        }
+        s.xgroupCreate(XReadArgs.StreamOffset.from("trimmed", "0"), "g", XGroupCreateArgs.Builder.mkstream(false));
+        s.xreadgroup(Consumer.from("g", "c"), XReadArgs.Builder.count(1), XReadArgs.StreamOffset.lastConsumed("trimmed"));
+        s.xdel("trimmed", "4-0", "5-0");
+
+        Pipeline pipeline = new Pipeline("FULL");
+        pipeline.deserializer.removeProperty(RedisTypeDeserializer.RESTORE_PROBE_TARGET);
+        assertEquals(Map.of("missing_on_target", 1L), counts(pipeline.pass()));
+        assertEquals(0, pipeline.pass().get("differences").asLong(), "the group's lag cannot match once entries were deleted, so it is not compared");
     }
 
     @Test

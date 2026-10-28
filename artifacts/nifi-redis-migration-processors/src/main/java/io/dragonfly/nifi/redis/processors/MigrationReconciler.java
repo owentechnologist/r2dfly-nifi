@@ -413,8 +413,17 @@ public class MigrationReconciler extends AbstractProcessor {
             String key = new String(sameType.get(i), StandardCharsets.UTF_8);
             if (!sourceSizes.get(i).equals(targetSizes.get(i))) {
                 repair(session, current, key, "size");
-            } else if (compareValues && !sameValue(source, target, key, new String(sameTypeTargets.get(i), StandardCharsets.UTF_8), sameTypeNames.get(i))) {
-                repair(session, current, key, "value");
+            } else if (compareValues) {
+                String targetKey = new String(sameTypeTargets.get(i), StandardCharsets.UTF_8);
+                try {
+                    if (!sameValue(source, target, key, targetKey, sameTypeNames.get(i))) {
+                        repair(session, current, key, "value");
+                    }
+                } catch (RuntimeException e) {
+                    // One key that cannot be read whole must not hold the pass: copy it again instead.
+                    getLogger().warn("Could not compare the values of {}; sending it to repair", key, e);
+                    repair(session, current, key, "unreadable");
+                }
             }
         }
     }
@@ -513,8 +522,10 @@ public class MigrationReconciler extends AbstractProcessor {
         session.adjustCounter("Reconcile Keys Checked", finished.keysChecked, false);
         finished.counts.forEach((reason, count) -> session.adjustCounter("Reconcile Differences (" + reason + ")", count, false));
         gauges.set(session, "Reconcile Last Pass Differences", finished.differences());
-        if (finished.mode == Mode.FULL && finished.differences() == 0) {
-            gauges.set(session, "Reconcile Last Clean Full Pass Started (epoch seconds)", finished.startedAt.getEpochSecond());
+        // Cleared by a FULL pass that found differences, so it never vouches for a keyspace a later pass found wrong.
+        if (finished.mode == Mode.FULL) {
+            gauges.set(session, "Reconcile Last Clean Full Pass Started (epoch seconds)",
+                    finished.differences() == 0 ? finished.startedAt.getEpochSecond() : 0);
         }
         session.commit();
         getLogger().info("Reconcile pass finished: {} keys checked, {} differences {} sent to repair",

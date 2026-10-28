@@ -17,9 +17,10 @@ import java.util.Set;
 public final class ComparableValue {
 
     /** Idle and activity times move between two reads, and delivered_at_ms is derived from the
-     * moment of each read, so none of them ever match exactly. */
+     * moment of each read, so none of them ever match exactly. A group's lag comes from the
+     * stream's entries-added, which Dragonfly cannot be told, so it differs once entries were trimmed. */
     private static final Set<String> TIME_DEPENDENT_FIELDS = Set.of(
-            "ms_since_last_delivery", "delivered_at_ms", "idle", "inactive", "seen-time", "active-time");
+            "ms_since_last_delivery", "delivered_at_ms", "idle", "inactive", "seen-time", "active-time", "lag");
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 

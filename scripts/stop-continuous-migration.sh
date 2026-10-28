@@ -198,6 +198,12 @@ stop_one() {
     echo "warning: could not read the current revision of $label - leaving it alone" >&2
     return 1
   fi
+  # STOPPED would enable a processor the live-source choice disabled on purpose, and the next
+  # whole-group start would then run both live sources.
+  if [[ "$(nifi_api_get "processors/$proc_id" | py3 "import json,sys; print(json.load(sys.stdin)['component'].get('state',''))")" == "DISABLED" ]]; then
+    echo "  $label: Disabled"
+    return 0
+  fi
   nifi_api_put "processors/$proc_id/run-status" \
     "{\"revision\":{\"version\":$ver},\"state\":\"STOPPED\",\"disconnectedNodeAcknowledged\":false}" > /dev/null || true
   while true; do
