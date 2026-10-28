@@ -34,6 +34,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 @Tags({"redis", "dragonfly", "migration", "sink", "target"})
@@ -192,6 +193,12 @@ public class RedisBatchWriter extends AbstractProcessor {
         return PROPERTY_DESCRIPTORS;
     }
 
+    /**
+     * Keys with a write waiting on retry, and how many. A newer read of such a key waits behind the
+     * retry, which would otherwise land on top of it: the retry sits behind it in the queue.
+     */
+    private final Map<String, Integer> retrying = new ConcurrentHashMap<>();
+
     @Override
     public Set<Relationship> getRelationships() {
         return RELATIONSHIPS;
@@ -219,10 +226,16 @@ public class RedisBatchWriter extends AbstractProcessor {
         RetryPolicy retryPolicy = RetryPolicy.standard();
 
         long now = System.currentTimeMillis();
-        List<FlowFile> batch = session.get(new ReadyBatchFilter(batchSize, perTypeBatchSize, now));
+        List<FlowFile> batch = session.get(new ReadyBatchFilter(batchSize, perTypeBatchSize, now, retrying.keySet()));
         if (batch.isEmpty()) {
             context.yield();
             return;
+        }
+        for (FlowFile flowFile : batch) {
+            byte[] key = RedisBytes.key(flowFile);
+            if (key != null && flowFile.getAttribute(RetryPolicy.RETRY_COUNT_ATTRIBUTE) != null) {
+                retrying.computeIfPresent(RedisBytes.identity(key), (k, count) -> count > 1 ? count - 1 : null);
+            }
         }
 
         List<PendingWrite> inOrder = new ArrayList<>();
@@ -429,6 +442,10 @@ public class RedisBatchWriter extends AbstractProcessor {
         attrs.put(RetryPolicy.RETRY_COUNT_ATTRIBUTE, String.valueOf(attempt));
         attrs.put(RetryPolicy.RETRY_NOT_BEFORE_ATTRIBUTE, String.valueOf(System.currentTimeMillis() + retryPolicy.delayMillisForAttempt(attempt)));
         FlowFile updated = session.putAllAttributes(flowFile, attrs);
+        byte[] key = RedisBytes.key(flowFile);
+        if (key != null) {
+            retrying.merge(RedisBytes.identity(key), 1, Integer::sum);
+        }
         session.transfer(updated, REL_RETRY);
     }
 
@@ -482,6 +499,7 @@ public class RedisBatchWriter extends AbstractProcessor {
         private final int defaultBatchSize;
         private final Map<String, Integer> perTypeLimits;
         private final long now;
+        private final Set<String> retrying;
         private final Map<String, Integer> acceptedByBucket = new HashMap<>();
         /** Keys passed over in this scan: a later FlowFile of the same key must not overtake them. */
         private final Set<String> heldBack = new HashSet<>();
@@ -489,10 +507,11 @@ public class RedisBatchWriter extends AbstractProcessor {
         private final Set<String> chunkedKeys = new HashSet<>();
         private int scanned = 0;
 
-        ReadyBatchFilter(int defaultBatchSize, Map<String, Integer> perTypeLimits, long now) {
+        ReadyBatchFilter(int defaultBatchSize, Map<String, Integer> perTypeLimits, long now, Set<String> retrying) {
             this.defaultBatchSize = defaultBatchSize;
             this.perTypeLimits = perTypeLimits;
             this.now = now;
+            this.retrying = retrying;
         }
 
         @Override
@@ -501,6 +520,10 @@ public class RedisBatchWriter extends AbstractProcessor {
             byte[] keyBytes = RedisBytes.key(flowFile);
             String key = keyBytes == null ? null : RedisBytes.identity(keyBytes);
             if (key != null && heldBack.contains(key)) {
+                return FlowFileFilterResult.REJECT_AND_CONTINUE;
+            }
+            // Not added to heldBack: the retry behind it holds the older read and has to go first.
+            if (key != null && retrying.contains(key) && flowFile.getAttribute(RetryPolicy.RETRY_COUNT_ATTRIBUTE) == null) {
                 return FlowFileFilterResult.REJECT_AND_CONTINUE;
             }
             boolean chunk = ChunkReassembler.isChunk(flowFile);
