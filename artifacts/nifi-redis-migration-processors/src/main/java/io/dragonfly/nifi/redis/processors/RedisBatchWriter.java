@@ -194,10 +194,12 @@ public class RedisBatchWriter extends AbstractProcessor {
     }
 
     /**
-     * Keys with a write waiting on retry, and how many. A newer read of such a key waits behind the
-     * retry, which would otherwise land on top of it: the retry sits behind it in the queue.
+     * Keys with a write waiting on retry, and until when a newer read of one waits behind it: the
+     * retry sits behind that read in the queue and would otherwise land on top of it. The wait ends
+     * a minute after the retry is due, so a retry that never comes back cannot hold a key forever.
      */
-    private final Map<String, Integer> retrying = new ConcurrentHashMap<>();
+    private final Map<String, Long> retryingUntil = new ConcurrentHashMap<>();
+    private static final long RETRY_HOLD_GRACE_MS = 60_000;
 
     @Override
     public Set<Relationship> getRelationships() {
@@ -226,7 +228,8 @@ public class RedisBatchWriter extends AbstractProcessor {
         RetryPolicy retryPolicy = RetryPolicy.standard();
 
         long now = System.currentTimeMillis();
-        List<FlowFile> batch = session.get(new ReadyBatchFilter(batchSize, perTypeBatchSize, now, retrying.keySet()));
+        retryingUntil.values().removeIf(until -> until <= now);
+        List<FlowFile> batch = session.get(new ReadyBatchFilter(batchSize, perTypeBatchSize, now, retryingUntil.keySet()));
         if (batch.isEmpty()) {
             context.yield();
             return;
@@ -234,7 +237,7 @@ public class RedisBatchWriter extends AbstractProcessor {
         for (FlowFile flowFile : batch) {
             byte[] key = RedisBytes.key(flowFile);
             if (key != null && flowFile.getAttribute(RetryPolicy.RETRY_COUNT_ATTRIBUTE) != null) {
-                retrying.computeIfPresent(RedisBytes.identity(key), (k, count) -> count > 1 ? count - 1 : null);
+                retryingUntil.remove(RedisBytes.identity(key));
             }
         }
 
@@ -439,12 +442,13 @@ public class RedisBatchWriter extends AbstractProcessor {
         }
         getLogger().warn("Routing {} to retry (attempt {} of {})", flowFile, attempt, retryPolicy.maxAttempts());
         Map<String, String> attrs = new HashMap<>();
+        long notBefore = System.currentTimeMillis() + retryPolicy.delayMillisForAttempt(attempt);
         attrs.put(RetryPolicy.RETRY_COUNT_ATTRIBUTE, String.valueOf(attempt));
-        attrs.put(RetryPolicy.RETRY_NOT_BEFORE_ATTRIBUTE, String.valueOf(System.currentTimeMillis() + retryPolicy.delayMillisForAttempt(attempt)));
+        attrs.put(RetryPolicy.RETRY_NOT_BEFORE_ATTRIBUTE, String.valueOf(notBefore));
         FlowFile updated = session.putAllAttributes(flowFile, attrs);
         byte[] key = RedisBytes.key(flowFile);
         if (key != null) {
-            retrying.merge(RedisBytes.identity(key), 1, Integer::sum);
+            retryingUntil.merge(RedisBytes.identity(key), notBefore + RETRY_HOLD_GRACE_MS, Math::max);
         }
         session.transfer(updated, REL_RETRY);
     }
