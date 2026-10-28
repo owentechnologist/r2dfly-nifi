@@ -89,6 +89,23 @@ class CommandBuilderTest {
         assertTrue(write.isCompletedExceptionally());
     }
 
+    @Test
+    void aPayloadTheTargetCannotReadIsRejectedButATransientReplyIsRetried() throws Exception {
+        KeyRecord record = new KeyRecord("k", "hash", -1, null, null);
+        record.dumpPayload = new byte[] {1, 2, 3};
+
+        FakeCommands badPayload = new FakeCommands();
+        badPayload.restoreError = "ERR Bad data format";
+        assertEquals(CommandBuilder.WriteOutcome.RESTORE_REJECTED, CommandBuilder.write(badPayload.asyncCommands(), badPayload.rawConnection(),
+                record, "k", CommandBuilder.TtlStrategy.PRESERVE, 0, CommandBuilder.ConflictStrategy.OVERWRITE).get());
+
+        FakeCommands outOfMemory = new FakeCommands();
+        outOfMemory.restoreError = "OOM command not allowed when used memory > 'maxmemory'";
+        assertTrue(CommandBuilder.write(outOfMemory.asyncCommands(), outOfMemory.rawConnection(),
+                record, "k", CommandBuilder.TtlStrategy.PRESERVE, 0, CommandBuilder.ConflictStrategy.OVERWRITE)
+                .handle((outcome, error) -> error != null).get(), "a full target fails the write, which the writer retries");
+    }
+
     private static Map<String, String> decode(Map<byte[], byte[]> raw) {
         Map<String, String> decoded = new LinkedHashMap<>();
         raw.forEach((k, v) -> decoded.put(new String(k, StandardCharsets.UTF_8), new String(v, StandardCharsets.UTF_8)));
@@ -102,6 +119,7 @@ class CommandBuilderTest {
         final List<Long> pexpireCalls = new ArrayList<>();
         final List<Map<byte[], byte[]>> hsetCalls = new ArrayList<>();
         private Object dispatchedCommand;
+        String restoreError;
 
         @SuppressWarnings("unchecked")
         RedisClusterAsyncCommands<byte[], byte[]> asyncCommands() {
@@ -121,6 +139,9 @@ class CommandBuilderTest {
                                 return completed(true);
                             case "exists":
                                 return completed(0L);
+                            case "restore":
+                                return new PipelinedRedisFuture<>(CompletableFuture.failedFuture(
+                                        new io.lettuce.core.RedisCommandExecutionException(restoreError)));
                             default:
                                 throw new UnsupportedOperationException(method.getName());
                         }

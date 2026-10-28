@@ -194,10 +194,18 @@ public final class CommandBuilder {
                 .thenApply(v -> WriteOutcome.SUCCESS)
                 .exceptionallyCompose(e -> {
                     Throwable cause = e instanceof CompletionException && e.getCause() != null ? e.getCause() : e;
-                    return cause instanceof RedisCommandExecutionException
+                    return cause instanceof RedisCommandExecutionException && !transientReply(cause.getMessage())
                             ? CompletableFuture.completedFuture(WriteOutcome.RESTORE_REJECTED)
                             : CompletableFuture.failedFuture(cause);
                 });
+    }
+
+    /** Replies about the target's state, not the payload: the write is retried rather than given up on. */
+    private static final List<String> TRANSIENT_REPLIES = List.of("OOM", "LOADING", "BUSY", "READONLY", "TRYAGAIN",
+            "CLUSTERDOWN", "MASTERDOWN", "NOREPLICAS", "MOVED", "ASK");
+
+    private static boolean transientReply(String message) {
+        return message != null && TRANSIENT_REPLIES.stream().anyMatch(prefix -> message.startsWith(prefix + " ") || message.equals(prefix));
     }
 
     private static CompletableFuture<Void> writeString(
