@@ -75,12 +75,11 @@ public final class CommandBuilder {
             RedisClusterAsyncCommands<byte[], byte[]> target,
             StatefulConnection<byte[], byte[]> rawConn,
             KeyRecord record,
-            String keyPrefix,
-            String keyPrefixSeparator,
+            String targetKey,
             TtlStrategy ttlStrategy,
             long ttlResetOffsetMs,
             ConflictStrategy conflictStrategy) {
-        return write(target, rawConn, record, keyPrefix, keyPrefixSeparator, ttlStrategy, ttlResetOffsetMs,
+        return write(target, rawConn, record, targetKey, ttlStrategy, ttlResetOffsetMs,
                 conflictStrategy, DEFAULT_WRITE_CHUNK_SIZE);
     }
 
@@ -88,14 +87,13 @@ public final class CommandBuilder {
             RedisClusterAsyncCommands<byte[], byte[]> target,
             StatefulConnection<byte[], byte[]> rawConn,
             KeyRecord record,
-            String keyPrefix,
-            String keyPrefixSeparator,
+            String targetKeyName,
             TtlStrategy ttlStrategy,
             long ttlResetOffsetMs,
             ConflictStrategy conflictStrategy,
             int writeChunkSize) {
 
-        byte[] targetKey = prefixedKey(record.key, keyPrefix, keyPrefixSeparator);
+        byte[] targetKey = targetKeyName.getBytes(StandardCharsets.UTF_8);
         Long effectiveTtl = effectiveTtl(record.ttlMs, ttlStrategy, ttlResetOffsetMs);
         boolean keepFieldTtls = ttlStrategy != TtlStrategy.STRIP;
 
@@ -415,14 +413,8 @@ public final class CommandBuilder {
         return toCf(target.pexpire(key, ttlMs)).thenApply(v -> null);
     }
 
-    private static byte[] prefixedKey(String key, String prefix, String separator) {
-        if (prefix == null || prefix.isEmpty()) {
-            return key.getBytes(StandardCharsets.UTF_8);
-        }
-        return (prefix + separator + key).getBytes(StandardCharsets.UTF_8);
-    }
-
-    private static Long effectiveTtl(long sourceTtlMs, TtlStrategy strategy, long resetOffsetMs) {
+    /** The TTL a key gets on the target, or null for none. */
+    public static Long effectiveTtl(long sourceTtlMs, TtlStrategy strategy, long resetOffsetMs) {
         return switch (strategy) {
             case STRIP -> null;
             case PRESERVE -> sourceTtlMs > 0 ? sourceTtlMs : null;

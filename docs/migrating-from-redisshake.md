@@ -52,12 +52,25 @@ RedisShake puts connection details in separate keys. r2dfly takes one connection
 | `allow_command_group`, `allow_command` and their `block_` forms, used to pick data types | `--key-types string,hash,...` and `--disallow-key-types` (see below) |
 | `skip_unknown_type` | `--disallow-key-types` with the same types |
 | `allow_slot`, `block_slot` | No equivalent |
-| `function` (a Lua hook) | No equivalent yet |
+| `function` (a Lua hook) | `--transform-script` (a Groovy hook), or the built-in transforms below |
 
 RedisShake filters commands, not keys. In its RDB phase it writes every key with `RESTORE`,
 whatever the key's type, so a command-group filter does not mean "copy only these key types".
 r2dfly's `--key-types` reads each key's real `TYPE`, and applies the same filter in the copy and
 in the live phase, through renames into and out of a prefix.
+
+### Transforms
+
+RedisShake does these in its Lua `function`. r2dfly has them built in, so the reconciler and the
+live phase follow them too. See [Transforms](quickstart.md#transforms) for the details.
+
+| What the Lua function did | r2dfly |
+|---|---|
+| Rewrite a key prefix | `--rename-prefix old:=new:` (`[transform] rename-prefix`) |
+| Move keys to another database | Give each connection string its database: `redis://source/0` to `redis://target/2` |
+| Drop a TTL, or lengthen it | `--ttl-strategy strip`, or `--ttl-strategy reset --ttl-reset-offset-ms N` |
+| Skip keys by prefix or type | `--prefix-deny-list`, `--key-types` (see Filters) |
+| Change values | `--transform-script`, a Groovy script that gets each key's whole record instead of each command |
 
 ### Behavior and tuning
 

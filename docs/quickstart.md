@@ -142,6 +142,103 @@ These options apply to `simple-migration.sh` and `continuous-migration.sh` alike
 -y, --yes                     don't prompt before stopping/clearing a pre-existing migration
 ```
 
+## Transforms
+
+These options change what lands on the target. `simple-migration.sh` and
+`continuous-migration.sh` both take them, and each has a key in the `[transform]` TOML section.
+
+```
+--rename-prefix RULES        comma-separated old=new key prefix rules, e.g. user:=account:
+--ttl-strategy S             preserve (default), strip or reset
+--ttl-reset-offset-ms N      milliseconds added to each TTL under --ttl-strategy reset
+--transform-script FILE      a Groovy script run on every key record before it is written
+```
+
+```toml
+[transform]
+rename-prefix = "user:=account:,session:=s:"
+ttl-strategy = "reset"
+ttl-reset-offset-ms = 600000
+script = "my-transform.groovy"
+```
+
+**Prefix rename.** A key that starts with an old prefix is written under the new one, and the
+longest matching old prefix wins. An empty old prefix (`=v2:`) puts a prefix in front of every
+key. The rename applies everywhere a key is named: the copy, the live phase's writes and deletes,
+the reconciler's comparison, and the `PREFIX` list of rebuilt search indexes. A source key that
+already sits under a new prefix would be overwritten by a renamed key, so it is dead-lettered
+with that reason instead of copied. The prefix filters (`--prefix-only-list`,
+`--prefix-deny-list`) match the source names, before the rename.
+
+**TTL strategy.** `preserve` copies the TTL each key has left. `strip` writes every key without
+a TTL. `reset` adds `--ttl-reset-offset-ms` to each remaining TTL, which gives the application
+time to settle after cutover. A key without a TTL gets none either way. The reconciler expects
+the TTLs the strategy produces, so it does not report them as differences.
+
+**Database remap.** A run copies one database. Give each side's connection string its database,
+`redis://source:6379/3` and `redis://target:6379/5`, to copy database 3 into database 5. A
+Dragonfly cluster has only database 0.
+
+**Scripted hook.** `--transform-script` places NiFi's `ExecuteGroovyScript` processor, named
+"Transform Hook", in front of RedisBatchWriter. Every key record on its way to the target passes
+through it: the copy, the live phase, the reconciler's repairs and a file import. Each FlowFile
+holds one key record as JSON, the same record `--target-file` writes. The hook turns off the
+RESTORE fast path, so every record is JSON rather than a DUMP payload. A run without the flag
+bypasses and disables a hook an earlier run placed.
+
+What a RedisShake Lua hook sees, and where it is here:
+
+| RedisShake | r2dfly hook |
+|---|---|
+| `DB` | `DB`, a script variable holding the source database |
+| `KEYS` | `record.key`, one key per record |
+| `TYPE` | `record.type`, the key's real type (`string`, `hash`, `list`, `set`, `zset`, `stream`, or `deleted` for a delete) |
+| `CMD`, `ARGV` | None. r2dfly copies keys, not commands: the record holds the key's whole value (`record.value`) and its TTL (`record.ttl_ms`) instead. |
+
+A script that drops `tmp:` keys and upper-cases the strings under `order:`:
+
+```groovy
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
+session.get(1000).each { flowFile ->
+    try {
+        def record
+        flowFile.read { record = new JsonSlurper().parse(it) }
+        if (record.key.startsWith('tmp:')) {
+            session.remove(flowFile)
+            return
+        }
+        if (record.type == 'string' && record.key.startsWith('order:')) {
+            record.value = record.value.toUpperCase()
+        }
+        flowFile.write('UTF-8', JsonOutput.toJson(record))
+        REL_SUCCESS << flowFile
+    } catch (Exception e) {
+        // One bad record goes to the dead-letter directory with this reason; the rest carry on.
+        flowFile.'redis.failure.reason' = "transform script: ${e}"
+        REL_FAILURE << flowFile
+    }
+}
+```
+
+Things to know before using a hook:
+
+- Use `--rename-prefix` for renames. A rename in a script also has to set the `redis.key`
+  attribute, and the live phase's deletes and the reconciler do not pass through the hook.
+- Module keys (JSON, TopK, Bloom), search indexes and `--target-file` output do not pass
+  through the hook either.
+- A large hash or list can arrive in several chunks, each a record with the same key and part
+  of the value, so decide per key, not per record.
+- The reconciler compares the target with the untransformed source. A hook that changes values
+  or drops keys makes every pass find those keys again. Their repairs go through the hook too, so
+  the target stays transformed, but no pass is clean and `cutover.sh` never reports SAFE. Decide
+  the cutover yourself in that case.
+- Catch exceptions per record, as the example does, and send the record to `REL_FAILURE` with a
+  `redis.failure.reason`. It then lands in the dead-letter directory with that reason. An
+  exception the script lets escape holds back its whole batch, and NiFi retries that batch
+  without end.
+
 ## Files: RDB and AOF input, backups to a file
 
 `simple-migration.sh` can take a file in place of the source or the target. These options are

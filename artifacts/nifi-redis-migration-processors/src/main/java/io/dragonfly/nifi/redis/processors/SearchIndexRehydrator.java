@@ -1,6 +1,7 @@
 package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService;
+import io.dragonfly.nifi.redis.util.KeyMapping;
 import io.dragonfly.nifi.redis.util.RawModuleCommands;
 import io.dragonfly.nifi.redis.util.SearchIndexCache;
 import io.dragonfly.nifi.redis.util.SearchIndexDefinition;
@@ -108,7 +109,8 @@ public class SearchIndexRehydrator extends AbstractProcessor {
             .build();
 
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS =
-            List.of(TARGET_CONNECTION_POOL, CURSOR_STATE_CACHE, MIGRATION_ID, FT_CREATE_TIMEOUT_MS, INDEX_OVERWRITE);
+            List.of(TARGET_CONNECTION_POOL, CURSOR_STATE_CACHE, MIGRATION_ID, FT_CREATE_TIMEOUT_MS, INDEX_OVERWRITE,
+                    KeyMapping.KEY_RENAME, RedisBatchWriter.KEY_PREFIX, RedisBatchWriter.KEY_PREFIX_SEPARATOR);
 
     // No FlowFiles are ever produced - this processor's only effect is FT.CREATE calls issued,
     // and cache entries removed, in @OnScheduled.
@@ -131,6 +133,7 @@ public class SearchIndexRehydrator extends AbstractProcessor {
         String migrationId = context.getProperty(MIGRATION_ID).getValue();
         long timeoutMs = context.getProperty(FT_CREATE_TIMEOUT_MS).asLong();
         boolean overwrite = context.getProperty(INDEX_OVERWRITE).asBoolean();
+        KeyMapping mapping = KeyMapping.of(context, RedisBatchWriter.KEY_PREFIX, RedisBatchWriter.KEY_PREFIX_SEPARATOR);
         ComponentLog logger = getLogger();
 
         List<String> names;
@@ -159,6 +162,8 @@ public class SearchIndexRehydrator extends AbstractProcessor {
                 continue;
             }
 
+            // The index has to cover the keys under their target names.
+            def.prefixes = new ArrayList<>(def.prefixes.stream().flatMap(prefix -> mapping.targetPrefixes(prefix).stream()).distinct().toList());
             List<byte[]> args;
             try {
                 args = def.toFtCreateArgs();

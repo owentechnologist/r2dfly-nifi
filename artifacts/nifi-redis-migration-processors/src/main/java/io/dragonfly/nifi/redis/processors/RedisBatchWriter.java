@@ -4,6 +4,7 @@ import io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService;
 import io.dragonfly.nifi.redis.util.ChunkReassembler;
 import io.dragonfly.nifi.redis.util.CommandBuilder;
 import io.dragonfly.nifi.redis.util.FailureReason;
+import io.dragonfly.nifi.redis.util.KeyMapping;
 import io.dragonfly.nifi.redis.util.KeyRecord;
 import io.dragonfly.nifi.redis.util.RedisTypeSerializer;
 import io.dragonfly.nifi.redis.util.RetryPolicy;
@@ -114,6 +115,8 @@ public class RedisBatchWriter extends AbstractProcessor {
     public static final PropertyDescriptor TTL_STRATEGY = new PropertyDescriptor.Builder()
             .name("ttl-strategy")
             .displayName("TTL Strategy")
+            .description("PRESERVE gives each key the TTL it has left on the source, STRIP writes every key without "
+                    + "a TTL, and RESET adds TTL Reset Offset to the TTL a key has left. A key without a TTL gets none.")
             .required(true)
             .allowableValues(CommandBuilder.TtlStrategy.PRESERVE.name(), CommandBuilder.TtlStrategy.STRIP.name(), CommandBuilder.TtlStrategy.RESET.name())
             .defaultValue(CommandBuilder.TtlStrategy.PRESERVE.name())
@@ -122,6 +125,7 @@ public class RedisBatchWriter extends AbstractProcessor {
     public static final PropertyDescriptor TTL_RESET_OFFSET_MS = new PropertyDescriptor.Builder()
             .name("ttl-reset-offset-ms")
             .displayName("TTL Reset Offset (ms)")
+            .description("Milliseconds added to every expiring key's TTL when TTL Strategy is RESET.")
             .required(false)
             .addValidator(StandardValidators.NON_NEGATIVE_INTEGER_VALIDATOR)
             .defaultValue("0")
@@ -130,6 +134,7 @@ public class RedisBatchWriter extends AbstractProcessor {
     public static final PropertyDescriptor KEY_PREFIX = new PropertyDescriptor.Builder()
             .name("key-prefix")
             .displayName("Key Prefix")
+            .description("Written in front of every target key, followed by Key Prefix Separator.")
             .required(false)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
@@ -176,7 +181,7 @@ public class RedisBatchWriter extends AbstractProcessor {
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
             DRAGONFLY_CONNECTION_POOL, BATCH_SIZE, BATCH_SIZE_STRING, BATCH_SIZE_HASH, BATCH_SIZE_LIST,
             BATCH_SIZE_SET, BATCH_SIZE_ZSET, BATCH_SIZE_STREAM, WRITE_CHUNK_SIZE, BATCH_TIMEOUT_MS,
-            MAX_PIPELINE_DEPTH, TTL_STRATEGY, TTL_RESET_OFFSET_MS, KEY_PREFIX, KEY_PREFIX_SEPARATOR,
+            MAX_PIPELINE_DEPTH, TTL_STRATEGY, TTL_RESET_OFFSET_MS, KeyMapping.KEY_RENAME, KEY_PREFIX, KEY_PREFIX_SEPARATOR,
             CONFLICT_STRATEGY, WRITE_CONFIRMATION);
 
     private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_SUCCESS, REL_SKIPPED, REL_FAILURE, REL_RETRY, REL_RESTORE_REJECTED);
@@ -206,8 +211,7 @@ public class RedisBatchWriter extends AbstractProcessor {
         int writeChunkSize = context.getProperty(WRITE_CHUNK_SIZE).asInteger();
         long batchTimeoutMs = context.getProperty(BATCH_TIMEOUT_MS).asLong();
         int maxPipelineDepth = context.getProperty(MAX_PIPELINE_DEPTH).asInteger();
-        String keyPrefix = context.getProperty(KEY_PREFIX).getValue();
-        String keyPrefixSeparator = context.getProperty(KEY_PREFIX_SEPARATOR).getValue();
+        KeyMapping keyMapping = KeyMapping.of(context, KEY_PREFIX, KEY_PREFIX_SEPARATOR);
         CommandBuilder.TtlStrategy ttlStrategy = CommandBuilder.TtlStrategy.valueOf(context.getProperty(TTL_STRATEGY).getValue());
         long ttlResetOffsetMs = context.getProperty(TTL_RESET_OFFSET_MS).isSet() ? context.getProperty(TTL_RESET_OFFSET_MS).asLong() : 0L;
         CommandBuilder.ConflictStrategy conflictStrategy = CommandBuilder.ConflictStrategy.valueOf(context.getProperty(CONFLICT_STRATEGY).getValue());
@@ -237,7 +241,7 @@ public class RedisBatchWriter extends AbstractProcessor {
                         flowFile.getAttribute("redis.key"), flowFile.getAttribute("redis.type"),
                         parseLong(flowFile.getAttribute("redis.ttl.ms"), -1), null, null);
                 dumpRecord.dumpPayload = payload;
-                ready.add(new PendingWrite(flowFile, dumpRecord));
+                ready.add(new PendingWrite(flowFile, dumpRecord, null));
                 continue;
             }
 
@@ -257,9 +261,9 @@ public class RedisBatchWriter extends AbstractProcessor {
                 int chunkTotal = Integer.parseInt(chunkTotalAttr);
                 Optional<KeyRecord> merged = chunkReassembler.accumulate(record.key, record, chunkIndex, chunkTotal);
                 session.remove(flowFile);
-                merged.ifPresent(mergedRecord -> ready.add(new PendingWrite(session.create(), mergedRecord)));
+                merged.ifPresent(mergedRecord -> ready.add(new PendingWrite(session.create(), mergedRecord, null)));
             } else {
-                ready.add(new PendingWrite(flowFile, record));
+                ready.add(new PendingWrite(flowFile, record, null));
             }
         }
 
@@ -267,7 +271,20 @@ public class RedisBatchWriter extends AbstractProcessor {
             session.commit();
             return;
         }
-        List<PendingWrite> writes = latestPerKey(session, ready);
+        List<PendingWrite> writes = new ArrayList<>();
+        for (PendingWrite pending : latestPerKey(session, ready)) {
+            Optional<String> targetKey = keyMapping.toTarget(pending.record.key);
+            if (targetKey.isEmpty()) {
+                session.transfer(FailureReason.tag(session, pending.flowFile,
+                        "a renamed key takes this key's target name; exclude it or change Key Prefix Rename"), REL_FAILURE);
+            } else {
+                writes.add(new PendingWrite(pending.flowFile, pending.record, targetKey.get()));
+            }
+        }
+        if (writes.isEmpty()) {
+            session.commit();
+            return;
+        }
 
         List<Written> outcomes;
         if (writeConfirmation) {
@@ -275,12 +292,12 @@ public class RedisBatchWriter extends AbstractProcessor {
             for (int start = 0; start < writes.size(); start += maxPipelineDepth) {
                 List<PendingWrite> group = writes.subList(start, Math.min(start + maxPipelineDepth, writes.size()));
                 outcomes.addAll(dragonflyPool.withConnectionAndRaw((cmds, rawConn) -> dispatchAndAwait(
-                        cmds, rawConn, group, keyPrefix, keyPrefixSeparator, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize, batchTimeoutMs, getLogger())));
+                        cmds, rawConn, group, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize, batchTimeoutMs, getLogger())));
             }
         } else {
             dragonflyPool.withConnectionAndRaw((cmds, rawConn) -> {
                 for (PendingWrite pending : writes) {
-                    CommandBuilder.write(cmds, rawConn, pending.record, keyPrefix, keyPrefixSeparator, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize);
+                    CommandBuilder.write(cmds, rawConn, pending.record, pending.targetKey, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize);
                 }
                 return null;
             });
@@ -323,12 +340,12 @@ public class RedisBatchWriter extends AbstractProcessor {
     }
 
     private static List<Written> dispatchAndAwait(
-            RedisClusterAsyncCommands<byte[], byte[]> cmds, StatefulConnection<byte[], byte[]> rawConn, List<PendingWrite> ready, String keyPrefix,
-            String keyPrefixSeparator, CommandBuilder.TtlStrategy ttlStrategy, long ttlResetOffsetMs,
+            RedisClusterAsyncCommands<byte[], byte[]> cmds, StatefulConnection<byte[], byte[]> rawConn, List<PendingWrite> ready,
+            CommandBuilder.TtlStrategy ttlStrategy, long ttlResetOffsetMs,
             CommandBuilder.ConflictStrategy conflictStrategy, int writeChunkSize, long batchTimeoutMs, ComponentLog logger) {
         List<CompletableFuture<CommandBuilder.WriteOutcome>> futures = new ArrayList<>(ready.size());
         for (PendingWrite pending : ready) {
-            futures.add(CommandBuilder.write(cmds, rawConn, pending.record, keyPrefix, keyPrefixSeparator, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize));
+            futures.add(CommandBuilder.write(cmds, rawConn, pending.record, pending.targetKey, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize));
         }
         try {
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(batchTimeoutMs, TimeUnit.MILLISECONDS);
@@ -428,7 +445,8 @@ public class RedisBatchWriter extends AbstractProcessor {
         }
     }
 
-    private record PendingWrite(FlowFile flowFile, KeyRecord record) {
+    /** targetKey is null until the key mapping has named it. */
+    private record PendingWrite(FlowFile flowFile, KeyRecord record, String targetKey) {
     }
 
     // ReadyBatchFilter buckets by Redis type: a type with its own perTypeLimits entry gets an

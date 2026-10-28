@@ -61,6 +61,7 @@ The last column marks the rows this project's recent work changed.
 | Restart | Starts over | Resumes: scan checkpoints, partial resync | Now r2dfly |
 | A key the target cannot take | Not tested here | Dead-letter record with the reason; the run continues | Now r2dfly |
 | Filters | Key prefix, suffix, regex, database, command, command group, slot, Lua hook | Key prefix and real key type, applied to the copy and the live phase alike | RedisShake broader |
+| Transforms | A Lua hook on each command | Built-in prefix rename, database remap and TTL strategies that the live phase, reconciler and search indexes follow, plus a Groovy hook on each key record | Now a tie |
 | Cutover and rollback | Not built in | Safe-to-switch check, final reconcile, reverse sync | Now r2dfly |
 | Metrics | An HTTP status port | Prometheus, through NiFi | |
 | Operating model | One binary, one config file | A NiFi deployment: a JVM, containers, a canvas, a REST API | |
@@ -112,8 +113,9 @@ cluster was not measured.
   when it is safe to switch.
 - **Data that is not in Redis** (a Postgres table, a Kafka topic, files, MongoDB): r2dfly.
   RedisShake reads only the Redis protocol and its file formats.
-- **Fine-grained key selection by suffix, regex or Lua:** RedisShake. r2dfly selects by prefix and
-  by key type only.
+- **Fine-grained key selection by suffix, regex or Lua:** RedisShake. r2dfly's filters select by
+  prefix and key type. Its Groovy hook can drop keys by any rule, but then the reconciler keeps
+  reporting the dropped keys, so the cutover check cannot pass.
 
 If your organization already runs NiFi, r2dfly fits that operating model, with its counters in
 Prometheus and its flow on the NiFi canvas. RedisShake is a program you run, not a managed flow.

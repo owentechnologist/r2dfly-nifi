@@ -208,6 +208,16 @@ Optional:
                                  BATCH_SIZE_TOPK)
   --batch-size-bloom-cms N         same, for Bloom/Cuckoo Filter/CMS keys under --dfly-to-dfly
                                  (env BATCH_SIZE_BLOOM_CMS)
+  --rename-prefix RULES         comma-separated old=new key prefix rules, e.g. user:=account:
+                                 (env RENAME_PREFIX). Applied to the copy, the live phase, the
+                                 reconciler and search index prefixes alike.
+                                 See the Transforms section of docs/quickstart.md.
+  --ttl-strategy S              preserve (default), strip or reset (env TTL_STRATEGY)
+  --ttl-reset-offset-ms N       milliseconds added to each TTL under --ttl-strategy reset (env
+                                 TTL_RESET_OFFSET_MS, default: 0)
+  --transform-script FILE       a Groovy script run on every key record before it is written (env
+                                 TRANSFORM_SCRIPT).
+                                 See the Transforms section of docs/quickstart.md.
   --defaults                    skip the interactive resource/parallelism prompt and use the
                                  defaults above (env ASSUME_DEFAULTS)
   --disable-provenance          cap NiFi's provenance repository to a small fixed footprint
@@ -314,6 +324,10 @@ MODULE_BATCH_SIZE="${MODULE_BATCH_SIZE:-}"
 BATCH_SIZE_JSON="${BATCH_SIZE_JSON:-}"
 BATCH_SIZE_TOPK="${BATCH_SIZE_TOPK:-}"
 BATCH_SIZE_BLOOM_CMS="${BATCH_SIZE_BLOOM_CMS:-}"
+RENAME_PREFIX="${RENAME_PREFIX:-}"
+TTL_STRATEGY="${TTL_STRATEGY:-}"
+TTL_RESET_OFFSET_MS="${TTL_RESET_OFFSET_MS:-}"
+TRANSFORM_SCRIPT="${TRANSFORM_SCRIPT:-}"
 # Unset means "leave the RedisKeyspaceEventConsumer processor's own default in place" - STAGE 7
 # sends JSON null for each of these, which is how the NiFi API explicitly clears an optional
 # property back to its default rather than inheriting a previous run's value.
@@ -406,6 +420,10 @@ MAPPING = {
     ("migration", "batch-size-json"): "BATCH_SIZE_JSON",
     ("migration", "batch-size-topk"): "BATCH_SIZE_TOPK",
     ("migration", "batch-size-bloom-cms"): "BATCH_SIZE_BLOOM_CMS",
+    ("transform", "rename-prefix"): "RENAME_PREFIX",
+    ("transform", "ttl-strategy"): "TTL_STRATEGY",
+    ("transform", "ttl-reset-offset-ms"): "TTL_RESET_OFFSET_MS",
+    ("transform", "script"): "TRANSFORM_SCRIPT",
     ("live", "keyspace-pattern"): "KEYSPACE_PATTERN",
     ("live", "event-types"): "EVENT_TYPES",
     ("live", "max-queue-depth"): "MAX_QUEUE_DEPTH",
@@ -542,6 +560,10 @@ while [[ $# -gt 0 ]]; do
     --batch-size-json) require_value "$@"; BATCH_SIZE_JSON="$2"; shift 2 ;;
     --batch-size-topk) require_value "$@"; BATCH_SIZE_TOPK="$2"; shift 2 ;;
     --batch-size-bloom-cms) require_value "$@"; BATCH_SIZE_BLOOM_CMS="$2"; shift 2 ;;
+    --rename-prefix) require_value "$@"; RENAME_PREFIX="$2"; shift 2 ;;
+    --ttl-strategy) require_value "$@"; TTL_STRATEGY="$2"; shift 2 ;;
+    --ttl-reset-offset-ms) require_value "$@"; TTL_RESET_OFFSET_MS="$2"; shift 2 ;;
+    --transform-script) require_value "$@"; TRANSFORM_SCRIPT="$2"; shift 2 ;;
     --keyspace-pattern) require_value "$@"; KEYSPACE_PATTERN="$2"; shift 2 ;;
     --event-types) require_value "$@"; EVENT_TYPES="$2"; shift 2 ;;
     --max-queue-depth) require_value "$@"; MAX_QUEUE_DEPTH="$2"; shift 2 ;;
@@ -1263,6 +1285,10 @@ RUN_ARGS+=(--claim-timeout-ms "$CLAIM_TIMEOUT_MS" --source-read-from "$SOURCE_RE
 [[ -n "$BATCH_SIZE_JSON" ]] && RUN_ARGS+=(--batch-size-json "$BATCH_SIZE_JSON")
 [[ -n "$BATCH_SIZE_TOPK" ]] && RUN_ARGS+=(--batch-size-topk "$BATCH_SIZE_TOPK")
 [[ -n "$BATCH_SIZE_BLOOM_CMS" ]] && RUN_ARGS+=(--batch-size-bloom-cms "$BATCH_SIZE_BLOOM_CMS")
+[[ -n "$RENAME_PREFIX" ]] && RUN_ARGS+=(--rename-prefix "$RENAME_PREFIX")
+[[ -n "$TTL_STRATEGY" ]] && RUN_ARGS+=(--ttl-strategy "$TTL_STRATEGY")
+[[ -n "$TTL_RESET_OFFSET_MS" ]] && RUN_ARGS+=(--ttl-reset-offset-ms "$TTL_RESET_OFFSET_MS")
+[[ -n "$TRANSFORM_SCRIPT" ]] && RUN_ARGS+=(--transform-script "$TRANSFORM_SCRIPT")
 
 "$PROJECT_ROOT/scripts/run-r2dfly.sh" "${RUN_ARGS[@]}"
 

@@ -2,7 +2,9 @@ package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService;
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
+import io.dragonfly.nifi.redis.util.CommandBuilder;
 import io.dragonfly.nifi.redis.util.FailureReason;
+import io.dragonfly.nifi.redis.util.KeyMapping;
 import io.dragonfly.nifi.redis.util.Futures;
 import io.dragonfly.nifi.redis.util.ModuleCopy;
 import io.dragonfly.nifi.redis.util.RawModuleCommands;
@@ -27,6 +29,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -140,7 +143,8 @@ public class ModuleTypeHandler extends AbstractProcessor {
     public static final Relationship REL_FAILURE = new Relationship.Builder().name("failure").description("Unsupported module type or reconstruction failed").build();
 
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
-            SOURCE_CONNECTION_POOL, TARGET_CONNECTION_POOL, KEY_PREFIX, KEY_PREFIX_SEPARATOR, BATCH_SIZE,
+            SOURCE_CONNECTION_POOL, TARGET_CONNECTION_POOL, KeyMapping.KEY_RENAME, KEY_PREFIX, KEY_PREFIX_SEPARATOR,
+            RedisBatchWriter.TTL_STRATEGY, RedisBatchWriter.TTL_RESET_OFFSET_MS, BATCH_SIZE,
             BATCH_SIZE_JSON, BATCH_SIZE_TOPK, BATCH_SIZE_BLOOM_CMS, BATCH_TIMEOUT_MS, DFLY_TO_DFLY);
     // Auto-terminated by default so flows built before it existed stay valid; while nothing is
     // connected to it, these keys go to failure as they always did.
@@ -182,8 +186,9 @@ public class ModuleTypeHandler extends AbstractProcessor {
 
         RedisConnectionPoolService sourcePool = context.getProperty(SOURCE_CONNECTION_POOL).asControllerService(RedisConnectionPoolService.class);
         DragonflyConnectionPoolService targetPool = context.getProperty(TARGET_CONNECTION_POOL).asControllerService(DragonflyConnectionPoolService.class);
-        String prefix = context.getProperty(KEY_PREFIX).getValue();
-        String separator = context.getProperty(KEY_PREFIX_SEPARATOR).getValue();
+        KeyMapping keyMapping = KeyMapping.of(context, KEY_PREFIX, KEY_PREFIX_SEPARATOR);
+        CommandBuilder.TtlStrategy ttlStrategy = CommandBuilder.TtlStrategy.valueOf(context.getProperty(RedisBatchWriter.TTL_STRATEGY).getValue());
+        long ttlResetOffsetMs = context.getProperty(RedisBatchWriter.TTL_RESET_OFFSET_MS).asLong();
         boolean dflyToDfly = context.getProperty(DFLY_TO_DFLY).asBoolean();
         ComponentLog logger = getLogger();
 
@@ -194,14 +199,20 @@ public class ModuleTypeHandler extends AbstractProcessor {
         for (FlowFile flowFile : batch) {
             String key = flowFile.getAttribute("redis.key");
             String moduleType = flowFile.getAttribute("redis.type");
-            long ttlMs = parseLong(flowFile.getAttribute("redis.ttl.ms"), -1);
+            Long ttl = CommandBuilder.effectiveTtl(parseLong(flowFile.getAttribute("redis.ttl.ms"), -1), ttlStrategy, ttlResetOffsetMs);
             if (key == null || moduleType == null) {
                 session.transfer(session.penalize(FailureReason.tag(session, flowFile, "no redis.key or redis.type attribute")), REL_FAILURE);
                 continue;
             }
+            Optional<String> targetName = keyMapping.toTarget(key);
+            if (targetName.isEmpty()) {
+                session.transfer(FailureReason.tag(session, flowFile,
+                        "a renamed key takes this key's target name; exclude it or change Key Prefix Rename"), REL_FAILURE);
+                continue;
+            }
             byte[] sourceKey = key.getBytes(StandardCharsets.UTF_8);
-            byte[] targetKey = ((prefix == null || prefix.isEmpty()) ? key : prefix + separator + key).getBytes(StandardCharsets.UTF_8);
-            Item item = new Item(flowFile, sourceKey, targetKey, ttlMs);
+            byte[] targetKey = targetName.get().getBytes(StandardCharsets.UTF_8);
+            Item item = new Item(flowFile, sourceKey, targetKey, ttl == null ? -1 : ttl);
             switch (ModuleCopy.of(moduleType)) {
                 case JSON_REBUILD -> jsonItems.add(item);
                 case TOPK_REBUILD -> topkItems.add(item);

@@ -138,6 +138,40 @@ with a consumer group and a pending entry.
 Guarded by `FileRoundTripIT` (the JSON-lines and RESP round trips); the RDB and AOF loading was
 an end-to-end run of `simple-migration.sh` on scratch containers.
 
+## Transforms
+
+Tested end to end on scratch containers, a Redis Stack 7.4 source and a Dragonfly target, with
+`simple-migration.sh` and `continuous-migration.sh`.
+
+- `--rename-prefix user:=account:` left the target identical to the source under the new names,
+  for the copy, the keyspace live phase and the replication live phase (writes and deletes
+  alike). The source key `account:9`, which `user:9` would overwrite, was dead-lettered with
+  the reason. A search index on `PREFIX 1 user:h:` was rebuilt on Dragonfly with prefix
+  `account:h:`.
+- A full reconcile pass under the rename and `--ttl-strategy reset` found no differences.
+  `reset` left each target TTL 600 seconds above the source's, as asked.
+- Copying database 3 into database 5 (`/3` and `/5` on the connection strings) matched under
+  both live phases and left database 0 of the target empty. With the keyspace live phase, a
+  write to a key in database 0 of the source did not reach the target.
+- NiFi 2.11's `ExecuteGroovyScript` names its properties `Script File` and `Failure Strategy`.
+  The older `groovyx-script-file` names are taken as dynamic properties without an error, which
+  leaves the processor invalid with "At least one parameter required". `run-r2dfly.sh` therefore
+  checks that the hook is valid before starting the flow.
+
+- The example hook in the quickstart, run by `continuous-migration.sh --transform-script`,
+  upper-cased the `order:` strings and dropped the `tmp:` keys in the copy and in the keyspace
+  live phase. A record whose script threw was dead-lettered with the script's reason, and the
+  `DB` variable held the source database. A later run without the flag bypassed the hook and
+  left the target identical to the source.
+- An exception the script does not catch is not handled by `Failure Strategy` set to
+  `transfer to failure` when the script takes a batch with `session.get(1000)`: NiFi logs
+  "Processing halted", rolls the batch back and retries it without end. So the example catches
+  per record. A script that does not compile is refused at validation, and `run-r2dfly.sh`
+  stops with Groovy's compiler error.
+
+Guarded by `KeyMappingTest`, and by `MigrationReconcilerIT`, which runs a rename with reset TTLs
+through a pass, a clean pass, and a deleted source key.
+
 ## NiFi 2.11
 
 - Processor counters are exported on `/nifi-api/flow/metrics/prometheus` as

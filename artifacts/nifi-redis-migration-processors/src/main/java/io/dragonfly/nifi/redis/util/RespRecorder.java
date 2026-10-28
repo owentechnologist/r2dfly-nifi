@@ -31,7 +31,7 @@ public final class RespRecorder {
         ByteBuf out = Unpooled.buffer();
         StatefulRedisConnection<byte[], byte[]> connection = recordingConnection(out);
         CommandBuilder.write(new RedisAsyncCommandsImpl<>(connection, ByteArrayCodec.INSTANCE), connection, record,
-                null, ":", CommandBuilder.TtlStrategy.PRESERVE, 0, CommandBuilder.ConflictStrategy.OVERWRITE).join();
+                record.key, CommandBuilder.TtlStrategy.PRESERVE, 0, CommandBuilder.ConflictStrategy.OVERWRITE).join();
         byte[] bytes = new byte[out.readableBytes()];
         out.readBytes(bytes);
         return bytes;

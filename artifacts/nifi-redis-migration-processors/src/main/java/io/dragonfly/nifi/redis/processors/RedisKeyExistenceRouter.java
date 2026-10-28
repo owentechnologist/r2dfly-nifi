@@ -2,6 +2,7 @@ package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.dragonfly.nifi.redis.util.FailureReason;
+import io.dragonfly.nifi.redis.util.KeyMapping;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.components.PropertyDescriptor;
@@ -47,7 +48,7 @@ public class RedisKeyExistenceRouter extends AbstractProcessor {
     // call, so this relationship deliberately names the observation and not a remedy.
     public static final Relationship REL_MISSING = new Relationship.Builder().name("missing")
             .description("The key exists on the target but not on the source. redis.key is rewritten to the "
-                    + "bare, unprefixed key so a downstream processor can re-apply its own Key Prefix.").build();
+                    + "source key it was copied from, so a downstream processor can map it again.").build();
     public static final Relationship REL_FILTERED = new Relationship.Builder().name("filtered")
             .description("The key is outside the migration's configured prefix scope, so the source was "
                     + "never consulted").build();
@@ -55,7 +56,7 @@ public class RedisKeyExistenceRouter extends AbstractProcessor {
             .description("The EXISTS command failed for this key").build();
 
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
-            REDIS_CONNECTION_POOL, KEY_PREFIX, KEY_PREFIX_SEPARATOR, PREFIX_DENY_LIST, PREFIX_ONLY_LIST);
+            REDIS_CONNECTION_POOL, KeyMapping.KEY_RENAME, KEY_PREFIX, KEY_PREFIX_SEPARATOR, PREFIX_DENY_LIST, PREFIX_ONLY_LIST);
 
     private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_EXISTS, REL_MISSING, REL_FILTERED, REL_FAILURE);
 
@@ -87,8 +88,7 @@ public class RedisKeyExistenceRouter extends AbstractProcessor {
         // target data as a migration finding.
         Optional<String> sourceKey = inScopeSourceKey(
                 targetKey,
-                context.getProperty(KEY_PREFIX).getValue(),
-                context.getProperty(KEY_PREFIX_SEPARATOR).getValue(),
+                KeyMapping.of(context, KEY_PREFIX, KEY_PREFIX_SEPARATOR),
                 parsePrefixList(context.getProperty(PREFIX_DENY_LIST).getValue()),
                 parsePrefixList(context.getProperty(PREFIX_ONLY_LIST).getValue()));
         if (sourceKey.isEmpty()) {
@@ -122,26 +122,19 @@ public class RedisKeyExistenceRouter extends AbstractProcessor {
      * Maps a target-side key back to the source key it was written from, or empty when the key falls
      * outside the migration's scope. A key that does not carry the configured Key Prefix was not
      * written by this migration at all, so it is out of scope by the same rule as the deny/only lists.
-     * Both lists are matched against the unprefixed key, so the same values configured on the forward
+     * Both lists are matched against the source key, so the same values configured on the forward
      * leg's RedisScanReader apply here unchanged.
      */
-    static Optional<String> inScopeSourceKey(String targetKey, String prefix, String separator,
+    static Optional<String> inScopeSourceKey(String targetKey, KeyMapping keyMapping,
                                              List<String> denyPrefixes, List<String> onlyPrefixes) {
-        String bareKey = targetKey;
-        if (prefix != null && !prefix.isEmpty()) {
-            String qualified = prefix + separator;
-            if (!targetKey.startsWith(qualified)) {
-                return Optional.empty();
-            }
-            bareKey = targetKey.substring(qualified.length());
-        }
-        if (startsWithAny(bareKey, denyPrefixes)) {
+        Optional<String> sourceKey = keyMapping.toSource(targetKey);
+        if (sourceKey.isEmpty() || startsWithAny(sourceKey.get(), denyPrefixes)) {
             return Optional.empty();
         }
-        if (!onlyPrefixes.isEmpty() && !startsWithAny(bareKey, onlyPrefixes)) {
+        if (!onlyPrefixes.isEmpty() && !startsWithAny(sourceKey.get(), onlyPrefixes)) {
             return Optional.empty();
         }
-        return Optional.of(bareKey);
+        return sourceKey;
     }
 
     static List<String> parsePrefixList(String value) {

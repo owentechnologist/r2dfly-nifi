@@ -2,6 +2,7 @@ package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService;
 import io.dragonfly.nifi.redis.util.FailureReason;
+import io.dragonfly.nifi.redis.util.KeyMapping;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.components.PropertyDescriptor;
@@ -14,6 +15,7 @@ import org.apache.nifi.processor.exception.ProcessException;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 @Tags({"redis", "dragonfly", "migration", "live", "target"})
@@ -34,7 +36,7 @@ public class DeleteRedisKey extends AbstractProcessor {
     public static final Relationship REL_SUCCESS = new Relationship.Builder().name("success").description("Key deleted (or already absent) on the target").build();
     public static final Relationship REL_FAILURE = new Relationship.Builder().name("failure").description("Delete failed").build();
 
-    private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(DRAGONFLY_CONNECTION_POOL, KEY_PREFIX, KEY_PREFIX_SEPARATOR);
+    private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(DRAGONFLY_CONNECTION_POOL, KeyMapping.KEY_RENAME, KEY_PREFIX, KEY_PREFIX_SEPARATOR);
     private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_SUCCESS, REL_FAILURE);
 
     @Override
@@ -60,9 +62,13 @@ public class DeleteRedisKey extends AbstractProcessor {
             return;
         }
 
-        String prefix = context.getProperty(KEY_PREFIX).getValue();
-        String separator = context.getProperty(KEY_PREFIX_SEPARATOR).getValue();
-        byte[] targetKey = ((prefix == null || prefix.isEmpty()) ? key : prefix + separator + key).getBytes(StandardCharsets.UTF_8);
+        // A key with no target name was never copied, so there is nothing to delete.
+        Optional<String> targetName = KeyMapping.of(context, KEY_PREFIX, KEY_PREFIX_SEPARATOR).toTarget(key);
+        if (targetName.isEmpty()) {
+            session.transfer(flowFile, REL_SUCCESS);
+            return;
+        }
+        byte[] targetKey = targetName.get().getBytes(StandardCharsets.UTF_8);
 
         DragonflyConnectionPoolService dragonflyPool = context.getProperty(DRAGONFLY_CONNECTION_POOL).asControllerService(DragonflyConnectionPoolService.class);
         try {

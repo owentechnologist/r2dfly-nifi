@@ -8,6 +8,7 @@ import io.dragonfly.nifi.redis.processors.RedisTypeDeserializer;
 import io.dragonfly.nifi.redis.services.AbstractRedisConnectionPoolService;
 import io.dragonfly.nifi.redis.services.StandardDragonflyConnectionPoolService;
 import io.dragonfly.nifi.redis.services.StandardRedisConnectionPoolService;
+import io.dragonfly.nifi.redis.util.KeyMapping;
 import io.lettuce.core.Consumer;
 import io.lettuce.core.Range;
 import io.lettuce.core.RedisClient;
@@ -134,6 +135,37 @@ class MigrationReconcilerIT {
         assertEquals(Map.of("missing_on_target", 1L), counts(report));
         assertEquals(List.of("user:1"), tgt.sync().keys("*"));
         assertEquals(0, pipeline.pass().get("differences").asLong(), "the skipped keys stay out of every pass");
+    }
+
+    @Test
+    void comparesEachKeyUnderItsRenamedNameAndTheTtlStrategy() throws Exception {
+        RedisCommands<String, String> s = src.sync();
+        RedisCommands<String, String> t = tgt.sync();
+        for (int i = 0; i < 20; i++) {
+            s.set("user:" + i, "v" + i);
+        }
+        s.set("user:ttl", "x", SetArgs.Builder.ex(3600));
+        s.hset("order:1", Map.of("f", "v"));
+
+        Pipeline pipeline = new Pipeline("FULL");
+        for (TestRunner runner : List.of(pipeline.reconciler, pipeline.writer)) {
+            runner.setProperty(KeyMapping.KEY_RENAME, "user:=account:");
+            runner.setProperty(RedisBatchWriter.TTL_STRATEGY, "RESET");
+            runner.setProperty(RedisBatchWriter.TTL_RESET_OFFSET_MS, "600000");
+        }
+        assertEquals(Map.of("missing_on_target", 22L), counts(pipeline.pass()));
+        assertEquals(22, t.dbsize());
+        assertEquals(List.of(), t.keys("user:*"));
+        assertEquals("v7", t.get("account:7"));
+        long ttl = t.pttl("account:ttl");
+        assertTrue(ttl > 4_100_000 && ttl <= 4_200_000, "the source's hour plus ten minutes, was " + ttl);
+        assertEquals(0, pipeline.pass().get("differences").asLong(), "renamed keys with reset TTLs match");
+
+        s.del("user:2");
+        t.set("user:5", "not written by the migration");
+        assertEquals(Map.of("extra_on_target", 1L), counts(pipeline.pass()));
+        assertEquals(0, t.exists("account:2"));
+        assertEquals("not written by the migration", t.get("user:5"), "a key no source key maps to is left alone");
     }
 
     @Test

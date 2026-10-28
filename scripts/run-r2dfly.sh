@@ -43,6 +43,21 @@ Files (paths inside the NiFi container; simple-migration.sh copies files in and 
                                  cannot be written to a file, so --key-types keeps only core types.
   --target-file-format F        jsonl (default) or resp (env TARGET_FILE_FORMAT)
 
+Transforms, applied wherever keys are written, deleted, compared or indexed:
+  --rename-prefix RULES         comma-separated old=new key prefix rules, e.g. user:=account:
+                                 (env RENAME_PREFIX, default: none). The longest matching old prefix
+                                 wins; a source key already under a new prefix is dead-lettered,
+                                 since a renamed key would overwrite it.
+  --ttl-strategy S              preserve (default), strip (no TTLs on the target) or reset (add
+                                 --ttl-reset-offset-ms to each TTL) (env TTL_STRATEGY)
+  --ttl-reset-offset-ms N       milliseconds added under --ttl-strategy reset (env
+                                 TTL_RESET_OFFSET_MS, default: 0)
+  --transform-script FILE       a Groovy script run on every key record before it is written, in a
+                                 "Transform Hook" ExecuteGroovyScript processor placed in front of
+                                 RedisBatchWriter (env TRANSFORM_SCRIPT).
+                                 See the Transforms section of docs/quickstart.md.
+                                 Turns off the RESTORE fast path, so every record is JSON.
+
 Scan behavior:
   --key-types LIST              comma-separated Redis types to scan/migrate (env KEY_TYPES,
                                  default: string,hash,set,zset,list,stream,ReJSON-RL - ReJSON-RL
@@ -363,6 +378,10 @@ SOURCE_READ_FROM="${SOURCE_READ_FROM:-master}"
 MAX_DUMP_PAYLOAD_BYTES="${MAX_DUMP_PAYLOAD_BYTES:-67108864}"
 PARALLELISM="${PARALLELISM:-1}"
 WRITER_CONCURRENCY="${WRITER_CONCURRENCY:-1}"
+RENAME_PREFIX="${RENAME_PREFIX:-}"
+TTL_STRATEGY="${TTL_STRATEGY:-preserve}"
+TTL_RESET_OFFSET_MS="${TTL_RESET_OFFSET_MS:-0}"
+TRANSFORM_SCRIPT="${TRANSFORM_SCRIPT:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -419,6 +438,10 @@ while [[ $# -gt 0 ]]; do
     --max-dump-payload-bytes) MAX_DUMP_PAYLOAD_BYTES="$2"; shift 2 ;;
     --parallelism) PARALLELISM="$2"; shift 2 ;;
     --writer-concurrency) WRITER_CONCURRENCY="$2"; shift 2 ;;
+    --rename-prefix) RENAME_PREFIX="$2"; shift 2 ;;
+    --ttl-strategy) TTL_STRATEGY="$2"; shift 2 ;;
+    --ttl-reset-offset-ms) TTL_RESET_OFFSET_MS="$2"; shift 2 ;;
+    --transform-script) TRANSFORM_SCRIPT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 1 ;;
   esac
@@ -433,6 +456,27 @@ fi
 if [[ -n "$SOURCE_FILE" && -n "$TARGET_FILE" ]]; then
   echo "error: --source-file and --target-file cannot be used together" >&2; usage; exit 1
 fi
+TTL_STRATEGY="$(tr '[:lower:]' '[:upper:]' <<< "$TTL_STRATEGY")"
+case "$TTL_STRATEGY" in
+  PRESERVE|STRIP|RESET) ;;
+  *) echo "error: --ttl-strategy must be preserve, strip or reset (got '$TTL_STRATEGY')" >&2; usage; exit 1 ;;
+esac
+if ! [[ "$TTL_RESET_OFFSET_MS" =~ ^[0-9]+$ ]]; then
+  echo "error: --ttl-reset-offset-ms must be a non-negative integer (got '$TTL_RESET_OFFSET_MS')" >&2; usage; exit 1
+fi
+IFS=',' read -ra _RULES <<< "$RENAME_PREFIX"
+for _rule in ${_RULES[@]+"${_RULES[@]}"}; do
+  [[ -z "${_rule// /}" ]] && continue
+  if [[ "$_rule" != *=* || -z "${_rule#*=}" ]]; then
+    echo "error: --rename-prefix rule '$_rule' is not old=new with a non-empty new prefix" >&2; usage; exit 1
+  fi
+done
+unset _RULES _rule
+if [[ -n "$TRANSFORM_SCRIPT" && ! -f "$TRANSFORM_SCRIPT" ]]; then
+  echo "error: --transform-script $TRANSFORM_SCRIPT does not exist" >&2; exit 1
+fi
+# The hook edits key records, and a DUMP payload is not one.
+[[ -n "$TRANSFORM_SCRIPT" ]] && RESTORE_FAST_PATH="false"
 case "$TARGET_FILE_FORMAT" in
   jsonl|resp) ;;
   *) echo "error: --target-file-format must be jsonl or resp (got '$TARGET_FILE_FORMAT')" >&2; usage; exit 1 ;;
@@ -725,7 +769,7 @@ import json, sys
 d = json.load(sys.stdin)
 order = ['RedisScanReader', 'RedisBatchWriter', 'ModuleTypeHandler', 'RedisTypeDeserializer', 'SearchIndexExporter', 'SearchIndexRehydrator',
          'RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'RedisReplicationReader', 'RedisTypeDeserializer (live)',
-         'MigrationReconciler', 'RedisDeadLetterWriter', 'KeyRecordFileWriter', 'KeyRecordFileReader']
+         'MigrationReconciler', 'RedisDeadLetterWriter', 'KeyRecordFileWriter', 'KeyRecordFileReader', 'DeleteRedisKey', 'ExecuteGroovyScript']
 ids = {name: '' for name in order}
 for p in d['processors']:
     t = p['component']['type']
@@ -739,7 +783,7 @@ for p in d['processors']:
             break
 print('|'.join(ids[name] for name in order))
 ")" || true
-IFS='|' read -r PROC_SCAN PROC_WRITER PROC_MTH PROC_DESER PROC_SIDX_EXPORT PROC_SIDX_REHYDRATE PROC_LIVE_CONSUMER PROC_LIVE_FETCH PROC_REPL_READER PROC_REPL_DESER PROC_RECONCILER PROC_DEAD_LETTER PROC_FILE_WRITER PROC_FILE_READER <<< "$PROC_IDS"
+IFS='|' read -r PROC_SCAN PROC_WRITER PROC_MTH PROC_DESER PROC_SIDX_EXPORT PROC_SIDX_REHYDRATE PROC_LIVE_CONSUMER PROC_LIVE_FETCH PROC_REPL_READER PROC_REPL_DESER PROC_RECONCILER PROC_DEAD_LETTER PROC_FILE_WRITER PROC_FILE_READER PROC_DELETE PROC_HOOK <<< "$PROC_IDS"
 if [[ -z "$PROC_SCAN" ]]; then
   echo "error: could not find the RedisScanReader processor in $PG_ID" >&2; exit 1
 fi
@@ -952,7 +996,11 @@ echo "  batch-size=$BATCH_SIZE  batch-timeout-ms=$BATCH_TIMEOUT_MS  writer-concu
 echo "  batch-size-string=${BATCH_SIZE_STRING:-<none>}  batch-size-hash=${BATCH_SIZE_HASH:-<none>}  batch-size-list=${BATCH_SIZE_LIST:-<none>}"
 echo "  batch-size-set=${BATCH_SIZE_SET:-<none>}  batch-size-zset=${BATCH_SIZE_ZSET:-<none>}  batch-size-stream=${BATCH_SIZE_STREAM:-<none>}"
 PROC_VER="$(nifi_current_version "processors/$PROC_WRITER")" || true
-WRITER_PROPS="\"batch-size\":\"$BATCH_SIZE\",\"batch-timeout-ms\":\"$BATCH_TIMEOUT_MS\""
+# Every processor that writes, deletes, compares or indexes target keys gets the same mapping.
+RENAME_PROPS="\"key-prefix-rename\":$(json_or_null "$RENAME_PREFIX")"
+TTL_PROPS="\"ttl-strategy\":\"$TTL_STRATEGY\",\"ttl-reset-offset-ms\":\"$TTL_RESET_OFFSET_MS\""
+echo "  rename-prefix=${RENAME_PREFIX:-<none>}  ttl-strategy=$TTL_STRATEGY  ttl-reset-offset-ms=$TTL_RESET_OFFSET_MS"
+WRITER_PROPS="\"batch-size\":\"$BATCH_SIZE\",\"batch-timeout-ms\":\"$BATCH_TIMEOUT_MS\",$RENAME_PROPS,$TTL_PROPS"
 WRITER_PROPS="$WRITER_PROPS,\"batch-size-string\":$(json_or_null "$BATCH_SIZE_STRING")"
 WRITER_PROPS="$WRITER_PROPS,\"batch-size-hash\":$(json_or_null "$BATCH_SIZE_HASH")"
 WRITER_PROPS="$WRITER_PROPS,\"batch-size-list\":$(json_or_null "$BATCH_SIZE_LIST")"
@@ -967,7 +1015,7 @@ if [[ -n "$PROC_MTH" ]]; then
   echo "  batch-size=$MODULE_BATCH_SIZE  batch-timeout-ms=$MODULE_BATCH_TIMEOUT_MS  dfly-to-dfly=$DFLY_TO_DFLY  parallelism=$PARALLELISM"
   echo "  batch-size-json=${BATCH_SIZE_JSON:-<none>}  batch-size-topk=${BATCH_SIZE_TOPK:-<none>}  batch-size-bloom-cms=${BATCH_SIZE_BLOOM_CMS:-<none>}"
   PROC_VER="$(nifi_current_version "processors/$PROC_MTH")" || true
-  MTH_PROPS="\"batch-size\":\"$MODULE_BATCH_SIZE\",\"batch-timeout-ms\":\"$MODULE_BATCH_TIMEOUT_MS\",\"dfly-to-dfly\":\"$DFLY_TO_DFLY\""
+  MTH_PROPS="\"batch-size\":\"$MODULE_BATCH_SIZE\",\"batch-timeout-ms\":\"$MODULE_BATCH_TIMEOUT_MS\",\"dfly-to-dfly\":\"$DFLY_TO_DFLY\",$RENAME_PROPS,$TTL_PROPS"
   MTH_PROPS="$MTH_PROPS,\"batch-size-json\":$(json_or_null "$BATCH_SIZE_JSON")"
   MTH_PROPS="$MTH_PROPS,\"batch-size-topk\":$(json_or_null "$BATCH_SIZE_TOPK")"
   MTH_PROPS="$MTH_PROPS,\"batch-size-bloom-cms\":$(json_or_null "$BATCH_SIZE_BLOOM_CMS")"
@@ -975,6 +1023,16 @@ if [[ -n "$PROC_MTH" ]]; then
   nifi_api_put_checked "processors/$PROC_MTH" "$PROC_BODY" > /dev/null
 else
   echo "==> ModuleTypeHandler processor not found; skipping its batch tuning (older flow definition?)"
+fi
+
+# The live phase's delete and the reconciler's comparison must name each key the way the writer does.
+if [[ -n "$PROC_DELETE" ]]; then
+  PROC_VER="$(nifi_current_version "processors/$PROC_DELETE")" || true
+  nifi_api_put_checked "processors/$PROC_DELETE" "{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_DELETE\",\"config\":{\"properties\":{$RENAME_PROPS}}}}" > /dev/null
+fi
+if [[ -n "$PROC_RECONCILER" ]]; then
+  PROC_VER="$(nifi_current_version "processors/$PROC_RECONCILER")" || true
+  nifi_api_put_checked "processors/$PROC_RECONCILER" "{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_RECONCILER\",\"config\":{\"properties\":{$RENAME_PROPS,$TTL_PROPS}}}}" > /dev/null
 fi
 
 # ensure_ssl_context_service - reuses an existing SSL Context Service in this process group if
@@ -1187,7 +1245,7 @@ if [[ "$IGNORE_SEARCH_INDEXES" != "true" ]]; then
     echo "==> exporting search index definitions on the source (SearchIndexExporter)"
     run_oneshot_processor "$PROC_SIDX_EXPORT" "SearchIndexExporter" || true
     echo "==> rebuilding search indexes on the target (SearchIndexRehydrator)"
-    run_oneshot_processor "$PROC_SIDX_REHYDRATE" "SearchIndexRehydrator" "" ",\"index-overwrite\":\"$INDEX_OVERWRITE\"" || true
+    run_oneshot_processor "$PROC_SIDX_REHYDRATE" "SearchIndexRehydrator" "" ",\"index-overwrite\":\"$INDEX_OVERWRITE\",$RENAME_PROPS" || true
   else
     echo "warning: SearchIndexExporter/SearchIndexRehydrator not found in this flow (older flow definition?) - search index migration skipped. Delete and re-import the process group (reset-r2dfly-flow.sh, then deploy-to-nifi.sh) to pick them up, or pass --ignore-search-indexes to silence this." >&2
   fi
@@ -1253,13 +1311,8 @@ set_processor_state() {
 FILE_PROCESSORS_TO_START=()
 FILE_RECORDS_BASE=0
 SOURCE_FILE_RECORDS=0
-if [[ -n "$SOURCE_FILE" || -n "$TARGET_FILE" || -n "$PROC_FILE_WRITER" || -n "$PROC_FILE_READER" ]]; then
-  if [[ -z "$PROC_DEAD_LETTER" ]]; then
-    echo "error: could not find the RedisDeadLetterWriter processor in $PG_ID. Re-import the baseline with reset-r2dfly-flow.sh." >&2; exit 1
-  fi
-  echo "==> stopping the flow to wire it for this run's source and target"
-  nifi_cli pg-stop -pgid "$PG_ID" >/dev/null || true
-  wait_for_processors_stopped "$PG_ID" || true
+if [[ -n "$SOURCE_FILE$TARGET_FILE$TRANSFORM_SCRIPT" && -z "$PROC_DEAD_LETTER" ]]; then
+  echo "error: could not find the RedisDeadLetterWriter processor in $PG_ID. Re-import the baseline with reset-r2dfly-flow.sh." >&2; exit 1
 fi
 if [[ -n "$TARGET_FILE" ]]; then
   [[ -n "$PROC_FILE_WRITER" ]] || PROC_FILE_WRITER="$(ensure_processor KeyRecordFileWriter 1200 400)"
@@ -1268,9 +1321,11 @@ if [[ -n "$TARGET_FILE" ]]; then
   connect_processors "$PROC_FILE_WRITER" "$PROC_DEAD_LETTER" failure
   connect_processors "$PROC_DESER" "$PROC_FILE_WRITER" success
   disconnect_processors "$PROC_DESER" "$PROC_WRITER" success
+  [[ -n "$PROC_HOOK" ]] && disconnect_processors "$PROC_DESER" "$PROC_HOOK" success
   FILE_PROCESSORS_TO_START=("$PROC_SCAN" "$PROC_DESER" "$PROC_FILE_WRITER" "$PROC_DEAD_LETTER")
 elif [[ -n "$PROC_FILE_WRITER" ]]; then
-  connect_processors "$PROC_DESER" "$PROC_WRITER" success
+  # Through the transform hook when there is one; the hook block below handles that case.
+  [[ -n "$(connection_id "$PROC_DESER" "${PROC_HOOK:-none}" success)" ]] || connect_processors "$PROC_DESER" "$PROC_WRITER" success
   disconnect_processors "$PROC_DESER" "$PROC_FILE_WRITER" success
 fi
 if [[ -n "$SOURCE_FILE" ]]; then
@@ -1286,6 +1341,70 @@ fi
 # Left disabled whatever this run does: a file run starts only its own processors, below.
 [[ -n "$PROC_FILE_WRITER" ]] && set_processor_state "$PROC_FILE_WRITER" DISABLED
 [[ -n "$PROC_FILE_READER" ]] && set_processor_state "$PROC_FILE_READER" DISABLED
+
+# --- The transform hook: an ExecuteGroovyScript named "Transform Hook" in front of RedisBatchWriter.
+#     Every connection into the writer, other than its own retry loop, is redirected to the hook, so
+#     the scan, the live phase, the reconciler's repairs and a file import all pass through it.
+#     Redirecting a connection keeps whatever is queued on it. Without --transform-script, a hook
+#     left by an earlier run is bypassed and disabled. ---
+
+# redirect_inputs <from-id> <to-id> - every connection into one processor, sent to another instead.
+# A connection that would duplicate one already there is removed, so a record is never copied twice.
+redirect_inputs() {
+  local from="$1" to="$2" id src rels
+  while IFS='|' read -r id src rels; do
+    [[ -n "$id" ]] || continue
+    if [[ -n "$(connection_id "$src" "$to" "${rels%%,*}")" ]]; then
+      disconnect_processors "$src" "$from" "${rels%%,*}"
+      continue
+    fi
+    nifi_api_put_checked "connections/$id" "{\"revision\":{\"version\":$(nifi_current_version "connections/$id")},\"component\":{\"id\":\"$id\",\"destination\":{\"id\":\"$to\",\"groupId\":\"$PG_ID\",\"type\":\"PROCESSOR\"}}}" > /dev/null
+  done <<< "$(nifi_api_get "process-groups/$PG_ID/connections" | py3 "
+import json, sys
+for c in json.load(sys.stdin)['connections']:
+    k = c['component']
+    if k['destination']['id'] == '$from' and k['source']['id'] not in ('$from', '$to'):
+        print(c['id'] + '|' + k['source']['id'] + '|' + ','.join(k.get('selectedRelationships') or []))
+")"
+}
+
+if [[ -n "$TRANSFORM_SCRIPT" ]]; then
+  HOOK_FILE="/opt/nifi/nifi-current/r2dfly-files/transform.groovy"
+  runtime_exec "$CONTAINER_NAME" mkdir -p "$(dirname "$HOOK_FILE")"
+  "$RUNTIME" cp "$TRANSFORM_SCRIPT" "$CONTAINER_NAME:$HOOK_FILE"
+  if [[ -z "$PROC_HOOK" ]]; then
+    PROC_HOOK="$(nifi_api_post "process-groups/$PG_ID/processors" '{"revision":{"version":0},"component":{"type":"org.apache.nifi.processors.groovyx.ExecuteGroovyScript","bundle":{"group":"org.apache.nifi","artifact":"nifi-groovyx-nar","version":"2.11.0"},"name":"Transform Hook","position":{"x":1600,"y":400}}}' \
+      | py3 "import json,sys; print(json.load(sys.stdin)['id'])")" || true
+    [[ -n "$PROC_HOOK" ]] || { echo "error: could not create the Transform Hook processor" >&2; exit 1; }
+  fi
+  # DB is the source database, RedisShake's DB variable; a file source has none.
+  SOURCE_DB="$(sed -n 's|^rediss\{0,1\}://[^/]*/\([0-9][0-9]*\).*|\1|p' <<< "${SOURCE_CONNECTION_STRING%%,*}")"
+  echo "==> placing the transform hook in front of RedisBatchWriter ($TRANSFORM_SCRIPT, DB=${SOURCE_DB:-0})"
+  set_processor_state "$PROC_HOOK" STOPPED
+  PROC_VER="$(nifi_current_version "processors/$PROC_HOOK")" || true
+  nifi_api_put_checked "processors/$PROC_HOOK" "{\"revision\":{\"version\":$PROC_VER},\"component\":{\"id\":\"$PROC_HOOK\",\"config\":{\"properties\":{\"Script File\":\"$HOOK_FILE\",\"Failure Strategy\":\"transfer to failure\",\"DB\":\"${SOURCE_DB:-0}\"}}}}" > /dev/null
+  redirect_inputs "$PROC_WRITER" "$PROC_HOOK"
+  connect_processors "$PROC_HOOK" "$PROC_WRITER" success
+  connect_processors "$PROC_HOOK" "$PROC_DEAD_LETTER" failure
+  # Every record waits in front of an invalid hook, so a script NiFi rejects stops the run here.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    HOOK_STATUS="$(nifi_api_get "processors/$PROC_HOOK" | py3 "
+import json, sys
+c = json.load(sys.stdin)['component']
+print(c.get('validationStatus', '') + '|' + '; '.join(c.get('validationErrors') or []))
+")" || true
+    [[ "${HOOK_STATUS%%|*}" == "VALIDATING" || -z "$HOOK_STATUS" ]] || break
+    sleep 1
+  done
+  if [[ "${HOOK_STATUS%%|*}" != "VALID" ]]; then
+    echo "error: NiFi rejected the transform hook: ${HOOK_STATUS#*|}" >&2; exit 1
+  fi
+  [[ ${#FILE_PROCESSORS_TO_START[@]} -gt 0 ]] && FILE_PROCESSORS_TO_START+=("$PROC_HOOK")
+elif [[ -n "$PROC_HOOK" ]]; then
+  echo "==> bypassing the transform hook left by an earlier run"
+  redirect_inputs "$PROC_HOOK" "$PROC_WRITER"
+  set_processor_state "$PROC_HOOK" DISABLED
+fi
 
 # nifi_counter <name> - the counter summed across processors, 0 if never incremented.
 nifi_counter() {
