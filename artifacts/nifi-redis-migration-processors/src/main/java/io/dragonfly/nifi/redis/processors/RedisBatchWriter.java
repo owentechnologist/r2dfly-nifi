@@ -6,6 +6,7 @@ import io.dragonfly.nifi.redis.util.CommandBuilder;
 import io.dragonfly.nifi.redis.util.FailureReason;
 import io.dragonfly.nifi.redis.util.KeyMapping;
 import io.dragonfly.nifi.redis.util.KeyRecord;
+import io.dragonfly.nifi.redis.util.RedisBytes;
 import io.dragonfly.nifi.redis.util.RedisTypeSerializer;
 import io.dragonfly.nifi.redis.util.RetryPolicy;
 import io.lettuce.core.api.StatefulConnection;
@@ -235,8 +236,7 @@ public class RedisBatchWriter extends AbstractProcessor {
                     session.transfer(session.penalize(FailureReason.tag(session, flowFile, "reading the DUMP payload failed", e)), REL_FAILURE);
                     continue;
                 }
-                KeyRecord dumpRecord = new KeyRecord(
-                        flowFile.getAttribute("redis.key"), flowFile.getAttribute("redis.type"),
+                KeyRecord dumpRecord = KeyRecord.of(RedisBytes.key(flowFile), false, flowFile.getAttribute("redis.type"),
                         parseLong(flowFile.getAttribute("redis.ttl.ms"), -1), null, null);
                 dumpRecord.dumpPayload = payload;
                 inOrder.add(new PendingWrite(flowFile, dumpRecord, null));
@@ -262,7 +262,7 @@ public class RedisBatchWriter extends AbstractProcessor {
         }
         List<PendingWrite> writes = new ArrayList<>();
         for (PendingWrite pending : latestPerKey(session, ready)) {
-            Optional<String> targetKey = keyMapping.toTarget(pending.record.key);
+            Optional<byte[]> targetKey = keyMapping.toTarget(pending.record.keyBytes());
             if (targetKey.isEmpty()) {
                 session.transfer(FailureReason.tag(session, pending.flowFile,
                         "a renamed key takes this key's target name; exclude it or change Key Prefix Rename"), REL_FAILURE);
@@ -310,7 +310,7 @@ public class RedisBatchWriter extends AbstractProcessor {
                     case CONFLICT -> session.transfer(FailureReason.tag(session, flowFile,
                             "the key already exists on the target and conflict-strategy is FAIL"), REL_FAILURE);
                     case RESTORE_REJECTED -> {
-                        getLogger().warn("Target rejected the DUMP payload for key {}; sending it back for a typed copy", writes.get(i).record.key);
+                        getLogger().warn("Target rejected the DUMP payload for key {}; sending it back for a typed copy", RedisBytes.display(writes.get(i).record.keyBytes()));
                         FlowFile rejected = session.putAttribute(flowFile, "redis.restore.rejected", "true");
                         if (context.hasConnection(REL_RESTORE_REJECTED)) {
                             session.transfer(rejected, REL_RESTORE_REJECTED);
@@ -334,7 +334,7 @@ public class RedisBatchWriter extends AbstractProcessor {
         Map<String, Integer> lastChunkAt = new HashMap<>();
         for (int i = 0; i < inOrder.size(); i++) {
             if (ChunkReassembler.isChunk(inOrder.get(i).flowFile)) {
-                lastChunkAt.put(inOrder.get(i).record.key, i);
+                lastChunkAt.put(RedisBytes.identity(inOrder.get(i).record.keyBytes()), i);
             }
         }
         List<PendingWrite> ready = new ArrayList<>(inOrder.size());
@@ -342,8 +342,8 @@ public class RedisBatchWriter extends AbstractProcessor {
             PendingWrite pending = inOrder.get(i);
             if (!ChunkReassembler.isChunk(pending.flowFile)) {
                 ready.add(pending);
-            } else if (lastChunkAt.get(pending.record.key) == i) {
-                ChunkReassembler.join(session, groups.get(pending.record.key), REL_FAILURE)
+            } else if (lastChunkAt.get(RedisBytes.identity(pending.record.keyBytes())) == i) {
+                ChunkReassembler.join(session, groups.get(RedisBytes.identity(pending.record.keyBytes())), REL_FAILURE)
                         .ifPresent(joined -> ready.add(new PendingWrite(joined.flowFile(), joined.record(), null)));
             }
         }
@@ -376,7 +376,7 @@ public class RedisBatchWriter extends AbstractProcessor {
             if (future.isDone() && !future.isCompletedExceptionally()) {
                 outcomes.add(new Written(future.join(), null));
             } else {
-                String key = ready.get(i).record.key;
+                String key = RedisBytes.display(ready.get(i).record.keyBytes());
                 if (future.isCompletedExceptionally()) {
                     Throwable cause = null;
                     try {
@@ -406,7 +406,7 @@ public class RedisBatchWriter extends AbstractProcessor {
         List<PendingWrite> kept = new ArrayList<>(ready.size());
         for (int i = ready.size() - 1; i >= 0; i--) {
             PendingWrite pending = ready.get(i);
-            if (seen.add(pending.record.key)) {
+            if (seen.add(RedisBytes.identity(pending.record.keyBytes()))) {
                 kept.add(pending);
             } else {
                 session.adjustCounter("Writes Superseded by a Later Read", 1, false);
@@ -461,7 +461,7 @@ public class RedisBatchWriter extends AbstractProcessor {
     }
 
     /** targetKey is null until the key mapping has named it. */
-    private record PendingWrite(FlowFile flowFile, KeyRecord record, String targetKey) {
+    private record PendingWrite(FlowFile flowFile, KeyRecord record, byte[] targetKey) {
     }
 
     // ReadyBatchFilter buckets by Redis type: a type with its own perTypeLimits entry gets an
@@ -498,7 +498,8 @@ public class RedisBatchWriter extends AbstractProcessor {
         @Override
         public FlowFileFilterResult filter(FlowFile flowFile) {
             scanned++;
-            String key = flowFile.getAttribute("redis.key");
+            byte[] keyBytes = RedisBytes.key(flowFile);
+            String key = keyBytes == null ? null : RedisBytes.identity(keyBytes);
             if (key != null && heldBack.contains(key)) {
                 return FlowFileFilterResult.REJECT_AND_CONTINUE;
             }

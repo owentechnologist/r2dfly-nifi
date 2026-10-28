@@ -5,6 +5,7 @@ import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.dragonfly.nifi.redis.util.CommandBuilder;
 import io.dragonfly.nifi.redis.util.FailureReason;
 import io.dragonfly.nifi.redis.util.KeyMapping;
+import io.dragonfly.nifi.redis.util.RedisBytes;
 import io.dragonfly.nifi.redis.util.Futures;
 import io.dragonfly.nifi.redis.util.ModuleCopy;
 import io.dragonfly.nifi.redis.util.RawModuleCommands;
@@ -197,22 +198,20 @@ public class ModuleTypeHandler extends AbstractProcessor {
         List<Item> dumpRestoreOnlyItems = new ArrayList<>();
 
         for (FlowFile flowFile : batch) {
-            String key = flowFile.getAttribute("redis.key");
+            byte[] key = RedisBytes.key(flowFile);
             String moduleType = flowFile.getAttribute("redis.type");
             Long ttl = CommandBuilder.effectiveTtl(parseLong(flowFile.getAttribute("redis.ttl.ms"), -1), ttlStrategy, ttlResetOffsetMs);
             if (key == null || moduleType == null) {
                 session.transfer(session.penalize(FailureReason.tag(session, flowFile, "no redis.key or redis.type attribute")), REL_FAILURE);
                 continue;
             }
-            Optional<String> targetName = keyMapping.toTarget(key);
+            Optional<byte[]> targetName = keyMapping.toTarget(key);
             if (targetName.isEmpty()) {
                 session.transfer(FailureReason.tag(session, flowFile,
                         "a renamed key takes this key's target name; exclude it or change Key Prefix Rename"), REL_FAILURE);
                 continue;
             }
-            byte[] sourceKey = key.getBytes(StandardCharsets.UTF_8);
-            byte[] targetKey = targetName.get().getBytes(StandardCharsets.UTF_8);
-            Item item = new Item(flowFile, sourceKey, targetKey, ttl == null ? -1 : ttl);
+            Item item = new Item(flowFile, key, targetName.get(), ttl == null ? -1 : ttl);
             switch (ModuleCopy.of(moduleType)) {
                 case JSON_REBUILD -> jsonItems.add(item);
                 case TOPK_REBUILD -> topkItems.add(item);

@@ -2,6 +2,7 @@ package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.dragonfly.nifi.redis.services.ReplicationEndpoint;
+import io.dragonfly.nifi.redis.util.RedisBytes;
 import io.dragonfly.nifi.redis.util.CommandKeyTable;
 import io.dragonfly.nifi.redis.util.CounterGauge;
 import io.dragonfly.nifi.redis.util.KeyFilter;
@@ -254,7 +255,8 @@ public class RedisReplicationReader extends AbstractProcessor {
             }
             for (String key : batch.keys()) {
                 FlowFile flowFile = session.create();
-                flowFile = session.putAllAttributes(flowFile, Map.of("redis.key", key, "redis.event.db", String.valueOf(current.setup.database())));
+                flowFile = session.putAllAttributes(flowFile, RedisBytes.keyAttributes(RedisBytes.fromIdentity(key)));
+                flowFile = session.putAttribute(flowFile, "redis.event.db", String.valueOf(current.setup.database()));
                 session.transfer(flowFile, REL_KEY_CHANGED);
             }
             session.commit();
@@ -437,7 +439,7 @@ public class RedisReplicationReader extends AbstractProcessor {
         List<String> kept = new ArrayList<>(keys.size());
         for (byte[] key : keys) {
             if (filter.allowsKey(key)) {
-                kept.add(new String(key, StandardCharsets.UTF_8));
+                kept.add(RedisBytes.identity(key));
             } else {
                 prefixSkipped.incrementAndGet();
             }
@@ -508,7 +510,7 @@ public class RedisReplicationReader extends AbstractProcessor {
                     List<String> keys = new ArrayList<>();
                     for (byte[] key : page.getKeys()) {
                         if (setup.filter().allowsKey(key)) {
-                            keys.add(new String(key, StandardCharsets.UTF_8));
+                            keys.add(RedisBytes.identity(key));
                         }
                     }
                     if (!dirty.markSnapshot(shard.id, keys, generation)) {

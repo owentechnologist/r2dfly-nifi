@@ -2,7 +2,9 @@ package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.dragonfly.nifi.redis.util.FailureReason;
+import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.KeyMapping;
+import io.dragonfly.nifi.redis.util.RedisBytes;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.components.PropertyDescriptor;
@@ -76,8 +78,8 @@ public class RedisKeyExistenceRouter extends AbstractProcessor {
         if (flowFile == null) {
             return;
         }
-        String targetKey = flowFile.getAttribute("redis.key");
-        if (targetKey == null || targetKey.isEmpty()) {
+        byte[] targetKey = RedisBytes.key(flowFile);
+        if (targetKey == null || targetKey.length == 0) {
             getLogger().error("FlowFile is missing the redis.key attribute");
             session.transfer(session.penalize(FailureReason.tag(session, flowFile, "no redis.key attribute")), REL_FAILURE);
             return;
@@ -86,34 +88,34 @@ public class RedisKeyExistenceRouter extends AbstractProcessor {
         // Scope is resolved before the EXISTS call, not after. An out-of-scope key is not an absent
         // key, and asking the source about one would let a bare "0" reply present pre-existing
         // target data as a migration finding.
-        Optional<String> sourceKey = inScopeSourceKey(
+        Optional<byte[]> sourceKey = inScopeSourceKey(
                 targetKey,
                 KeyMapping.of(context, KEY_PREFIX, KEY_PREFIX_SEPARATOR),
-                parsePrefixList(context.getProperty(PREFIX_DENY_LIST).getValue()),
-                parsePrefixList(context.getProperty(PREFIX_ONLY_LIST).getValue()));
+                KeyFilter.parse(null, context.getProperty(PREFIX_DENY_LIST).getValue(), context.getProperty(PREFIX_ONLY_LIST).getValue()));
         if (sourceKey.isEmpty()) {
             session.transfer(flowFile, REL_FILTERED);
             return;
         }
-        String bareKey = sourceKey.get();
+        byte[] bareKey = sourceKey.get();
 
         RedisConnectionPoolService redisPool = context.getProperty(REDIS_CONNECTION_POOL).asControllerService(RedisConnectionPoolService.class);
         try {
             long found = redisPool.withConnection(cmds -> {
                 try {
-                    return cmds.exists(bareKey.getBytes(StandardCharsets.UTF_8)).get();
+                    return cmds.exists(bareKey).get();
                 } catch (Exception e) {
-                    throw new ProcessException("EXISTS failed for key " + bareKey, e);
+                    throw new ProcessException("EXISTS failed for key " + RedisBytes.display(bareKey), e);
                 }
             });
             if (found > 0) {
                 session.transfer(flowFile, REL_EXISTS);
             } else {
                 session.adjustCounter(ORPHAN_COUNTER, 1, true);
-                session.transfer(session.putAttribute(flowFile, "redis.key", bareKey), REL_MISSING);
+                FlowFile renamed = session.removeAttribute(flowFile, RedisBytes.KEY_BASE64);
+                session.transfer(session.putAllAttributes(renamed, RedisBytes.keyAttributes(bareKey)), REL_MISSING);
             }
         } catch (Exception e) {
-            getLogger().error("Failed to check existence of key {} on the source", bareKey, e);
+            getLogger().error("Failed to check existence of key {} on the source", RedisBytes.display(bareKey), e);
             session.transfer(session.penalize(FailureReason.tag(session, flowFile, "EXISTS on the source failed", e)), REL_FAILURE);
         }
     }
@@ -125,26 +127,7 @@ public class RedisKeyExistenceRouter extends AbstractProcessor {
      * Both lists are matched against the source key, so the same values configured on the forward
      * leg's RedisScanReader apply here unchanged.
      */
-    static Optional<String> inScopeSourceKey(String targetKey, KeyMapping keyMapping,
-                                             List<String> denyPrefixes, List<String> onlyPrefixes) {
-        Optional<String> sourceKey = keyMapping.toSource(targetKey);
-        if (sourceKey.isEmpty() || startsWithAny(sourceKey.get(), denyPrefixes)) {
-            return Optional.empty();
-        }
-        if (!onlyPrefixes.isEmpty() && !startsWithAny(sourceKey.get(), onlyPrefixes)) {
-            return Optional.empty();
-        }
-        return sourceKey;
-    }
-
-    static List<String> parsePrefixList(String value) {
-        if (value == null || value.isBlank()) {
-            return List.of();
-        }
-        return Arrays.stream(value.split(",")).map(String::trim).filter(s -> !s.isEmpty()).collect(Collectors.toList());
-    }
-
-    private static boolean startsWithAny(String key, List<String> prefixes) {
-        return prefixes.stream().anyMatch(key::startsWith);
+    static Optional<byte[]> inScopeSourceKey(byte[] targetKey, KeyMapping keyMapping, KeyFilter scope) {
+        return keyMapping.toSource(targetKey).filter(scope::allowsKey);
     }
 }

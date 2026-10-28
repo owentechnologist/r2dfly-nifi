@@ -1,6 +1,7 @@
 package io.dragonfly.nifi.redis.processors;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.dragonfly.nifi.redis.util.RedisBytes;
 import io.dragonfly.nifi.redis.util.ChunkReassembler;
 import io.dragonfly.nifi.redis.util.CounterGauge;
 import io.dragonfly.nifi.redis.util.FailureReason;
@@ -86,7 +87,7 @@ public class RedisDeadLetterWriter extends AbstractProcessor {
      * is named by its index too, so the key's chunks do not replace one another.
      */
     private static String fileName(FlowFile flowFile) {
-        String key = flowFile.getAttribute("redis.key");
+        byte[] key = RedisBytes.key(flowFile);
         if (key == null) {
             return flowFile.getAttribute("uuid") + ".json";
         }
@@ -94,7 +95,7 @@ public class RedisDeadLetterWriter extends AbstractProcessor {
                 ? "-chunk-" + flowFile.getAttribute(ChunkReassembler.INDEX) + "-of-" + flowFile.getAttribute(ChunkReassembler.TOTAL) : "";
         try {
             // A hash, not the key itself: a key can be longer than a file name may be.
-            byte[] digest = MessageDigest.getInstance("SHA-256").digest(key.getBytes(StandardCharsets.UTF_8));
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(key);
             return "key-" + HexFormat.of().formatHex(digest) + chunk + ".json";
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException(e);

@@ -194,9 +194,9 @@ What a RedisShake Lua hook sees, and where it is here:
 | RedisShake | r2dfly hook |
 |---|---|
 | `DB` | `DB`, a script variable holding the source database |
-| `KEYS` | `record.key`, one key per record |
+| `KEYS` | `record.key`, one key per record (base64 when `record.key_base64` is true) |
 | `TYPE` | `record.type`, the key's real type (`string`, `hash`, `list`, `set`, `zset`, `stream`, or `deleted` for a delete) |
-| `CMD`, `ARGV` | None. r2dfly copies keys, not commands: the record holds the key's whole value (`record.value`) and its TTL (`record.ttl_ms`) instead. |
+| `CMD`, `ARGV` | None. r2dfly copies keys, not commands: the record holds the key's whole value (`record.value`) and its TTL (`record.ttl_ms`) instead. When `record.base64` is true, the value's byte strings are base64 (see [Binary keys and values](#binary-keys-and-values)). |
 
 A script that drops `tmp:` keys and upper-cases the strings under `order:`:
 
@@ -212,7 +212,7 @@ session.get(1000).each { flowFile ->
             session.remove(flowFile)
             return
         }
-        if (record.type == 'string' && record.key.startsWith('order:')) {
+        if (record.type == 'string' && !record.base64 && record.key.startsWith('order:')) {
             record.value = record.value.toUpperCase()
         }
         flowFile.write('UTF-8', JsonOutput.toJson(record))
@@ -287,6 +287,24 @@ Things to know about writing to a file:
 - TTLs are stored as time remaining, so they count from when the file is loaded, not from when
   it was written. Stream delivery times are absolute.
 - A big hash or list that the flow splits into chunks is joined back into one line.
+- A key name or value that is not UTF-8 text is written in base64; see
+  [Binary keys and values](#binary-keys-and-values).
+
+## Binary keys and values
+
+Redis keys and values are bytes, not text, and r2dfly copies them byte for byte. The flow carries
+keys and values as text where it can, so the files, the dead-letter records and the hook stay
+readable, and switches to base64 only where the bytes are not valid UTF-8:
+
+- A key record whose key name is not UTF-8 has `"key_base64": true`, and its `key` is base64.
+- A key record with any value that is not UTF-8 has `"base64": true`, and every byte string in
+  its value is base64: a string's value, hash fields and values, list, set and sorted-set
+  members, and stream field names and values. Stream entry ids, scores and TTLs stay as they are.
+- A FlowFile whose key name is not UTF-8 carries the exact bytes in `redis.key.base64`;
+  `redis.key` then shows the name with replacement characters, for people only.
+
+Stream consumer group and consumer names are carried as UTF-8 text, so a name that is not valid
+UTF-8 is not copied exactly.
 
 ## Using a TOML config file
 

@@ -61,6 +61,7 @@ The last column marks the rows this project's recent work changed.
 | Restart | Starts over | Resumes: scan checkpoints, partial resync | Now r2dfly |
 | A key the target cannot take | Not tested here | Dead-letter record with the reason; the run continues | Now r2dfly |
 | Filters | Key prefix, suffix, regex, database, command, command group, slot, Lua hook | Key prefix and real key type, applied to the copy and the live phase alike | RedisShake broader |
+| Binary key names and values | Copied byte for byte (tested) | Copied byte for byte; carried as base64 where they are not UTF-8 text (tested) | Now a tie |
 | Transforms | A Lua hook on each command | Built-in prefix rename, database remap and TTL strategies that the live phase, reconciler and search indexes follow, plus a Groovy hook on each key record | Now a tie |
 | Cutover and rollback | Not built in | Safe-to-switch check, final reconcile, reverse sync | Now r2dfly |
 | Metrics | An HTTP status port | Prometheus, through NiFi | |

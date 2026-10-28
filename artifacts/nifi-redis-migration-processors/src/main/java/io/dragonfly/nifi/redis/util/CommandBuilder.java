@@ -75,7 +75,7 @@ public final class CommandBuilder {
             RedisClusterAsyncCommands<byte[], byte[]> target,
             StatefulConnection<byte[], byte[]> rawConn,
             KeyRecord record,
-            String targetKey,
+            byte[] targetKey,
             TtlStrategy ttlStrategy,
             long ttlResetOffsetMs,
             ConflictStrategy conflictStrategy) {
@@ -87,14 +87,14 @@ public final class CommandBuilder {
             RedisClusterAsyncCommands<byte[], byte[]> target,
             StatefulConnection<byte[], byte[]> rawConn,
             KeyRecord record,
-            String targetKeyName,
+            byte[] targetKey,
             TtlStrategy ttlStrategy,
             long ttlResetOffsetMs,
             ConflictStrategy conflictStrategy,
             int writeChunkSize) {
         // A record that cannot even be turned into commands fails as its own write, not the caller's batch.
         try {
-            return dispatch(target, rawConn, record, targetKeyName, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize);
+            return dispatch(target, rawConn, record, targetKey, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize);
         } catch (RuntimeException e) {
             return CompletableFuture.failedFuture(e);
         }
@@ -104,12 +104,11 @@ public final class CommandBuilder {
             RedisClusterAsyncCommands<byte[], byte[]> target,
             StatefulConnection<byte[], byte[]> rawConn,
             KeyRecord record,
-            String targetKeyName,
+            byte[] targetKey,
             TtlStrategy ttlStrategy,
             long ttlResetOffsetMs,
             ConflictStrategy conflictStrategy,
             int writeChunkSize) {
-        byte[] targetKey = targetKeyName.getBytes(StandardCharsets.UTF_8);
         Long effectiveTtl = effectiveTtl(record.ttlMs, ttlStrategy, ttlResetOffsetMs);
         boolean keepFieldTtls = ttlStrategy != TtlStrategy.STRIP;
 
@@ -210,7 +209,7 @@ public final class CommandBuilder {
 
     private static CompletableFuture<Void> writeString(
             RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, KeyRecord record, Long ttlMs) {
-        byte[] value = String.valueOf(record.value).getBytes(StandardCharsets.UTF_8);
+        byte[] value = record.bytes(record.value);
         RedisFuture<String> future = (ttlMs != null)
                 ? target.set(key, value, new SetArgs().px(ttlMs))
                 : target.set(key, value);
@@ -224,7 +223,7 @@ public final class CommandBuilder {
         futures.add(toCf(target.del(key)));
         Map<byte[], byte[]> chunk = new LinkedHashMap<>();
         for (Map.Entry<String, Object> entry : asMap(record.value).entrySet()) {
-            chunk.put(entry.getKey().getBytes(StandardCharsets.UTF_8), String.valueOf(entry.getValue()).getBytes(StandardCharsets.UTF_8));
+            chunk.put(record.bytes(entry.getKey()), record.bytes(entry.getValue()));
             if (chunk.size() == writeChunkSize) {
                 futures.add(toCf(target.hset(key, chunk)));
                 chunk = new LinkedHashMap<>();
@@ -234,7 +233,7 @@ public final class CommandBuilder {
             futures.add(toCf(target.hset(key, chunk)));
         }
         if (keepFieldTtls && record.fieldExpireAtMs != null) {
-            addFieldTtlFutures(target, key, record.fieldExpireAtMs, futures);
+            addFieldTtlFutures(target, key, record, futures);
         }
         return allOf(futures).thenCompose(v -> applyTtl(target, key, ttlMs));
     }
@@ -243,12 +242,12 @@ public final class CommandBuilder {
      * TTL rounds up to the next second; fields sharing a value go out in one call. A field whose
      * expiry passed while the record was in flight is deleted, as the source will have done. */
     private static void addFieldTtlFutures(
-            RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, Map<String, Long> expireAtMs, List<CompletableFuture<?>> futures) {
+            RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, KeyRecord record, List<CompletableFuture<?>> futures) {
         long now = System.currentTimeMillis();
         Map<Long, List<byte[]>> fieldsBySeconds = new java.util.TreeMap<>();
         List<byte[]> expired = new ArrayList<>();
-        expireAtMs.forEach((field, at) -> {
-            byte[] raw = field.getBytes(StandardCharsets.UTF_8);
+        record.fieldExpireAtMs.forEach((field, at) -> {
+            byte[] raw = record.bytes(field);
             long remainingMs = at - now;
             if (remainingMs <= 0) {
                 expired.add(raw);
@@ -268,7 +267,7 @@ public final class CommandBuilder {
 
     private static CompletableFuture<Void> writeList(
             RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, KeyRecord record, Long ttlMs, int writeChunkSize) {
-        byte[][] values = toByteArrays(asList(record.value));
+        byte[][] values = toByteArrays(record);
         List<CompletableFuture<?>> futures = new ArrayList<>();
         futures.add(toCf(target.del(key)));
         for (byte[][] part : chunkArray(values, writeChunkSize)) {
@@ -279,7 +278,7 @@ public final class CommandBuilder {
 
     private static CompletableFuture<Void> writeSet(
             RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, KeyRecord record, Long ttlMs, int writeChunkSize) {
-        byte[][] values = toByteArrays(asList(record.value));
+        byte[][] values = toByteArrays(record);
         List<CompletableFuture<?>> futures = new ArrayList<>();
         futures.add(toCf(target.del(key)));
         for (byte[][] part : chunkArray(values, writeChunkSize)) {
@@ -296,7 +295,7 @@ public final class CommandBuilder {
         for (int i = 0; i < items.size(); i++) {
             Map<String, Object> entry = (Map<String, Object>) items.get(i);
             double score = score(entry.get("score"));
-            byte[] member = String.valueOf(entry.get("member")).getBytes(StandardCharsets.UTF_8);
+            byte[] member = record.bytes(entry.get("member"));
             scored[i] = ScoredValue.just(score, member);
         }
         List<CompletableFuture<?>> futures = new ArrayList<>();
@@ -350,7 +349,7 @@ public final class CommandBuilder {
             String id = String.valueOf(entry.get("id"));
             Map<String, Object> fieldsRaw = (Map<String, Object>) entry.get("fields");
             Map<byte[], byte[]> fields = new LinkedHashMap<>();
-            fieldsRaw.forEach((k, v) -> fields.put(k.getBytes(StandardCharsets.UTF_8), String.valueOf(v).getBytes(StandardCharsets.UTF_8)));
+            fieldsRaw.forEach((k, v) -> fields.put(record.bytes(k), record.bytes(v)));
             futures.add(toCf(target.xadd(key, new XAddArgs().id(id), fields)));
             lastEntryId = id;
         }
@@ -359,11 +358,11 @@ public final class CommandBuilder {
         for (Map<String, Object> group : groups) {
             String lastDeliveredId = String.valueOf(group.getOrDefault("last-delivered-id", "0"));
             XReadArgs.StreamOffset<byte[]> offset = XReadArgs.StreamOffset.from(key, lastDeliveredId);
-            futures.add(toCf(target.xgroupCreate(offset, bytes(group.get("name")), new XGroupCreateArgs().mkstream(true))));
+            futures.add(toCf(target.xgroupCreate(offset, utf8(group.get("name")), new XGroupCreateArgs().mkstream(true))));
             // Through SETID rather than CREATE's own ENTRIESREAD, which Dragonfly 2.0.2 accepts and ignores.
             if (group.get("entries-read") instanceof Number entriesRead) {
                 futures.add(toCf(target.dispatch(RawCommand.XGROUP, new StatusOutput<>(ByteArrayCodec.INSTANCE),
-                        new CommandArgs<>(ByteArrayCodec.INSTANCE).add("SETID").addKey(key).add(bytes(group.get("name")))
+                        new CommandArgs<>(ByteArrayCodec.INSTANCE).add("SETID").addKey(key).add(utf8(group.get("name")))
                                 .add(lastDeliveredId).add("ENTRIESREAD").add(entriesRead.longValue()))));
             }
         }
@@ -375,11 +374,11 @@ public final class CommandBuilder {
         }
         boolean anyPending = false;
         for (Map<String, Object> group : groups) {
-            byte[] groupName = bytes(group.get("name"));
+            byte[] groupName = utf8(group.get("name"));
             if (group.get("consumers") instanceof List<?> consumers) {
                 for (Object c : consumers) {
                     if (c instanceof Map<?, ?> consumer && consumer.get("name") != null) {
-                        futures.add(toCf(target.xgroupCreateconsumer(key, io.lettuce.core.Consumer.from(groupName, bytes(consumer.get("name"))))));
+                        futures.add(toCf(target.xgroupCreateconsumer(key, io.lettuce.core.Consumer.from(groupName, utf8(consumer.get("name"))))));
                     }
                 }
             }
@@ -413,7 +412,7 @@ public final class CommandBuilder {
             if (group.get("pending") instanceof List<?> pending) {
                 for (Object p : pending) {
                     if (p instanceof Map<?, ?> entry) {
-                        claims.add(toCf(target.xclaim(key, io.lettuce.core.Consumer.from(bytes(group.get("name")), bytes(entry.get("consumer"))),
+                        claims.add(toCf(target.xclaim(key, io.lettuce.core.Consumer.from(utf8(group.get("name")), utf8(entry.get("consumer"))),
                                 claimArgs((Map<String, Object>) entry, clockOffsetMs), String.valueOf(entry.get("id")))));
                     }
                 }
@@ -430,7 +429,8 @@ public final class CommandBuilder {
         return new XClaimArgs().minIdleTime(0).time(deliveredAt + clockOffsetMs).retryCount(deliveries).force().justid();
     }
 
-    private static byte[] bytes(Object value) {
+    /** Group and consumer names, which are carried as UTF-8 text. */
+    private static byte[] utf8(Object value) {
         return String.valueOf(value).getBytes(StandardCharsets.UTF_8);
     }
 
@@ -451,10 +451,11 @@ public final class CommandBuilder {
         };
     }
 
-    private static byte[][] toByteArrays(List<Object> items) {
+    private static byte[][] toByteArrays(KeyRecord record) {
+        List<Object> items = asList(record.value);
         byte[][] values = new byte[items.size()][];
         for (int i = 0; i < items.size(); i++) {
-            values[i] = String.valueOf(items.get(i)).getBytes(StandardCharsets.UTF_8);
+            values[i] = record.bytes(items.get(i));
         }
         return values;
     }

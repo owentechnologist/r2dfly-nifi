@@ -1,5 +1,6 @@
 package io.dragonfly.nifi.redis.processors;
 
+import io.dragonfly.nifi.redis.util.RedisBytes;
 import io.dragonfly.nifi.redis.util.CounterGauge;
 import io.dragonfly.nifi.redis.util.FailureReason;
 import io.dragonfly.nifi.redis.util.KeyRecord;
@@ -138,7 +139,8 @@ public class KeyRecordFileReader extends AbstractProcessor {
             if (record.key == null || record.type == null) {
                 throw new IOException("the line has no key or no type");
             }
-            flowFile = session.putAllAttributes(flowFile, Map.of("redis.key", record.key, "redis.type", record.type));
+            flowFile = session.putAllAttributes(flowFile, RedisBytes.keyAttributes(record.keyBytes()));
+            flowFile = session.putAttribute(flowFile, "redis.type", record.type);
             session.transfer(flowFile, REL_SUCCESS);
         } catch (IOException e) {
             session.transfer(FailureReason.tag(session, flowFile, "the line at byte " + lineStart + " is not a key record", e), REL_FAILURE);

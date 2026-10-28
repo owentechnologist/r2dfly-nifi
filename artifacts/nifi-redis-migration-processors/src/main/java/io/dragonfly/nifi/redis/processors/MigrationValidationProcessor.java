@@ -181,9 +181,9 @@ public class MigrationValidationProcessor extends AbstractProcessor {
 
         // FULL_VALUE
         Optional<List<KeyRecord>> sourceValue = sourcePool.withConnection(cmds ->
-                RedisValueFetcher.fetch(cmds, key, sourceType, -1, null, Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE, false));
+                RedisValueFetcher.fetch(cmds, keyBytes, sourceType, -1, null, Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE, false));
         Optional<List<KeyRecord>> targetValue = targetPool.withConnection(cmds ->
-                RedisValueFetcher.fetch(cmds, key, targetType, -1, null, Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE, false));
+                RedisValueFetcher.fetch(cmds, keyBytes, targetType, -1, null, Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE, false));
         boolean valueMismatch = !valuesEqual(sourceType, sourceValue, targetValue);
         return new KeyCheck(key, false, false, valueMismatch, !valueMismatch);
     }

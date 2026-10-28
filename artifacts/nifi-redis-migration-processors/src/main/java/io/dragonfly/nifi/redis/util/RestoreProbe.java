@@ -34,11 +34,11 @@ public final class RestoreProbe {
     }
 
     /** Returns the cached verdict for this pair, probing with {@code sampleKey} the first time. */
-    public Verdict verdictFor(String sampleKey, String type, String encoding, VerdictListener listener) {
+    public Verdict verdictFor(byte[] sampleKey, String type, String encoding, VerdictListener listener) {
         String pair = type + "/" + (encoding == null ? "unknown" : encoding);
         return verdicts.computeIfAbsent(pair, p -> {
             Verdict verdict = probe(sampleKey, type);
-            listener.onVerdict(p, sampleKey, verdict);
+            listener.onVerdict(p, RedisBytes.display(sampleKey), verdict);
             return verdict;
         });
     }
@@ -48,13 +48,12 @@ public final class RestoreProbe {
         void onVerdict(String typeAndEncoding, String sampleKey, Verdict verdict);
     }
 
-    private Verdict probe(String key, String type) {
-        byte[] rawKey = key.getBytes(StandardCharsets.UTF_8);
+    private Verdict probe(byte[] rawKey, String type) {
         byte[] payload;
         Optional<List<KeyRecord>> expected;
         try {
             payload = source.withConnection(cmds -> await(() -> cmds.dump(rawKey).get()));
-            expected = source.withConnection(cmds -> await(() -> fetchWhole(cmds, key, type)));
+            expected = source.withConnection(cmds -> await(() -> fetchWhole(cmds, rawKey, type)));
         } catch (RuntimeException e) {
             return new Verdict(false, "could not read the sample from the source: " + rootMessage(e));
         }
@@ -71,7 +70,7 @@ public final class RestoreProbe {
             } catch (RuntimeException e) {
                 return new Verdict(false, "target rejected the payload: " + rootMessage(e));
             }
-            actual = target.withConnection(cmds -> await(() -> fetchWhole(cmds, scratch, type)));
+            actual = target.withConnection(cmds -> await(() -> fetchWhole(cmds, rawScratch, type)));
             if (actual.isEmpty()) {
                 return new Verdict(false, "RESTORE succeeded but the scratch key reads back empty");
             }
@@ -93,7 +92,7 @@ public final class RestoreProbe {
 
     /** Chunk sizes of MAX_VALUE keep the whole value in one record so the two sides compare directly. */
     private static Optional<List<KeyRecord>> fetchWhole(
-            io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands<byte[], byte[]> cmds, String key, String type) throws Exception {
+            io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands<byte[], byte[]> cmds, byte[] key, String type) throws Exception {
         return RedisValueFetcher.fetch(cmds, key, type, -1L, null, Integer.MAX_VALUE, Integer.MAX_VALUE, 1000, true);
     }
 

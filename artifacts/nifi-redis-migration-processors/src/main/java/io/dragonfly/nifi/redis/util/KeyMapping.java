@@ -5,6 +5,7 @@ import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.components.Validator;
 import org.apache.nifi.processor.ProcessContext;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
@@ -55,7 +56,7 @@ public final class KeyMapping {
 
     /** {@code prefix} and {@code separator} are the older Key Prefix properties: prefix + separator goes in front. */
     public static KeyMapping of(String renameRules, String prefix, String separator) {
-        String outer = prefix == null || prefix.isEmpty() ? "" : prefix + (separator == null ? "" : separator);
+        String outer = bytewise(prefix == null || prefix.isEmpty() ? "" : prefix + (separator == null ? "" : separator));
         List<Rule> rules = parse(renameRules);
         return rules.isEmpty() && outer.isEmpty() ? IDENTITY : new KeyMapping(rules, outer);
     }
@@ -71,7 +72,16 @@ public final class KeyMapping {
         return this == IDENTITY;
     }
 
-    public Optional<String> toTarget(String sourceKey) {
+    /** Keys are bytes; the rules compare them in ISO-8859-1, one character per byte, so a prefix matches bytes exactly. */
+    public Optional<byte[]> toTarget(byte[] sourceKey) {
+        return toTarget(RedisBytes.identity(sourceKey)).map(RedisBytes::fromIdentity);
+    }
+
+    public Optional<byte[]> toSource(byte[] targetKey) {
+        return toSource(RedisBytes.identity(targetKey)).map(RedisBytes::fromIdentity);
+    }
+
+    private Optional<String> toTarget(String sourceKey) {
         Rule rule = ruleFor(sourceKey);
         if (rule == null && claimedByRename(sourceKey)) {
             return Optional.empty();
@@ -81,7 +91,7 @@ public final class KeyMapping {
     }
 
     /** The source key that maps to {@code targetKey}; empty when no source key does. */
-    public Optional<String> toSource(String targetKey) {
+    private Optional<String> toSource(String targetKey) {
         if (!targetKey.startsWith(outerPrefix)) {
             return Optional.empty();
         }
@@ -95,7 +105,8 @@ public final class KeyMapping {
      * The target prefixes that hold every key a source prefix covers, for an index's PREFIX list:
      * the prefix mapped, plus the new prefix of each rule whose old prefix the source prefix covers.
      */
-    public List<String> targetPrefixes(String sourcePrefix) {
+    public List<String> targetPrefixes(String textPrefix) {
+        String sourcePrefix = bytewise(textPrefix);
         Set<String> prefixes = new LinkedHashSet<>();
         Rule rule = ruleFor(sourcePrefix);
         prefixes.add(outerPrefix + (rule == null ? sourcePrefix : rule.to + sourcePrefix.substring(rule.from.length())));
@@ -104,7 +115,11 @@ public final class KeyMapping {
                 prefixes.add(outerPrefix + r.to);
             }
         }
-        return new ArrayList<>(prefixes);
+        return prefixes.stream().map(p -> new String(RedisBytes.fromIdentity(p), StandardCharsets.UTF_8)).toList();
+    }
+
+    private static String bytewise(String text) {
+        return RedisBytes.identity(text.getBytes(StandardCharsets.UTF_8));
     }
 
     private Rule ruleFor(String sourceKey) {
@@ -129,7 +144,7 @@ public final class KeyMapping {
             if (eq < 0) {
                 throw new IllegalArgumentException("'" + part.trim() + "' is not old=new");
             }
-            Rule rule = new Rule(part.substring(0, eq).trim(), part.substring(eq + 1).trim());
+            Rule rule = new Rule(bytewise(part.substring(0, eq).trim()), bytewise(part.substring(eq + 1).trim()));
             // Stripping a prefix would land renamed keys anywhere in the keyspace, so no key could be told apart.
             if (rule.to.isEmpty()) {
                 throw new IllegalArgumentException("'" + part.trim() + "' has no new prefix");

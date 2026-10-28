@@ -1,10 +1,12 @@
 package io.dragonfly.nifi.redis.processors;
 
+import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.KeyMapping;
 import org.apache.nifi.util.TestRunner;
 import org.apache.nifi.util.TestRunners;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -30,44 +32,58 @@ class RedisKeyExistenceRouterTest {
     @Test
     void stripsTheConfiguredPrefixFromTheTargetKey() {
         assertEquals(Optional.of("user:1"),
-                RedisKeyExistenceRouter.inScopeSourceKey("mig:user:1", KeyMapping.of(null, "mig", ":"), List.of(), List.of()));
+                scope("mig:user:1", KeyMapping.of(null, "mig", ":"), null, null));
     }
 
     @Test
     void returnsTheKeyUnchangedWhenNoPrefixIsConfigured() {
         assertEquals(Optional.of("user:1"),
-                RedisKeyExistenceRouter.inScopeSourceKey("user:1", KeyMapping.of(null, null, ":"), List.of(), List.of()));
+                scope("user:1", KeyMapping.of(null, null, ":"), null, null));
     }
 
     @Test
     void filtersATargetKeyThatDoesNotCarryTheConfiguredPrefix() {
         assertEquals(Optional.empty(),
-                RedisKeyExistenceRouter.inScopeSourceKey("preexisting:1", KeyMapping.of(null, "mig", ":"), List.of(), List.of()));
+                scope("preexisting:1", KeyMapping.of(null, "mig", ":"), null, null));
     }
 
     @Test
     void filtersADeniedPrefixMeasuredAgainstTheUnprefixedKey() {
         assertEquals(Optional.empty(),
-                RedisKeyExistenceRouter.inScopeSourceKey("mig:cache:1", KeyMapping.of(null, "mig", ":"), List.of("cache:"), List.of()));
+                scope("mig:cache:1", KeyMapping.of(null, "mig", ":"), "cache:", null));
     }
 
     @Test
     void filtersAKeyOutsideTheOnlyList() {
         assertEquals(Optional.empty(),
-                RedisKeyExistenceRouter.inScopeSourceKey("user:1", KeyMapping.of(null, null, ":"), List.of(), List.of("session:")));
+                scope("user:1", KeyMapping.of(null, null, ":"), null, "session:"));
         assertEquals(Optional.of("session:1"),
-                RedisKeyExistenceRouter.inScopeSourceKey("session:1", KeyMapping.of(null, null, ":"), List.of(), List.of("session:")));
+                scope("session:1", KeyMapping.of(null, null, ":"), null, "session:"));
     }
 
     @Test
     void appliesTheDenyListBeforeTheOnlyList() {
         assertEquals(Optional.empty(),
-                RedisKeyExistenceRouter.inScopeSourceKey("app:tmp:1", KeyMapping.of(null, null, ":"), List.of("app:tmp:"), List.of("app:")));
+                scope("app:tmp:1", KeyMapping.of(null, null, ":"), "app:tmp:", "app:"));
     }
 
     @Test
-    void parsesACommaSeparatedPrefixListIgnoringBlanks() {
-        assertEquals(List.of("a:", "b:"), RedisKeyExistenceRouter.parsePrefixList(" a: , , b: "));
-        assertEquals(List.of(), RedisKeyExistenceRouter.parsePrefixList("  "));
+    void mapsABinaryTargetKeyBackByItsBytes() {
+        byte[] binary = {'m', 'i', 'g', ':', (byte) 0xff, 0x01};
+        assertEquals(Optional.of(List.of((byte) 0xff, (byte) 0x01)), RedisKeyExistenceRouter.inScopeSourceKey(binary,
+                KeyMapping.of(null, "mig", ":"), KeyFilter.parse(null, null, null)).map(RedisKeyExistenceRouterTest::list));
+    }
+
+    private static Optional<String> scope(String targetKey, KeyMapping mapping, String deny, String only) {
+        return RedisKeyExistenceRouter.inScopeSourceKey(targetKey.getBytes(StandardCharsets.UTF_8), mapping, KeyFilter.parse(null, deny, only))
+                .map(k -> new String(k, StandardCharsets.UTF_8));
+    }
+
+    private static List<Byte> list(byte[] bytes) {
+        List<Byte> list = new java.util.ArrayList<>();
+        for (byte b : bytes) {
+            list.add(b);
+        }
+        return list;
     }
 }

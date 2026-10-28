@@ -4,6 +4,7 @@ import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.dragonfly.nifi.redis.util.FailureReason;
 import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.KeyRecord;
+import io.dragonfly.nifi.redis.util.RedisBytes;
 import io.dragonfly.nifi.redis.util.RedisTypeSerializer;
 import io.dragonfly.nifi.redis.util.RedisValueFetcher;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
@@ -83,8 +84,8 @@ public class RedisSingleKeyFetch extends AbstractProcessor {
         if (flowFile == null) {
             return;
         }
-        String key = flowFile.getAttribute("redis.key");
-        if (key == null || key.isEmpty()) {
+        byte[] key = RedisBytes.key(flowFile);
+        if (key == null || key.length == 0) {
             getLogger().error("FlowFile is missing the redis.key attribute");
             session.transfer(session.penalize(FailureReason.tag(session, flowFile, "no redis.key attribute")), REL_FAILURE);
             return;
@@ -99,13 +100,12 @@ public class RedisSingleKeyFetch extends AbstractProcessor {
 
         try {
             TypeAndTtl meta = redisPool.withConnection(cmds -> {
-                byte[] rawKey = key.getBytes(StandardCharsets.UTF_8);
                 try {
-                    var type = cmds.type(rawKey);
-                    var ttl = cmds.pttl(rawKey);
+                    var type = cmds.type(key);
+                    var ttl = cmds.pttl(key);
                     return new TypeAndTtl(type.get(), ttl.get());
                 } catch (Exception e) {
-                    throw new ProcessException("TYPE/PTTL failed for key " + key, e);
+                    throw new ProcessException("TYPE/PTTL failed for key " + RedisBytes.display(key), e);
                 }
             });
             String type = meta.type();

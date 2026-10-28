@@ -40,7 +40,7 @@ class CommandBuilderTest {
         value.put("nested", Map.of("a", 1));
         KeyRecord record = new KeyRecord("doc:1", "json", 5000, null, value);
 
-        CommandBuilder.write(fake.asyncCommands(), fake.rawConnection(), record, record.key,
+        CommandBuilder.write(fake.asyncCommands(), fake.rawConnection(), record, record.keyBytes(),
                 CommandBuilder.TtlStrategy.PRESERVE, 0, CommandBuilder.ConflictStrategy.OVERWRITE).get();
 
         assertFalse(fake.delCalled, "JSON.SET already replaces the whole document; a leading DEL is redundant");
@@ -59,7 +59,7 @@ class CommandBuilderTest {
         value.put("field1", "value1");
         KeyRecord record = new KeyRecord("myhash", "hash", 0, null, value);
 
-        CommandBuilder.write(fake.asyncCommands(), fake.rawConnection(), record, record.key,
+        CommandBuilder.write(fake.asyncCommands(), fake.rawConnection(), record, record.keyBytes(),
                 CommandBuilder.TtlStrategy.PRESERVE, 0, CommandBuilder.ConflictStrategy.OVERWRITE).get();
 
         assertTrue(fake.delCalled, "hash writes still issue a leading DEL, unlike json");
@@ -83,7 +83,7 @@ class CommandBuilderTest {
         FakeCommands fake = new FakeCommands();
         KeyRecord record = new KeyRecord("z", "zset", 0, null, "not a list of members");
 
-        CompletableFuture<CommandBuilder.WriteOutcome> write = CommandBuilder.write(fake.asyncCommands(), fake.rawConnection(), record, record.key,
+        CompletableFuture<CommandBuilder.WriteOutcome> write = CommandBuilder.write(fake.asyncCommands(), fake.rawConnection(), record, record.keyBytes(),
                 CommandBuilder.TtlStrategy.PRESERVE, 0, CommandBuilder.ConflictStrategy.OVERWRITE);
 
         assertTrue(write.isCompletedExceptionally());
@@ -97,12 +97,12 @@ class CommandBuilderTest {
         FakeCommands badPayload = new FakeCommands();
         badPayload.restoreError = "ERR Bad data format";
         assertEquals(CommandBuilder.WriteOutcome.RESTORE_REJECTED, CommandBuilder.write(badPayload.asyncCommands(), badPayload.rawConnection(),
-                record, "k", CommandBuilder.TtlStrategy.PRESERVE, 0, CommandBuilder.ConflictStrategy.OVERWRITE).get());
+                record, "k".getBytes(StandardCharsets.UTF_8), CommandBuilder.TtlStrategy.PRESERVE, 0, CommandBuilder.ConflictStrategy.OVERWRITE).get());
 
         FakeCommands outOfMemory = new FakeCommands();
         outOfMemory.restoreError = "OOM command not allowed when used memory > 'maxmemory'";
         assertTrue(CommandBuilder.write(outOfMemory.asyncCommands(), outOfMemory.rawConnection(),
-                record, "k", CommandBuilder.TtlStrategy.PRESERVE, 0, CommandBuilder.ConflictStrategy.OVERWRITE)
+                record, "k".getBytes(StandardCharsets.UTF_8), CommandBuilder.TtlStrategy.PRESERVE, 0, CommandBuilder.ConflictStrategy.OVERWRITE)
                 .handle((outcome, error) -> error != null).get(), "a full target fails the write, which the writer retries");
     }
 

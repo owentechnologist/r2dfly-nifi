@@ -2,6 +2,7 @@ package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.dragonfly.nifi.redis.services.RedisPubSubHandle;
+import io.dragonfly.nifi.redis.util.RedisBytes;
 import io.dragonfly.nifi.redis.util.ClusterTopologySnapshot;
 import io.dragonfly.nifi.redis.util.FailureReason;
 import io.dragonfly.nifi.redis.util.KeyFilter;
@@ -141,6 +142,7 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
             // on a miss, not null; both mean "no stored baseline".
             bytes -> (bytes == null || bytes.length == 0) ? null : new String(bytes, StandardCharsets.UTF_8);
 
+    /** Decoded as ISO-8859-1, one character per byte, so a key that is not UTF-8 text keeps its exact bytes. */
     private record RawEvent(String channel, String message, long timestampMs) {
     }
 
@@ -222,7 +224,7 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
         pubSubHandle.psubscribe(context.getProperty(KEYSPACE_PATTERN).getValue(), (channel, message) -> {
             lastEventAtMs.set(System.currentTimeMillis());
             boolean accepted = eventQueue.offer(new RawEvent(
-                    new String(channel, StandardCharsets.UTF_8), new String(message, StandardCharsets.UTF_8), System.currentTimeMillis()));
+                    RedisBytes.identity(channel), RedisBytes.identity(message), System.currentTimeMillis()));
             if (!accepted) {
                 droppedEvents.incrementAndGet();
             }
@@ -394,13 +396,13 @@ public class RedisKeyspaceEventConsumer extends AbstractProcessor {
         if (!eventTypeFilter.isEmpty() && !eventTypeFilter.contains(parsed.eventType.toLowerCase())) {
             return;
         }
-        if (!keyFilter.allowsKey(parsed.key)) {
+        byte[] key = RedisBytes.fromIdentity(parsed.key);
+        if (!keyFilter.allowsKey(key)) {
             session.adjustCounter("Keyspace Events Skipped (Prefix Filter)", 1, false);
             return;
         }
 
-        Map<String, String> attrs = new HashMap<>();
-        attrs.put("redis.key", parsed.key);
+        Map<String, String> attrs = new HashMap<>(RedisBytes.keyAttributes(key));
         attrs.put("redis.event.type", parsed.eventType);
         attrs.put("redis.event.db", String.valueOf(parsed.database));
         attrs.put("redis.event.timestamp", String.valueOf(event.timestampMs()));

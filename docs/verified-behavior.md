@@ -173,6 +173,25 @@ Tested end to end on scratch containers, a Redis Stack 7.4 source and a Dragonfl
 Guarded by `KeyMappingTest`, and by `MigrationReconcilerIT`, which runs a rename with reset TTLs
 through a pass, a clean pass, and a deleted source key.
 
+## Binary keys and values
+
+Tested with key names and values that are not UTF-8 text in every core type (string values, hash
+fields and values, list, set and sorted-set members, stream field names and values), seeded as
+raw RESP and read back on both sides by one Lua script, so no byte passed through a shell
+argument.
+
+- RedisShake's `sync_reader` and `scan_reader` (Redis 7.4 to Dragonfly) left every key name and
+  value byte-identical.
+- r2dfly, with base64 carried in key records and `redis.key.base64`, left every key name and value
+  byte-identical through `simple-migration.sh` from Redis 7.4 (RESTORE where the probe passed)
+  and Redis 8.10 (the typed path), and through `continuous-migration.sh` with the keyspace live
+  source (Redis 7.4) and the replication live source (Redis 8.10), live writes included. Before
+  base64, the typed path wrote U+FFFD in place of the invalid bytes and could not find keys whose
+  names were not text.
+
+Guarded by `BinaryDataIT`: the typed copy, the RESTORE path, a JSON-lines file, the replication
+live phase, the reconciler and a prefix rename.
+
 ## NiFi 2.11
 
 - Processor counters are exported on `/nifi-api/flow/metrics/prometheus` as

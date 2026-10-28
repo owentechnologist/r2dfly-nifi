@@ -3,6 +3,7 @@ package io.dragonfly.nifi.redis.processors;
 import io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService;
 import io.dragonfly.nifi.redis.util.FailureReason;
 import io.dragonfly.nifi.redis.util.KeyMapping;
+import io.dragonfly.nifi.redis.util.RedisBytes;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.components.PropertyDescriptor;
@@ -55,20 +56,20 @@ public class DeleteRedisKey extends AbstractProcessor {
         if (flowFile == null) {
             return;
         }
-        String key = flowFile.getAttribute("redis.key");
-        if (key == null || key.isEmpty()) {
+        byte[] key = RedisBytes.key(flowFile);
+        if (key == null || key.length == 0) {
             getLogger().error("FlowFile is missing the redis.key attribute");
             session.transfer(session.penalize(FailureReason.tag(session, flowFile, "no redis.key attribute")), REL_FAILURE);
             return;
         }
 
         // A key with no target name was never copied, so there is nothing to delete.
-        Optional<String> targetName = KeyMapping.of(context, KEY_PREFIX, KEY_PREFIX_SEPARATOR).toTarget(key);
+        Optional<byte[]> targetName = KeyMapping.of(context, KEY_PREFIX, KEY_PREFIX_SEPARATOR).toTarget(key);
         if (targetName.isEmpty()) {
             session.transfer(flowFile, REL_SUCCESS);
             return;
         }
-        byte[] targetKey = targetName.get().getBytes(StandardCharsets.UTF_8);
+        byte[] targetKey = targetName.get();
 
         DragonflyConnectionPoolService dragonflyPool = context.getProperty(DRAGONFLY_CONNECTION_POOL).asControllerService(DragonflyConnectionPoolService.class);
         try {
@@ -76,7 +77,7 @@ public class DeleteRedisKey extends AbstractProcessor {
                 try {
                     return cmds.del(targetKey).get();
                 } catch (Exception e) {
-                    throw new ProcessException("DEL failed for key " + key, e);
+                    throw new ProcessException("DEL failed for key " + RedisBytes.display(key), e);
                 }
             });
             session.transfer(flowFile, REL_SUCCESS);

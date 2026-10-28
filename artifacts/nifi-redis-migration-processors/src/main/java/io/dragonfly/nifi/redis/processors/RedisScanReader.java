@@ -1,6 +1,7 @@
 package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
+import io.dragonfly.nifi.redis.util.RedisBytes;
 import io.dragonfly.nifi.redis.util.ClusterTopologySnapshot;
 import io.dragonfly.nifi.redis.util.CounterGauge;
 import io.dragonfly.nifi.redis.util.FailureReason;
@@ -556,7 +557,7 @@ public class RedisScanReader extends AbstractProcessor {
                     long count = node.clusterCountKeysInSlot(slot).get();
                     List<byte[]> keys = count == 0 ? List.of() : node.clusterGetKeysInSlot(slot, (int) count).get();
                     List<byte[]> matching = pattern == null || pattern.equals("*") ? keys
-                            : keys.stream().filter(k -> globMatches(pattern, new String(k, StandardCharsets.UTF_8))).toList();
+                            : keys.stream().filter(k -> globMatches(RedisBytes.identity(pattern.getBytes(StandardCharsets.UTF_8)), RedisBytes.identity(k))).toList();
                     return describe(cmds, matching, ScanCursor.of("slot:" + slot), filter, emitTtl, skipVolatile, volatileThresholdMs, readEncoding);
                 } catch (ProcessException e) {
                     throw e;
@@ -767,7 +768,7 @@ public class RedisScanReader extends AbstractProcessor {
     private record ScanEntry(byte[] key, String type, long ttlMs, String encoding, String failure) {
         java.util.Map<String, String> attributes(int partitionIndex, ScanCursor cursor, Integer databaseIndex) {
             java.util.Map<String, String> attrs = new java.util.HashMap<>();
-            attrs.put("redis.key", new String(key, StandardCharsets.UTF_8));
+            attrs.putAll(RedisBytes.keyAttributes(key));
             attrs.put("redis.type", type);
             attrs.put("redis.ttl.ms", String.valueOf(ttlMs));
             attrs.put("redis.partition.index", String.valueOf(partitionIndex));

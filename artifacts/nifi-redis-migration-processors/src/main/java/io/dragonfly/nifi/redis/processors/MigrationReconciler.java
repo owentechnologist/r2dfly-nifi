@@ -10,6 +10,7 @@ import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.KeyMapping;
 import io.dragonfly.nifi.redis.util.KeyRecord;
 import io.dragonfly.nifi.redis.util.ModuleCopy;
+import io.dragonfly.nifi.redis.util.RedisBytes;
 import io.dragonfly.nifi.redis.util.RedisValueFetcher;
 import io.lettuce.core.KeyScanCursor;
 import io.lettuce.core.LettuceFutures;
@@ -36,6 +37,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -366,12 +368,11 @@ public class MigrationReconciler extends AbstractProcessor {
         CommandBuilder.TtlStrategy ttlStrategy = CommandBuilder.TtlStrategy.valueOf(context.getProperty(RedisBatchWriter.TTL_STRATEGY).getValue());
         long ttlResetOffsetMs = context.getProperty(RedisBatchWriter.TTL_RESET_OFFSET_MS).asLong();
         // A key with no target name is reported once, by the writer's dead-letter record.
-        List<byte[]> keys = candidates.stream().filter(k -> mapping.toTarget(new String(k, StandardCharsets.UTF_8)).isPresent()).toList();
+        List<byte[]> keys = candidates.stream().filter(k -> mapping.toTarget(k).isPresent()).toList();
         if (keys.isEmpty()) {
             return;
         }
-        List<byte[]> targetKeys = keys.stream()
-                .map(k -> mapping.toTarget(new String(k, StandardCharsets.UTF_8)).orElseThrow().getBytes(StandardCharsets.UTF_8)).toList();
+        List<byte[]> targetKeys = keys.stream().map(k -> mapping.toTarget(k).orElseThrow()).toList();
         List<String> sourceTypes = pipeline(source, keys, (cmds, key) -> cmds.type(key));
         List<String> targetTypes = pipeline(target, targetKeys, (cmds, key) -> cmds.type(key));
         List<Long> sourceTtls = pipeline(source, keys, (cmds, key) -> cmds.pttl(key));
@@ -380,7 +381,7 @@ public class MigrationReconciler extends AbstractProcessor {
         List<byte[]> sameTypeTargets = new ArrayList<>();
         List<String> sameTypeNames = new ArrayList<>();
         for (int i = 0; i < keys.size(); i++) {
-            String key = new String(keys.get(i), StandardCharsets.UTF_8);
+            byte[] key = keys.get(i);
             String sourceType = sourceTypes.get(i);
             String targetType = targetTypes.get(i);
             // A key the target cannot hold is reported once, by ModuleTypeHandler's dead-letter
@@ -410,18 +411,18 @@ public class MigrationReconciler extends AbstractProcessor {
         List<Long> sourceSizes = sizes(source, sameType, sameTypeNames);
         List<Long> targetSizes = sizes(target, sameTypeTargets, sameTypeNames);
         for (int i = 0; i < sameType.size(); i++) {
-            String key = new String(sameType.get(i), StandardCharsets.UTF_8);
+            byte[] key = sameType.get(i);
             if (!sourceSizes.get(i).equals(targetSizes.get(i))) {
                 repair(session, current, key, "size");
             } else if (compareValues) {
-                String targetKey = new String(sameTypeTargets.get(i), StandardCharsets.UTF_8);
+                byte[] targetKey = sameTypeTargets.get(i);
                 try {
                     if (!sameValue(source, target, key, targetKey, sameTypeNames.get(i))) {
                         repair(session, current, key, "value");
                     }
                 } catch (RuntimeException e) {
                     // One key that cannot be read whole must not hold the pass: copy it again instead.
-                    getLogger().warn("Could not compare the values of {}; sending it to repair", key, e);
+                    getLogger().warn("Could not compare the values of {}; sending it to repair", RedisBytes.display(key), e);
                     repair(session, current, key, "unreadable");
                 }
             }
@@ -435,19 +436,14 @@ public class MigrationReconciler extends AbstractProcessor {
     private void findKeysOnlyOnTarget(ProcessContext context, ProcessSession session, RedisConnectionPoolService source,
                                       List<byte[]> targetKeys, KeyFilter filter, Pass current) {
         KeyMapping mapping = KeyMapping.of(context, RedisBatchWriter.KEY_PREFIX, RedisBatchWriter.KEY_PREFIX_SEPARATOR);
-        List<byte[]> keys = targetKeys.stream()
-                .map(k -> mapping.toSource(new String(k, StandardCharsets.UTF_8)))
-                .flatMap(Optional::stream)
-                .map(k -> k.getBytes(StandardCharsets.UTF_8))
-                .filter(filter::allowsKey)
-                .toList();
+        List<byte[]> keys = targetKeys.stream().map(mapping::toSource).flatMap(Optional::stream).filter(filter::allowsKey).toList();
         if (keys.isEmpty()) {
             return;
         }
         List<Long> exists = pipeline(source, keys, (cmds, key) -> cmds.exists(key));
         for (int i = 0; i < keys.size(); i++) {
             if (exists.get(i) == 0) {
-                repair(session, current, new String(keys.get(i), StandardCharsets.UTF_8), "extra_on_target");
+                repair(session, current, keys.get(i), "extra_on_target");
             }
         }
     }
@@ -478,7 +474,7 @@ public class MigrationReconciler extends AbstractProcessor {
     }
 
     /** A change between the two reads shows up as a difference; the repair it causes copies the current value, which is harmless. */
-    private boolean sameValue(RedisConnectionPoolService source, RedisConnectionPoolService target, String key, String targetKey, String type) {
+    private boolean sameValue(RedisConnectionPoolService source, RedisConnectionPoolService target, byte[] key, byte[] targetKey, String type) {
         Optional<List<KeyRecord>> a = source.withConnection(cmds -> whole(cmds, key, type));
         Optional<List<KeyRecord>> b = target.withConnection(cmds -> whole(cmds, targetKey, type));
         if (a.isEmpty() || b.isEmpty()) {
@@ -487,13 +483,15 @@ public class MigrationReconciler extends AbstractProcessor {
         return ComparableValue.of(a.get().get(0)).equals(ComparableValue.of(b.get().get(0)));
     }
 
-    private static Optional<List<KeyRecord>> whole(RedisClusterAsyncCommands<byte[], byte[]> cmds, String key, String type) {
+    private static Optional<List<KeyRecord>> whole(RedisClusterAsyncCommands<byte[], byte[]> cmds, byte[] key, String type) {
         return RedisValueFetcher.fetch(cmds, key, type, -1L, null, Integer.MAX_VALUE, Integer.MAX_VALUE, 1000, true);
     }
 
-    private void repair(ProcessSession session, Pass current, String key, String reason) {
-        current.record(new Difference(key, reason));
-        FlowFile flowFile = session.putAllAttributes(session.create(), Map.of("redis.key", key, "redis.reconcile.reason", reason));
+    private void repair(ProcessSession session, Pass current, byte[] key, String reason) {
+        current.record(new Difference(RedisBytes.display(key), reason));
+        Map<String, String> attributes = new HashMap<>(RedisBytes.keyAttributes(key));
+        attributes.put("redis.reconcile.reason", reason);
+        FlowFile flowFile = session.putAllAttributes(session.create(), attributes);
         session.transfer(flowFile, REL_REPAIR);
     }
 
@@ -574,7 +572,7 @@ public class MigrationReconciler extends AbstractProcessor {
         Map<String, byte[]> distinct = new LinkedHashMap<>();
         for (byte[] key : drawn) {
             if (key != null && filter.allowsKey(key)) {
-                distinct.putIfAbsent(new String(key, StandardCharsets.UTF_8), key);
+                distinct.putIfAbsent(RedisBytes.identity(key), key);
             }
         }
         return new ArrayList<>(distinct.values());

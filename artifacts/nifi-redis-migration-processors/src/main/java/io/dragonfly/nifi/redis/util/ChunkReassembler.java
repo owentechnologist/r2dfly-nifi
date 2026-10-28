@@ -84,7 +84,8 @@ public final class ChunkReassembler {
         Set<String> chunkedKeys = new HashSet<>();
         int[] taken = {0};
         return flowFile -> {
-            String key = flowFile.getAttribute("redis.key");
+            byte[] keyBytes = RedisBytes.key(flowFile);
+            String key = keyBytes == null ? null : RedisBytes.identity(keyBytes);
             boolean chunk = isChunk(flowFile);
             if (chunk && chunkedKeys.contains(key)) {
                 return FlowFileFilter.FlowFileFilterResult.ACCEPT_AND_CONTINUE;
@@ -101,10 +102,10 @@ public final class ChunkReassembler {
         };
     }
 
-    /** Groups chunks by key, in the order each key first appears. */
+    /** Groups chunks by key, in the order each key first appears; keyed by {@link RedisBytes#identity}. */
     public static Map<String, List<Chunk>> byKey(List<Chunk> chunks) {
         Map<String, List<Chunk>> groups = new LinkedHashMap<>();
-        chunks.forEach(chunk -> groups.computeIfAbsent(chunk.record().key, k -> new ArrayList<>()).add(chunk));
+        chunks.forEach(chunk -> groups.computeIfAbsent(RedisBytes.identity(chunk.record().keyBytes()), k -> new ArrayList<>()).add(chunk));
         return groups;
     }
 
@@ -125,6 +126,8 @@ public final class ChunkReassembler {
             default -> throw new IllegalStateException("Chunking is only supported for hash/list, got: " + first.type);
         };
         KeyRecord merged = new KeyRecord(first.key, first.type, first.ttlMs, first.encoding, mergedValue);
+        merged.keyBase64 = first.keyBase64;
+        merged.base64 = first.base64;
         for (KeyRecord chunk : inOrder) {
             if (chunk.fieldExpireAtMs != null) {
                 if (merged.fieldExpireAtMs == null) {

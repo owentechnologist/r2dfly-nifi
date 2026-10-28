@@ -3,6 +3,7 @@ package io.dragonfly.nifi.redis.processors;
 import io.dragonfly.nifi.redis.util.ChunkReassembler;
 import io.dragonfly.nifi.redis.util.FailureReason;
 import io.dragonfly.nifi.redis.util.KeyRecord;
+import io.dragonfly.nifi.redis.util.RedisBytes;
 import io.dragonfly.nifi.redis.util.RedisTypeSerializer;
 import io.dragonfly.nifi.redis.util.RespRecorder;
 import org.apache.nifi.annotation.behavior.InputRequirement;
@@ -136,7 +137,7 @@ public class KeyRecordFileWriter extends AbstractProcessor {
         Map<String, Integer> lastChunkAt = new HashMap<>();
         for (int i = 0; i < parsed.size(); i++) {
             if (ChunkReassembler.isChunk(parsed.get(i).flowFile())) {
-                lastChunkAt.put(parsed.get(i).record().key, i);
+                lastChunkAt.put(RedisBytes.identity(parsed.get(i).record().keyBytes()), i);
             }
         }
 
@@ -145,10 +146,11 @@ public class KeyRecordFileWriter extends AbstractProcessor {
         for (int i = 0; i < parsed.size(); i++) {
             ChunkReassembler.Chunk item = parsed.get(i);
             if (ChunkReassembler.isChunk(item.flowFile())) {
-                if (lastChunkAt.get(item.record().key) != i) {
+                String key = RedisBytes.identity(item.record().keyBytes());
+                if (lastChunkAt.get(key) != i) {
                     continue;
                 }
-                Optional<ChunkReassembler.Chunk> joined = ChunkReassembler.join(session, groups.get(item.record().key), REL_FAILURE);
+                Optional<ChunkReassembler.Chunk> joined = ChunkReassembler.join(session, groups.get(key), REL_FAILURE);
                 if (joined.isEmpty()) {
                     continue;
                 }
