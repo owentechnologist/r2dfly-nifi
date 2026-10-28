@@ -7,6 +7,7 @@ import io.dragonfly.nifi.redis.util.CounterGauge;
 import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.ReplicationStream;
 import io.lettuce.core.KeyScanCursor;
+import io.lettuce.core.RedisCommandExecutionException;
 import io.lettuce.core.RedisFuture;
 import io.lettuce.core.ScanArgs;
 import io.lettuce.core.ScanCursor;
@@ -240,16 +241,17 @@ public class RedisReplicationReader extends AbstractProcessor {
         }
         Dirty dirty = current.dirty;
         reportLag(session, current);
-        for (Map<String, String> flush : dirty.takeFlushes()) {
-            session.transfer(session.putAllAttributes(session.create(), flush), REL_FLUSH);
-        }
+        List<Map<String, String>> flushes = dirty.takeFlushes();
         Batch batch = dirty.take(context.getProperty(MAX_FLOWFILES_PER_TRIGGER).asInteger());
-        if (batch.keys().isEmpty() && batch.checkpoint() == null) {
-            session.commit();
-            context.yield();
-            return;
-        }
         try {
+            for (Map<String, String> flush : flushes) {
+                session.transfer(session.putAllAttributes(session.create(), flush), REL_FLUSH);
+            }
+            if (batch.keys().isEmpty() && batch.checkpoint() == null) {
+                session.commit();
+                context.yield();
+                return;
+            }
             for (String key : batch.keys()) {
                 FlowFile flowFile = session.create();
                 flowFile = session.putAllAttributes(flowFile, Map.of("redis.key", key, "redis.event.db", String.valueOf(current.setup.database())));
@@ -257,7 +259,8 @@ public class RedisReplicationReader extends AbstractProcessor {
             }
             session.commit();
         } catch (RuntimeException e) {
-            dirty.giveBack(batch.keys());
+            // The stream has moved past these; a rolled-back session would otherwise lose them.
+            dirty.giveBack(batch.keys(), flushes);
             throw e;
         }
         if (batch.checkpoint() != null) {
@@ -400,8 +403,13 @@ public class RedisReplicationReader extends AbstractProcessor {
             return;
         }
         if (db != database) {
-            otherDbCommands.incrementAndGet();
-            dirty.advance(shard, offsetAfter, db);
+            byte[] arrived = keyArrivingFrom(name, argv, database);
+            if (arrived == null) {
+                otherDbCommands.incrementAndGet();
+                dirty.advance(shard, offsetAfter, db);
+            } else {
+                markAllowed(dirty, shard, List.of(arrived), offsetAfter, db, filter);
+            }
             return;
         }
         if (name.equals("flushdb")) {
@@ -412,11 +420,20 @@ public class RedisReplicationReader extends AbstractProcessor {
         try {
             keys = keyTable.keys(argv);
         } catch (RuntimeException e) {
+            if (!refusedBySource(e)) {
+                // A timeout or a lost pool connection: the stream reconnects from before this
+                // command and reads it again, rather than move past a change it could not place.
+                throw e;
+            }
             unknownKeyCommands.incrementAndGet();
-            getLogger().warn("Could not tell which keys {} touches; its change is not copied until the key changes again", name, e);
+            getLogger().warn("The source could not tell which keys {} touches; its change is not copied until the key changes again", name, e);
             dirty.advance(shard, offsetAfter, db);
             return;
         }
+        markAllowed(dirty, shard, keys, offsetAfter, db, filter);
+    }
+
+    private void markAllowed(Dirty dirty, String shard, List<byte[]> keys, long offsetAfter, int db, KeyFilter filter) {
         List<String> kept = new ArrayList<>(keys.size());
         for (byte[] key : keys) {
             if (filter.allowsKey(key)) {
@@ -426,6 +443,36 @@ public class RedisReplicationReader extends AbstractProcessor {
             }
         }
         dirty.mark(shard, kept, offsetAfter, db);
+    }
+
+    /**
+     * The key a command run in another database puts into {@code database}: MOVE key db, and
+     * COPY source destination DB db. The master propagates both under the database they ran in.
+     */
+    private static byte[] keyArrivingFrom(String name, List<byte[]> argv, int database) {
+        String db = String.valueOf(database);
+        if (name.equals("move") && argv.size() == 3 && db.equals(new String(argv.get(2), StandardCharsets.US_ASCII))) {
+            return argv.get(1);
+        }
+        if (name.equals("copy")) {
+            for (int i = 3; i + 1 < argv.size(); i++) {
+                if (new String(argv.get(i), StandardCharsets.US_ASCII).equalsIgnoreCase("db")
+                        && db.equals(new String(argv.get(i + 1), StandardCharsets.US_ASCII))) {
+                    return argv.get(2);
+                }
+            }
+        }
+        return null;
+    }
+
+    /** The source answered GETKEYS with an error, which asking again would not change. */
+    private static boolean refusedBySource(Throwable e) {
+        for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            if (cause instanceof RedisCommandExecutionException) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean touchesDb(List<byte[]> argv, int database) {
@@ -860,10 +907,11 @@ public class RedisReplicationReader extends AbstractProcessor {
             return new Batch(keys, checkpoint);
         }
 
-        synchronized void giveBack(List<String> keys) {
+        synchronized void giveBack(List<String> keys, List<Map<String, String>> takenFlushes) {
             LinkedHashSet<String> restored = new LinkedHashSet<>(keys);
             restored.addAll(draining);
             draining = restored;
+            flushes.addAll(0, takenFlushes);
         }
     }
 }

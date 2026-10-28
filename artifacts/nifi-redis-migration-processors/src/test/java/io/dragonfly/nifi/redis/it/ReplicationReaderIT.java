@@ -158,12 +158,21 @@ class ReplicationReaderIT {
             s.mset(Map.of("user:6", "now a string", "order:6", "x"));
             s.hset("user:new", Map.of("n", "new"));
             s.sadd("user:set", "wrong type");
+            // Run in database 3, propagated under SELECT 3, but they land in the migrated database 0.
+            try (Client other = new Client(source)) {
+                RedisCommands<String, String> db3 = other.sync();
+                db3.select(3);
+                db3.hset("user:moved", Map.of("n", "moved"));
+                db3.move("user:moved", 0);
+                db3.hset("user:copied", Map.of("n", "copied"));
+                db3.copy("user:copied", "user:copied", io.lettuce.core.CopyArgs.Builder.destinationDb(0));
+            }
             Thread.sleep(500);
             pipeline.pumpUntilQuiet();
 
             List<String> expected = s.keys("user:*").stream().filter(k -> s.type(k).equals("hash")).sorted().toList();
-            assertEquals(List.of("user:0", "user:3", "user:7", "user:8", "user:9", "user:new", "user:renamed-in-prefix",
-                    "user:renamed-into-prefix"), expected);
+            assertEquals(List.of("user:0", "user:3", "user:7", "user:8", "user:9", "user:copied", "user:moved", "user:new",
+                    "user:renamed-in-prefix", "user:renamed-into-prefix"), expected);
             assertEquals(expected, tgt.sync().keys("*").stream().sorted().toList());
             for (String key : expected) {
                 assertEquals(s.hgetall(key), tgt.sync().hgetall(key), key);
