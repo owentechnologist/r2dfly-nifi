@@ -83,9 +83,13 @@ The script starts the flow and exits. NiFi keeps running unsupervised and keeps 
 changes until you stop it:
 
 ```bash
-./stop-continuous-migration.sh --nifi-container nifi-redis-migration \
-  --nifi-user USER --nifi-password PASSWORD
+./stop-continuous-migration.sh --nifi-container nifi-redis-migration
 ```
+
+Like the migration scripts, it reads the NiFi login from the container; pass `--nifi-user` and
+`--nifi-password` if the container no longer has it. Running `simple-migration.sh` against the
+same NiFi also turns a continuous run's live phase off, and the next `continuous-migration.sh`
+turns it back on.
 
 With keyspace notifications, a dropped pub/sub connection loses the changes made during the
 outage. The stop script prints the `Keyspace Pub/Sub Disconnects` and `Keyspace Pub/Sub Downtime

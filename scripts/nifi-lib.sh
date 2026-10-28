@@ -166,6 +166,27 @@ nifi_lib_load_state() {
   [[ -n "$content" ]] && eval "$content"
 }
 
+# nifi_lib_require_credentials <container> - fills in whichever of NIFI_USER/NIFI_PASS is unset,
+# first from the container's logs (NiFi prints them once, on first creation), then from the copy
+# deploy-to-nifi.sh saved inside the container, and exits with an error if they are still missing.
+# A NIFI_TOKEN needs neither. Call it after nifi_lib_pick_runtime.
+nifi_lib_require_credentials() {
+  local container="$1" creds
+  [[ -n "${NIFI_TOKEN:-}" || ( -n "${NIFI_USER:-}" && -n "${NIFI_PASS:-}" ) ]] && return 0
+  creds="$($RUNTIME logs "$container" 2>&1 | grep -A1 "Generated Username" | tail -2)" || true
+  NIFI_USER="${NIFI_USER:-$(sed -n '1s/.*\[\(.*\)\]/\1/p' <<< "$creds")}"
+  NIFI_PASS="${NIFI_PASS:-$(sed -n '2s/.*\[\(.*\)\]/\1/p' <<< "$creds")}"
+  if [[ -z "$NIFI_USER" || -z "$NIFI_PASS" ]]; then
+    nifi_lib_load_state "$container" "$NIFI_CREDS_FILE_PATH"
+  fi
+  if [[ -z "${NIFI_USER:-}" || -z "${NIFI_PASS:-}" ]]; then
+    echo "error: no NiFi credentials given, and none could be read from '$container' (its logs print" >&2
+    echo "       them once, on first creation) or from the copy saved inside it. Pass --nifi-user and" >&2
+    echo "       --nifi-password, or --nifi-token." >&2
+    exit 1
+  fi
+}
+
 nifi_cli() {
   runtime_exec "$CONTAINER_NAME" "$NIFI_CLI" nifi "$@" \
     -u "$NIFI_INTERNAL_URL" -ts "$NIFI_TRUSTSTORE" -tst PKCS12 -tsp "$NIFI_TS_PASS" -btk "$NIFI_TOKEN"

@@ -308,23 +308,7 @@ else
   EFFECTIVE_FILE_FILTER="$SOURCE_FILE_FILTER"
 fi
 
-# Credentials are only ever printed once, in the container's own logs on first creation - same
-# fallback ingest-file-demo.sh/simple-migration.sh use, so this script doesn't force a re-entry of
-# credentials the user never had to type the first time.
-if [[ -z "$NIFI_TOKEN" && ( -z "$NIFI_USER" || -z "$NIFI_PASS" ) ]]; then
-  CREDS="$("$RUNTIME" logs "$CONTAINER_NAME" 2>&1 | grep -A1 "Generated Username" | tail -2)" || true
-  NIFI_USER="$(sed -n '1s/.*\[\(.*\)\]/\1/p' <<< "$CREDS")"
-  NIFI_PASS="$(sed -n '2s/.*\[\(.*\)\]/\1/p' <<< "$CREDS")"
-  if [[ -z "$NIFI_USER" || -z "$NIFI_PASS" ]]; then
-    nifi_lib_load_state "$CONTAINER_NAME" "$NIFI_CREDS_FILE_PATH"
-  fi
-fi
-if [[ -z "$NIFI_TOKEN" && ( -z "$NIFI_USER" || -z "$NIFI_PASS" ) ]]; then
-  echo "error: no NiFi credentials given, and none could be read from the container's logs (they're only" >&2
-  echo "       printed once, on first container creation) or from the copy saved inside the container -" >&2
-  echo "       pass --nifi-token, or both --nifi-user and --nifi-password, explicitly." >&2
-  exit 1
-fi
+nifi_lib_require_credentials "$CONTAINER_NAME"
 
 nifi_lib_init
 

@@ -264,6 +264,9 @@ network round trip per pipeline flush rather than a near-zero-latency local one)
 Starting the flow:
   --start                      start the flow automatically, no prompt
   --no-start                   never start the flow, no prompt
+  --one-time                   a one-time copy: enable RedisScanReader and disable the Live Phase
+                               processors an earlier continuous run left, so pg-start runs the scan
+                               and nothing else (simple-migration.sh passes it)
   (default: ask interactively; non-interactive shells default to not starting)
 
 Progress tracking (only runs if the flow gets started; each round also prints a line of NiFi's
@@ -331,6 +334,7 @@ SOURCE_FILE="${SOURCE_FILE:-}"
 TARGET_FILE="${TARGET_FILE:-}"
 TARGET_FILE_FORMAT="${TARGET_FILE_FORMAT:-jsonl}"
 START_MODE="ask"
+ONE_TIME="false"
 SOURCE_CONTAINER="${SOURCE_CONTAINER:-}"
 TARGET_CONTAINER="${TARGET_CONTAINER:-}"
 POLL_INTERVAL="${POLL_INTERVAL:-2}"
@@ -400,6 +404,7 @@ while [[ $# -gt 0 ]]; do
     --target-file-format) TARGET_FILE_FORMAT="$2"; shift 2 ;;
     --start) START_MODE="yes"; shift ;;
     --no-start) START_MODE="no"; shift ;;
+    --one-time) ONE_TIME="true"; shift ;;
     --source-container) SOURCE_CONTAINER="$2"; shift 2 ;;
     --target-container) TARGET_CONTAINER="$2"; shift 2 ;;
     --poll-interval) POLL_INTERVAL="$2"; shift 2 ;;
@@ -875,6 +880,37 @@ nifi_cli pg-stop -pgid "$PG_ID" || true
 # `|| true`: it returns 1 on timeout after warning that the run proceeds, as in reset-r2dfly-flow.sh.
 wait_for_processors_stopped "$PG_ID" || true
 
+# set_processor_state <id> <RUNNING|STOPPED|DISABLED>
+set_processor_state() {
+  local ver
+  ver="$(nifi_current_version "processors/$1")" || true
+  nifi_api_put "processors/$1/run-status" "{\"revision\":{\"version\":$ver},\"state\":\"$2\",\"disconnectedNodeAcknowledged\":false}" >/dev/null || true
+}
+
+# A replication run leaves RedisScanReader DISABLED, and pg-start starts every processor that is
+# not: without this a one-time copy would run the Live Phase instead of the scan.
+if [[ "$ONE_TIME" == "true" ]]; then
+  ONE_TIME_CHANGES="$(nifi_api_get "process-groups/$PG_ID/processors" | py3 "
+import json, sys
+live = ('RedisKeyspaceEventConsumer', 'RedisSingleKeyFetch', 'DeleteRedisKey', 'RedisReplicationReader', 'MigrationReconciler')
+for p in json.load(sys.stdin)['processors']:
+    c = p['component']
+    is_live = c['type'].endswith(live) or c['name'] == 'RedisTypeDeserializer (live)'
+    if is_live and c['state'] != 'DISABLED':
+        print('DISABLED ' + c['id'] + ' ' + c['name'])
+    elif c['type'].endswith('RedisScanReader') and c['state'] == 'DISABLED':
+        print('STOPPED ' + c['id'] + ' ' + c['name'])
+")" || true
+  while read -r state id name; do
+    [[ -z "$id" ]] && continue
+    set_processor_state "$id" "$state"
+    echo "  one-time copy: $name set to $state"
+  done <<< "$ONE_TIME_CHANGES"
+  if grep -q '^DISABLED' <<< "$ONE_TIME_CHANGES"; then
+    echo "  the Live Phase of an earlier continuous run is now off; continuous-migration.sh turns it back on"
+  fi
+fi
+
 # Same requirement applies to controller services, but for *enabled*, not running: NiFi
 # rejects a property PUT to an enabled service outright (a real bug found in practice - every
 # run-r2dfly.sh run after the very first silently failed to update connection-string,
@@ -1304,13 +1340,6 @@ disconnect_processors() {
   done
   nifi_api_delete "connections/$id?version=$(nifi_current_version "connections/$id")" >/dev/null || true
   [[ -z "$(connection_id "$1" "$2" "$3")" ]] || { echo "error: could not remove the connection $id" >&2; exit 1; }
-}
-
-# set_processor_state <id> <RUNNING|STOPPED|DISABLED>
-set_processor_state() {
-  local ver
-  ver="$(nifi_current_version "processors/$1")" || true
-  nifi_api_put "processors/$1/run-status" "{\"revision\":{\"version\":$ver},\"state\":\"$2\",\"disconnectedNodeAcknowledged\":false}" >/dev/null || true
 }
 
 FILE_PROCESSORS_TO_START=()

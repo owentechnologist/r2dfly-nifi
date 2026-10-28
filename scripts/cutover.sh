@@ -40,8 +40,8 @@ nifi_processor_counters. In a NiFi cluster they are summed over the nodes.
 
 NiFi connection/auth:
   --nifi-container NAME   container running NiFi (env NIFI_CONTAINER_NAME, default: nifi-redis-migration)
-  --nifi-user USER        NiFi single-user login username (env NIFI_USER)
-  --nifi-password PASS    NiFi single-user login password (env NIFI_PASS)
+  --nifi-user USER        NiFi single-user login username (env NIFI_USER; read from the container if omitted)
+  --nifi-password PASS    NiFi single-user login password (env NIFI_PASS; read from the container if omitted)
   --nifi-token TOKEN      use an existing bearer token instead of user/password (env NIFI_TOKEN)
   -h, --help              this help
 EOF
@@ -74,11 +74,9 @@ done
 for n in "$MAX_LAG_SECONDS" "$TIMEOUT_SECONDS" "$RECONCILE_ROUNDS"; do
   [[ "$n" =~ ^[0-9]+$ ]] || { echo "error: '$n' is not a whole number" >&2; exit 1; }
 done
-if [[ -z "$NIFI_TOKEN" && ( -z "$NIFI_USER" || -z "$NIFI_PASS" ) ]]; then
-  echo "error: NiFi credentials required - pass --nifi-token, or both --nifi-user and --nifi-password" >&2; usage; exit 1
-fi
 
 nifi_lib_pick_runtime
+nifi_lib_require_credentials "$CONTAINER_NAME"
 nifi_lib_init
 
 ROOT_ID="$(nifi_cli get-root-id -ot simple | tr -d '[:space:]')" || true

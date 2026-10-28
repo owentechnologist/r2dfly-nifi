@@ -828,29 +828,8 @@ if [[ -n "$SOURCE_FILE" ]]; then
   $RUNTIME cp "$SOURCE_FILE" "$NIFI_CONTAINER_NAME:$NIFI_SOURCE_FILE"
 fi
 
-# Credentials are only ever printed once, in the container's own logs on first creation - grab
-# them now (rather than waiting for STAGE 5's own authentication step) so the connection-info
-# message below can tell the user how to log in right away.
-if [[ -z "$NIFI_USER" || -z "$NIFI_PASS" ]]; then
-  # `|| true`: a no-match grep (e.g. credentials already rotated past the container's log
-  # buffer) fails this assignment and would otherwise silently abort the script before the "no
-  # NiFi credentials" error below can run.
-  CREDS="$($RUNTIME logs "$NIFI_CONTAINER_NAME" 2>&1 | grep -A1 "Generated Username" | tail -2)" || true
-  NIFI_USER="$(sed -n '1s/.*\[\(.*\)\]/\1/p' <<< "$CREDS")"
-  NIFI_PASS="$(sed -n '2s/.*\[\(.*\)\]/\1/p' <<< "$CREDS")"
-  # The credentials line is eventually rotated out of the container's logs for good, so fall
-  # back to the copy deploy-to-nifi.sh saved inside the container while it was still there.
-  if [[ -z "$NIFI_USER" || -z "$NIFI_PASS" ]]; then
-    nifi_lib_load_state "$NIFI_CONTAINER_NAME" "$NIFI_CREDS_FILE_PATH"
-  fi
-fi
-if [[ -z "$NIFI_USER" || -z "$NIFI_PASS" ]]; then
-  echo "error: no NiFi credentials given, and none could be read from the container's logs" >&2
-  echo "       (they're only printed once, on first container creation) or from the copy" >&2
-  echo "       saved inside the container - pass --nifi-user/--nifi-password explicitly if" >&2
-  echo "       you already have credentials." >&2
-  exit 1
-fi
+# Read now, not at STAGE 5, so the connection-info message below can show how to log in.
+nifi_lib_require_credentials "$NIFI_CONTAINER_NAME"
 
 # NiFi's self-signed cert's SAN list only covers localhost/127.0.0.1/the container's own
 # internal hostname (see docs/TUTORIAL.md) - a browser on a different machine than this one
@@ -1107,6 +1086,7 @@ echo "=================================================="
 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] STAGE 7/8: Configuring and starting the migration"
 echo "=================================================="
 RUN_ARGS=(
+  --one-time
   --nifi-container "$NIFI_CONTAINER_NAME"
   --nifi-user "$NIFI_USER" --nifi-password "$NIFI_PASS"
   --migration-id "$MIGRATION_ID"

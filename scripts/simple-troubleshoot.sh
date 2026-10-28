@@ -69,26 +69,7 @@ nifi_lib_pick_runtime
 nifi_lib_check_disk_space
 
 echo "==> discovering NiFi credentials for '$NIFI_CONTAINER_NAME'"
-if [[ -z "$NIFI_USER" || -z "$NIFI_PASS" ]]; then
-  # `|| true`: under set -e/pipefail, a no-match grep (e.g. credentials already rotated past the
-  # container's log buffer) fails this assignment and would silently abort the script before the
-  # "no NiFi credentials" error below can run.
-  CREDS="$($RUNTIME logs "$NIFI_CONTAINER_NAME" 2>&1 | grep -A1 "Generated Username" | tail -2)" || true
-  NIFI_USER="${NIFI_USER:-$(printf '%s\n' "$CREDS" | sed -n '1s/.*\[\(.*\)\]/\1/p')}"
-  NIFI_PASS="${NIFI_PASS:-$(printf '%s\n' "$CREDS" | sed -n '2s/.*\[\(.*\)\]/\1/p')}"
-  # The credentials line is eventually rotated out of the container's logs for good, so fall
-  # back to the copy deploy-to-nifi.sh saved inside the container while it was still there.
-  if [[ -z "$NIFI_USER" || -z "$NIFI_PASS" ]]; then
-    nifi_lib_load_state "$NIFI_CONTAINER_NAME" "$NIFI_CREDS_FILE_PATH"
-  fi
-fi
-if [[ -z "$NIFI_USER" || -z "$NIFI_PASS" ]]; then
-  echo "error: no NiFi credentials given, and none could be read from '$NIFI_CONTAINER_NAME'" >&2
-  echo "       logs (they're only printed once, on first container creation) or from the copy" >&2
-  echo "       saved inside the container - pass --nifi-user/--nifi-password explicitly if" >&2
-  echo "       you already have credentials." >&2
-  exit 1
-fi
+nifi_lib_require_credentials "$NIFI_CONTAINER_NAME"
 echo "  authenticated as $NIFI_USER"
 
 if [[ -z "$SOURCE_CONNECTION_STRING" || -z "$TARGET_CONNECTION_STRING" ]]; then

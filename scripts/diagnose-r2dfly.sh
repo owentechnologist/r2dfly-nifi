@@ -19,8 +19,8 @@ Usage: $(basename "$0") [options]
 
 NiFi connection/auth:
   --nifi-container NAME        container running NiFi (env NIFI_CONTAINER_NAME, default: nifi-redis-migration)
-  --nifi-user USER             NiFi single-user login username (env NIFI_USER)
-  --nifi-password PASSWORD     NiFi single-user login password (env NIFI_PASS)
+  --nifi-user USER             NiFi single-user login username (env NIFI_USER; read from the container if omitted)
+  --nifi-password PASSWORD     NiFi single-user login password (env NIFI_PASS; read from the container if omitted)
   --nifi-token TOKEN           use an existing bearer token instead of user/password (env NIFI_TOKEN)
 
 Reachability checks (optional - skipped if not given):
@@ -71,9 +71,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$NIFI_TOKEN" && ( -z "$NIFI_USER" || -z "$NIFI_PASS" ) ]]; then
-  echo "error: NiFi credentials required - pass --nifi-token, or both --nifi-user and --nifi-password" >&2; usage; exit 1
-fi
 # `tr`, not `${var,,}` (bash 4+ lowercasing), for the same reason run-r2dfly.sh spells this out at
 # its own lowercasing site: these scripts have to keep working under macOS's stock bash 3.2, which
 # aborts outright with "bad substitution" on `${var,,}` - and being this early in the script, that
@@ -93,6 +90,7 @@ esac
 [[ -n "$TARGET_CONTAINER" || -z "$TARGET_CONNECTION_STRING" ]] || TARGET_CONTAINER="$(redis_lib_extract_host "$TARGET_CONNECTION_STRING")"
 
 nifi_lib_pick_runtime
+nifi_lib_require_credentials "$CONTAINER_NAME"
 nifi_lib_init
 
 echo "==> locating the R2Dfly Migration process group"
