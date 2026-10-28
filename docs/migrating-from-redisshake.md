@@ -100,7 +100,10 @@ live phase follow them too. See [Transforms](quickstart.md#transforms) for the d
   snapshot. RedisShake's documentation says a topology change stops it.
 - **One bad key does not stop the run.** A key that cannot be copied gets a dead-letter record
   with its reason, and the flow continues. Read the records in the dead-letter directory
-  (`/opt/nifi/nifi-current/r2dfly-dead-letter` inside the NiFi container).
+  (`/opt/nifi/nifi-current/r2dfly-dead-letter` inside the NiFi container). Each key has one
+  record. It holds the latest `reason` and `failed_at`, the earlier reasons under `history`
+  (newest first, up to 20), the FlowFile's attributes, and its content in `content_base64`. A
+  chunk of a large key that failed on its own has a record of its own.
 - **Some module types cannot be copied from Redis.** Dragonfly v2.0.2 rejects Redis's Bloom,
   Cuckoo and Count-Min Sketch payloads, and has no time series, T-Digest, graph or vector sets.
   r2dfly dead-letters those keys with the reason. JSON and TopK are rebuilt from their values.
