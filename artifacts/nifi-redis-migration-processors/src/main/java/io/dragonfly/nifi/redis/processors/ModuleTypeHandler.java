@@ -271,14 +271,34 @@ public class ModuleTypeHandler extends AbstractProcessor {
         });
 
         List<Item> toWrite = new ArrayList<>();
+        List<Item> vanished = new ArrayList<>();
         Map<Item, byte[]> jsonByItem = new LinkedHashMap<>();
         for (Item item : items) {
-            byte[] json = resolveOrLogFailure(getFutures.get(item), item, "JSON.GET", session, logger);
+            CompletableFuture<byte[]> get = getFutures.get(item);
+            // A nil reply: the key expired or was deleted since the scan, so the target's copy goes too.
+            if (get != null && get.isDone() && !get.isCompletedExceptionally() && get.join() == null) {
+                vanished.add(item);
+                continue;
+            }
+            byte[] json = resolveOrLogFailure(get, item, "JSON.GET", session, logger);
             if (json == null) {
                 continue;
             }
             jsonByItem.put(item, json);
             toWrite.add(item);
+        }
+        if (!vanished.isEmpty()) {
+            Map<Item, CompletableFuture<Long>> deletes = targetPool.withRawConnection(conn -> {
+                Map<Item, CompletableFuture<Long>> futures = new LinkedHashMap<>();
+                vanished.forEach(item -> futures.put(item, RawModuleCommands.del(conn, item.targetKey)));
+                Futures.awaitAll(futures.values(), batchTimeoutMs);
+                return futures;
+            });
+            for (Item item : vanished) {
+                if (resolveOrLogFailure(deletes.get(item), item, "DEL", session, logger) != null) {
+                    session.transfer(item.flowFile, REL_SUCCESS);
+                }
+            }
         }
         if (toWrite.isEmpty()) {
             return;
@@ -570,12 +590,16 @@ public class ModuleTypeHandler extends AbstractProcessor {
      * failed or didn't finish in time - the caller treats null as "skip this item". */
     private <T> T resolveOrLogFailure(CompletableFuture<T> future, Item item, String commandName,
                                        ProcessSession session, ComponentLog logger) {
-        if (future != null && future.isDone() && !future.isCompletedExceptionally()) {
+        if (future != null && future.isDone() && !future.isCompletedExceptionally() && future.join() != null) {
             return future.join();
         }
         String key = new String(item.sourceKey, StandardCharsets.UTF_8);
         String reason;
-        if (future == null) {
+        if (future != null && future.isDone() && !future.isCompletedExceptionally()) {
+            // Callers read null as already routed, so a nil reply goes to failure here rather than nowhere.
+            logger.warn("{} answered nil for key {}", commandName, key);
+            reason = commandName + " answered nil";
+        } else if (future == null) {
             logger.warn("{} produced no future for key {}", commandName, key);
             reason = commandName + " was never sent";
         } else if (future.isCompletedExceptionally()) {

@@ -133,6 +133,37 @@ class ModuleTypeHandlerIT {
         assertEquals(expectedCounts, readTargetTopkCounts("srckey"));
     }
 
+    @Test
+    void aJsonKeyGoneFromTheSourceIsDeletedOnTheTargetWithoutStallingTheBatch() throws Exception {
+        RedisCommands<String, String> target = targetConnection.sync();
+        target.dispatch(io.lettuce.core.protocol.CommandType.SET, new StatusOutput<>(StringCodec.UTF8),
+                new CommandArgs<>(StringCodec.UTF8).addKey("gone:doc").addValue("stale copy"));
+        sourceConnection.sync().set("present:s", "unrelated");
+
+        TestRunner runner = TestRunners.newTestRunner(ModuleTypeHandler.class);
+        runner.setAllowSynchronousSessionCommits(true);
+        StandardRedisConnectionPoolService sourcePool = new StandardRedisConnectionPoolService();
+        runner.addControllerService("source-pool", sourcePool);
+        runner.setProperty(sourcePool, AbstractRedisConnectionPoolService.CONNECTION_STRING,
+                "redis://" + sourceDragonfly.getHost() + ":" + sourceDragonfly.getMappedPort(6379));
+        runner.setProperty(sourcePool, AbstractRedisConnectionPoolService.REQUIRE_TLS, "false");
+        runner.enableControllerService(sourcePool);
+        StandardDragonflyConnectionPoolService targetPool = new StandardDragonflyConnectionPoolService();
+        runner.addControllerService("target-pool", targetPool);
+        runner.setProperty(targetPool, AbstractRedisConnectionPoolService.CONNECTION_STRING,
+                "redis://" + targetDragonfly.getHost() + ":" + targetDragonfly.getMappedPort(6379));
+        runner.setProperty(targetPool, AbstractRedisConnectionPoolService.REQUIRE_TLS, "false");
+        runner.enableControllerService(targetPool);
+        runner.setProperty(ModuleTypeHandler.SOURCE_CONNECTION_POOL, "source-pool");
+        runner.setProperty(ModuleTypeHandler.TARGET_CONNECTION_POOL, "target-pool");
+
+        runner.enqueue(new byte[0], Map.of("redis.key", "gone:doc", "redis.type", "ReJSON-RL"));
+        runner.run();
+
+        runner.assertAllFlowFilesTransferred(ModuleTypeHandler.REL_SUCCESS, 1);
+        assertEquals(0L, target.exists("gone:doc"), "the stale copy is gone with the source key");
+    }
+
     private Map<String, Long> readTargetTopkCounts(String key) {
         RedisCommands<String, String> target = targetConnection.sync();
         List<Object> raw = target.dispatch(RawCommand.TOPK_LIST, new ArrayOutput<>(StringCodec.UTF8),
