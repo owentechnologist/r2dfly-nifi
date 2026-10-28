@@ -136,7 +136,7 @@ class ClusterScanIT {
         for (String id : masters.subList(1, masters.size())) {
             laterMastersKeys += dbsize(portOf(id));
         }
-        List<String> keys = scanCluster(1, "MASTER", masters.get(1) + "|0");
+        List<String> keys = scanCluster(1, "MASTER", masters.get(1) + "|" + masters.get(1) + "|0");
         assertEquals(laterMastersKeys, new HashSet<>(keys).size(), "only the checkpointed master and those after it were scanned");
     }
 
@@ -198,7 +198,7 @@ class ClusterScanIT {
         String migrationId = "cluster-" + System.nanoTime();
         if (checkpoint != null) {
             Serializer<String> serializer = (value, out) -> out.write(value.getBytes(StandardCharsets.UTF_8));
-            cache.put("redis.migration.cursor." + migrationId + ".0", checkpoint, serializer, serializer);
+            cache.put("redis.migration.cursor.v2." + migrationId + ".0", checkpoint, serializer, serializer);
         }
         runner.setProperty(RedisScanReader.REDIS_CONNECTION_POOL, "pool");
         runner.setProperty(RedisScanReader.CURSOR_STATE_CACHE, "cache");

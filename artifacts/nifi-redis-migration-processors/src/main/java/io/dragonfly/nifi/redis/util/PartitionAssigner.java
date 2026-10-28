@@ -47,7 +47,9 @@ public class PartitionAssigner {
 
     public PartitionAssigner(DistributedMapCacheClient cache, String migrationId) {
         this.cache = cache;
-        this.migrationId = migrationId;
+        // Versioned: state an earlier release saved for the same migration id meant different
+        // partitions and cursor formats, so a reused id starts its scan over rather than misread it.
+        this.migrationId = "v2." + migrationId;
     }
 
     /** Attempts to claim the first unclaimed partition in [0, partitionCount), never taking one over. */
@@ -58,6 +60,11 @@ public class PartitionAssigner {
     /** Like {@link #claimPartition(int)}, but also takes over a claim not heartbeat for {@code staleAfterMs}. */
     public Optional<Integer> claimPartition(int partitionCount, long staleAfterMs) throws IOException {
         for (int i = 0; i < partitionCount; i++) {
+            // A finished partition stops heartbeating, so its claim looks stale; taking it over would
+            // only keep a task from the partitions a dead node left unfinished.
+            if (isPartitionComplete(i)) {
+                continue;
+            }
             String now = String.valueOf(System.currentTimeMillis());
             if (cache.putIfAbsent(claimKey(i), now, STRING_SERIALIZER, STRING_SERIALIZER) || takeOverIfStale(i, staleAfterMs)) {
                 return Optional.of(i);

@@ -219,9 +219,9 @@ class ClusterTopologyIT {
             laterSlots = slotsOf(later);
             List<ClusterTopologySnapshot.MasterNode> baseline = new ArrayList<>();
             masters().forEach((id, port) -> baseline.add(new ClusterTopologySnapshot.MasterNode(id, "127.0.0.1", port, java.util.Set.copyOf(slotsOf(id)))));
-            put("redis.migration.topology." + migrationId, ClusterTopologySnapshot.of(System.currentTimeMillis(), baseline).encode());
+            put("redis.migration.topology.v2." + migrationId, ClusterTopologySnapshot.of(System.currentTimeMillis(), baseline).encode());
             String cursor = node(masters().get(current), c -> c.scan(io.lettuce.core.ScanArgs.Builder.limit(20))).getCursor();
-            put("redis.migration.cursor." + migrationId + ".0", current + "|" + current + "|" + cursor);
+            put("redis.migration.cursor.v2." + migrationId + ".0", current + "|" + current + "|" + cursor);
         }
 
         List<String> run() throws Exception {

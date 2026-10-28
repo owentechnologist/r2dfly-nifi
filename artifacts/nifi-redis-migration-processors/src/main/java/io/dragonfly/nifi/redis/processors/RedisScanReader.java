@@ -242,6 +242,8 @@ public class RedisScanReader extends AbstractProcessor {
         try {
             if (assigner.isPartitionComplete(partitionIndex)) {
                 getLogger().info("Partition {} already marked complete for migration '{}'; yielding", partitionIndex, migrationId);
+                // Free to claim another, such as one a dead node left behind.
+                assignedPartition.remove();
                 context.yield();
                 return;
             }
@@ -322,13 +324,15 @@ public class RedisScanReader extends AbstractProcessor {
                 gauges.set(session, "Source Latency (ms)", pageMs);
             }
             place = next;
+            // The page's FlowFiles first: a cursor saved ahead of them would skip the page if the commit failed.
+            // A crash between the two re-reads the page, which only copies its keys again.
+            session.commit();
             try {
                 assigner.checkpointCursor(partitionIndex, place == null ? "" : place.encode());
                 assigner.heartbeat(partitionIndex);
             } catch (IOException e) {
                 throw new ProcessException("Unable to checkpoint SCAN cursor", e);
             }
-            session.commit();
             long pauseMs = throttle.pauseAfter(pageMs, () -> opsPerSec(redisPool));
             if (pauseMs > 0) {
                 session.adjustCounter("Scan Throttle Pause (ms)", pauseMs, false);
@@ -406,8 +410,7 @@ public class RedisScanReader extends AbstractProcessor {
     /**
      * Where a partition is: the baseline shard it works on, the node it reads that shard on, and
      * its step there, a SCAN cursor or "slots:index" while it reads the shard's slots that moved
-     * off that node. Encoded "target|node|step"; the "node|cursor" of earlier versions reads as a
-     * shard scanned on its own node.
+     * off that node. Encoded "target|node|step".
      */
     record Place(String target, String node, String step) {
         static final String SLOTS = "slots:";
@@ -424,9 +427,9 @@ public class RedisScanReader extends AbstractProcessor {
             return target + "|" + node + "|" + step;
         }
 
-        static Place decode(String saved) {
+        static Optional<Place> decode(String saved) {
             String[] parts = saved.split("\\|", -1);
-            return parts.length == 3 ? new Place(parts[0], parts[1], parts[2]) : new Place(parts[0], parts[0], parts[1]);
+            return parts.length == 3 ? Optional.of(new Place(parts[0], parts[1], parts[2])) : Optional.empty();
         }
 
         @Override
@@ -440,7 +443,7 @@ public class RedisScanReader extends AbstractProcessor {
             return null;
         }
         try {
-            Optional<Place> saved = assigner.restoreCursor(partitionIndex).filter(s -> !s.isEmpty()).map(Place::decode);
+            Optional<Place> saved = assigner.restoreCursor(partitionIndex).flatMap(Place::decode);
             if (saved.isPresent() && targets.contains(saved.get().target())) {
                 return saved.get();
             }

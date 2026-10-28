@@ -13,7 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class PartitionAssignerTest {
 
     private static final Serializer<String> STRING = (value, out) -> out.write(value.getBytes(StandardCharsets.UTF_8));
-    private static final String CLAIM_0 = "redis.migration.partition.migration-1.claim.0";
+    private static final String CLAIM_0 = "redis.migration.partition.v2.migration-1.claim.0";
 
     @Test
     void aClaimStillBeingHeartbeatIsNotTakenOver() throws Exception {
@@ -35,6 +35,17 @@ class PartitionAssignerTest {
 
         assertEquals(Optional.of(0), first, "the dead owner's claim is taken over");
         assertEquals(Optional.empty(), second, "the take-over refreshed it, so the next task leaves it alone");
+    }
+
+    @Test
+    void aFinishedPartitionIsPassedOverForOneADeadNodeLeftUnfinished() throws Exception {
+        FakeAtomicMapCacheClient cache = new FakeAtomicMapCacheClient();
+        String stale = String.valueOf(System.currentTimeMillis() - 120_000);
+        cache.put(CLAIM_0, stale, STRING, STRING);
+        cache.put(CLAIM_0.replace(".claim.0", ".claim.1"), stale, STRING, STRING);
+        new PartitionAssigner(cache, "migration-1").markPartitionComplete(0);
+
+        assertEquals(Optional.of(1), new PartitionAssigner(cache, "migration-1").claimPartition(2, 60_000));
     }
 
     @Test
