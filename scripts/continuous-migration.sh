@@ -437,6 +437,8 @@ MAPPING = {
     ("run", "defaults"): "ASSUME_DEFAULTS",
     ("run", "verbose"): "VERBOSE",
     ("run", "yes"): "ASSUME_YES",
+    ("run", "migration-id"): "MIGRATION_ID",
+    ("run", "disable-provenance"): "DISABLE_PROVENANCE",
 }
 RESOURCE_KEYS = {("resources", k) for k in ("cpus", "memory", "parallelism", "writer-concurrency")}
 
@@ -1290,6 +1292,8 @@ RUN_ARGS+=(--claim-timeout-ms "$CLAIM_TIMEOUT_MS" --source-read-from "$SOURCE_RE
 [[ -n "$TTL_RESET_OFFSET_MS" ]] && RUN_ARGS+=(--ttl-reset-offset-ms "$TTL_RESET_OFFSET_MS")
 [[ -n "$TRANSFORM_SCRIPT" ]] && RUN_ARGS+=(--transform-script "$TRANSFORM_SCRIPT")
 
+RUN_MARKER="/tmp/r2dfly-run-$MIGRATION_ID"
+runtime_exec "$NIFI_CONTAINER_NAME" touch "$RUN_MARKER" || true
 "$PROJECT_ROOT/scripts/run-r2dfly.sh" "${RUN_ARGS[@]}"
 
 processor_run_status() {
@@ -1394,10 +1398,15 @@ echo "  target keys: $TARGET_DBSIZE_END (was $TARGET_DBSIZE_START before this ru
 echo "  keys migrated this run: $MIGRATED"
 # RedisDeadLetterWriter keeps one record per key it could not copy (a time series, a Bloom filter
 # from Redis, a write that kept failing, ...), each with its reason.
-DEAD_LETTERS="$(runtime_exec "$NIFI_CONTAINER_NAME" sh -c 'ls /opt/nifi/nifi-current/r2dfly-dead-letter 2>/dev/null | wc -l' | tr -d '[:space:]')" || true
+# Records written since this run started, against the marker set before it; older ones are reported apart.
+DEAD_LETTERS="$(runtime_exec "$NIFI_CONTAINER_NAME" sh -c "find /opt/nifi/nifi-current/r2dfly-dead-letter -type f -newer $RUN_MARKER 2>/dev/null | wc -l" | tr -d '[:space:]')" || true
+DEAD_LETTERS_ALL="$(runtime_exec "$NIFI_CONTAINER_NAME" sh -c 'ls /opt/nifi/nifi-current/r2dfly-dead-letter 2>/dev/null | wc -l' | tr -d '[:space:]')" || true
 if [[ "${DEAD_LETTERS:-0}" -gt 0 ]]; then
-  echo "  keys NOT copied: $DEAD_LETTERS - one JSON record each, with the reason, in"
+  echo "  keys NOT copied this run: $DEAD_LETTERS - one JSON record each, with the reason, in"
   echo "    $NIFI_CONTAINER_NAME:/opt/nifi/nifi-current/r2dfly-dead-letter"
+fi
+if [[ "${DEAD_LETTERS_ALL:-0}" -gt "${DEAD_LETTERS:-0}" ]]; then
+  echo "  $(( DEAD_LETTERS_ALL - ${DEAD_LETTERS:-0} )) older dead-letter records from earlier runs are still in that directory"
 fi
 echo "  the initial snapshot is complete, and the Live Phase is still running."
 echo "  NiFi keeps running unsupervised after this script exits, and the Live Phase keeps applying"

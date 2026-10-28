@@ -32,9 +32,9 @@ while you wait.
 
 `simple-migration.sh` runs a snapshot migration: it scans the source once and makes the target
 match that scan, then exits. It does not track changes made on the source after the scan
-starts - that's `--mode snapshot`, the default and (for now) only value. A continuous mode -
-an ongoing sync that keeps applying source changes until you stop it - is planned as a
-separate `continuous-migration.sh`, not this script.
+starts - that's `--mode snapshot`, the default and only value. For an ongoing sync that keeps
+applying source changes until you stop it, use `continuous-migration.sh`
+([below](#run-a-continuous-migration)).
 
 ```bash
 ./simple-migration.sh \
@@ -61,8 +61,10 @@ This single command:
 
 ## Run a continuous migration
 
-`continuous-migration.sh` does everything `simple-migration.sh` does, and also subscribes to the
-source's keyspace notifications so changes made after the scan keep flowing to the target.
+`continuous-migration.sh` runs the same copy as `simple-migration.sh`, then keeps applying the
+source's changes to the target until you stop it. By default it follows the source's keyspace
+notifications. It takes no file options, and it refuses `--source-read-from replica`, because a
+replica lags its master.
 
 ```bash
 ./continuous-migration.sh \
@@ -100,9 +102,10 @@ cutover and rollback.
 ## Options
 
 These options apply to `simple-migration.sh` and `continuous-migration.sh` alike.
-`continuous-migration.sh` takes no `--mode` and adds `--keyspace-pattern`, `--event-types`,
-`--max-queue-depth`, `--skip-keyspace-check` and `--reconciliation-signals` on top; see its
-`--help`.
+`continuous-migration.sh` takes no `--mode` and no file options, and adds `--live-source`,
+`--reconcile-mode`, `--reconcile-interval-ms`, `--reconcile-sample-size`, `--keyspace-pattern`,
+`--event-types`, `--max-queue-depth`, `--skip-keyspace-check`, `--require-config-check` and
+`--reconciliation-signals`; see its `--help`.
 
 ```
 --source-connection-string S  redis://[:password@]host:port[/db] (or rediss:// for TLS -
@@ -304,8 +307,12 @@ settings while a flag overrides just one of them for a single run:
 ./simple-migration.sh --toml-file source-cluster-hefty-box-config.toml --parallelism 8
 ```
 
-Every key maps 1:1 to a flag above (same name, minus `--`), grouped into sections. You don't
-need to set every key - anything left out falls back to `simple-migration.sh`'s own default:
+Every flag has a TOML key, grouped into sections, and most keys are the flag's name without
+`--`. The exceptions are the on/off flags, whose key takes `true` or `false`
+(`restore-fast-path = false` for `--no-restore-fast-path`), and a few renamed under their section:
+`[transform] script` is `--transform-script`, `[live] source` is `--live-source`, and
+`[run] migration-id` is `--migration-id`. An unknown key is reported as a warning. You don't
+need to set every key - anything left out falls back to the script's own default:
 
 ```toml
 [source]
@@ -349,6 +356,8 @@ dfly-to-dfly = true                                # --dfly-to-dfly / --no-dfly-
 defaults = true                                    # --defaults
 verbose = false                                    # --verbose
 yes = true                                         # -y / --yes
+migration-id = "r2dfly-orders"                     # --migration-id
+disable-provenance = true                          # --disable-provenance / --no-disable-provenance
 ```
 
 An unrecognized section or key is a warning (likely a typo), not a silent no-op or a hard

@@ -70,8 +70,9 @@ reason. Time series, T-Digest, graph and vector set keys are dead-lettered witho
 
 Redis 8 publishes no keyspace notification for `TOPK.*`, `BF.*`, `CF.*` or `CMS.*`. `JSON.*` and
 `TS.*` do publish. A live phase driven by keyspace notifications can never see those changes, so
-they need `--live-source replication` or a reconcile pass. Guarded by `LivePhaseIT`, which fails
-if Redis starts announcing them.
+they need `--live-source replication` or a reconcile pass. `LivePhaseIT` fails if Redis starts
+announcing `TOPK.*`; the `BF.*`, `CF.*` and `CMS.*` results come from a one-time probe that no test
+repeats.
 
 ## The replication protocol
 

@@ -59,8 +59,8 @@ import java.util.function.Function;
 @Tags({"redis", "dragonfly", "migration", "reconcile", "verify", "repair"})
 @CapabilityDescription("Compares source and target key by key (existence, type, size, TTL, and value), routes every key "
         + "that differs to repair for re-copying, and emits a JSON or Markdown report per pass. A sudden drop in the "
-        + "source's DBSIZE (a FLUSHALL or FLUSHDB) starts a full pass at once. Assumes target keys carry the source's "
-        + "names (no Key Prefix on the writer).")
+        + "source's DBSIZE (a FLUSHALL or FLUSHDB) starts a full pass at once. Target keys are named through the same Key Prefix Rename and Key Prefix as "
+        + "the writer's, and a target key no source key maps to is left alone.")
 @PrimaryNodeOnly
 @TriggerSerially
 // No input: NiFi refuses Primary Node Only for a processor with an incoming connection, and a

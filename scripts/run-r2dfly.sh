@@ -472,6 +472,11 @@ for _rule in ${_RULES[@]+"${_RULES[@]}"}; do
   fi
 done
 unset _RULES _rule
+# A file holds records as read; the transforms run in the writer and the hook in front of it.
+if [[ -n "$TARGET_FILE" && ( -n "$RENAME_PREFIX$TRANSFORM_SCRIPT" || "$TTL_STRATEGY" != "PRESERVE" ) ]]; then
+  echo "error: --target-file writes keys as the source holds them; --rename-prefix, --ttl-strategy and --transform-script apply when the file is loaded into a target instead" >&2
+  exit 1
+fi
 if [[ -n "$TRANSFORM_SCRIPT" && ! -f "$TRANSFORM_SCRIPT" ]]; then
   echo "error: --transform-script $TRANSFORM_SCRIPT does not exist" >&2; exit 1
 fi
@@ -1310,6 +1315,7 @@ set_processor_state() {
 
 FILE_PROCESSORS_TO_START=()
 FILE_RECORDS_BASE=0
+KEYS_WRITTEN_BASE=0
 SOURCE_FILE_RECORDS=0
 if [[ -n "$SOURCE_FILE$TARGET_FILE$TRANSFORM_SCRIPT" && -z "$PROC_DEAD_LETTER" ]]; then
   echo "error: could not find the RedisDeadLetterWriter processor in $PG_ID. Re-import the baseline with reset-r2dfly-flow.sh." >&2; exit 1
@@ -1604,6 +1610,9 @@ source_count() {
 target_count() {
   if [[ -n "$TARGET_FILE" ]]; then
     echo $(( $(nifi_counter "File Records Written") - FILE_RECORDS_BASE ))
+  elif [[ -n "$SOURCE_FILE" ]]; then
+    # Keys already on the target would make its DBSIZE look like the import was done.
+    echo $(( $(nifi_counter "Keys Written") - KEYS_WRITTEN_BASE ))
   else
     redis_dbsize "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING" "$TARGET_CONNECTION_MODE" "${TARGET_CLUSTER_NODES:-}"
   fi
@@ -1713,6 +1722,7 @@ if should_start; then
   if [[ ${#FILE_PROCESSORS_TO_START[@]} -gt 0 ]]; then
     echo "==> starting only the processors this file run uses"
     FILE_RECORDS_BASE="$(nifi_counter "File Records Written")"
+    KEYS_WRITTEN_BASE="$(nifi_counter "Keys Written")"
     if [[ -n "$SOURCE_FILE" ]]; then
       SOURCE_FILE_RECORDS="$(runtime_exec "$CONTAINER_NAME" grep -c . "$SOURCE_FILE" | tr -d '[:space:]')" || true
       echo "  $SOURCE_FILE holds ${SOURCE_FILE_RECORDS:=0} key records"
@@ -1734,8 +1744,18 @@ if should_start; then
     TARGET_CLUSTER_NODES=""
     [[ "$SOURCE_CONNECTION_MODE" == "cluster" ]] && SOURCE_CLUSTER_NODES="$(cluster_lib_each_master "$SOURCE_CONTAINER" "$SOURCE_CONNECTION_STRING")"
     [[ "$TARGET_CONNECTION_MODE" == "cluster" ]] && TARGET_CLUSTER_NODES="$(cluster_lib_each_master "$TARGET_CONTAINER" "$TARGET_CONNECTION_STRING")"
-    [[ ${#FILE_PROCESSORS_TO_START[@]} -gt 0 ]] || auto_tune_poll_durations
-    poll_until_synced || true
+    POLL_OK=true
+    if [[ ${#FILE_PROCESSORS_TO_START[@]} -gt 0 ]]; then
+      # Stopping a file run early would leave a partial file, so only a stall ends the wait.
+      [[ "$POLL_MAX_DURATION_EXPLICIT" == "true" ]] || POLL_MAX_DURATION=31536000
+    else
+      auto_tune_poll_durations
+    fi
+    poll_until_synced || POLL_OK=false
+    if [[ "$POLL_OK" != "true" && ${#FILE_PROCESSORS_TO_START[@]} -gt 0 ]]; then
+      echo "error: the file run did not finish; its processors are left running. Check the flow, then rerun." >&2
+      exit 1
+    fi
   fi
   if [[ ${#FILE_PROCESSORS_TO_START[@]} -gt 0 && "$POLL_MODE" == "yes" ]]; then
     echo "==> stopping the file run's processors"
