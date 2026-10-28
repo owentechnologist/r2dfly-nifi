@@ -49,6 +49,7 @@ class ReplicationReaderIT {
             seed(src.sync(), modules);
             tgt.sync().flushall();
 
+            long startedAt = System.currentTimeMillis() / 1000;
             ReplicationPipeline pipeline = new ReplicationPipeline(url(source), "STANDALONE", DRAGONFLY, reader(source));
             Writes writes = new Writes(source, modules, 1);
             writes.start();
@@ -57,6 +58,7 @@ class ReplicationReaderIT {
             pipeline.pumpUntilQuiet();
             ReplicationPipeline.assertTargetMatchesSource(src.sync(), tgt.sync(), modules);
             assertEquals(1L, pipeline.counter("Replication Full Resyncs"));
+            assertTrue(pipeline.counter("Replication Streams Connected At (epoch seconds)") >= startedAt);
 
             // A crash: the state is whatever the reader last saved while writes were still arriving.
             Writes moreWrites = new Writes(source, modules, 2);

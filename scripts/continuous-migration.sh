@@ -1217,7 +1217,8 @@ print(next((p['component']['id'] for p in json.load(sys.stdin)['processors'] if 
 if [[ -z "$PROC_RECONCILER" ]]; then
   echo "error: could not find MigrationReconciler in $PG_ID - build-live-phase-flow.sh should have created it" >&2; exit 1
 fi
-LIVE_PROCS_DOWNSTREAM_FIRST+=("$PROC_RECONCILER:MigrationReconciler")
+# With --live-source replication the reconciler starts only once the reader's streams are connected, below.
+[[ "$LIVE_SOURCE" != "replication" ]] && LIVE_PROCS_DOWNSTREAM_FIRST+=("$PROC_RECONCILER:MigrationReconciler")
 
 # json_or_null <value> - "null" (unquoted, NiFi's way of explicitly clearing an optional property
 # back to its own default) or the value quoted as a JSON string. NiFi's processor-property PUT is
@@ -1266,6 +1267,23 @@ RECONCILER_PROPS="$RECONCILER_PROPS,\"spare-target-only-keys\":\"$RECONCILE_SPAR
 RECONCILER_PROPS="$RECONCILER_PROPS,\"spared-prefixes\":$(json_or_null "$RECONCILE_SPARED_PREFIXES"),\"spared-types\":$(json_or_null "$RECONCILE_SPARED_TYPES")"
 nifi_api_put_checked "processors/$PROC_RECONCILER" \
   "{\"revision\":{\"version\":$RECONCILER_VER},\"component\":{\"id\":\"$PROC_RECONCILER\",\"config\":{\"properties\":{$RECONCILER_PROPS}}}}" > /dev/null
+
+# set_processor_state <proc-id> <STOPPED|DISABLED>
+set_processor_state() {
+  local ver
+  ver="$(nifi_current_version "processors/$1")" || true
+  nifi_api_put_checked "processors/$1/run-status" "{\"revision\":{\"version\":$ver},\"state\":\"$2\",\"disconnectedNodeAcknowledged\":false}" > /dev/null
+}
+
+# A repair sent before the replication reader's handshake can copy a key that is deleted before the
+# handshake, and neither the reader's snapshot nor its stream would then remove it. So with
+# --live-source replication the reconciler stays DISABLED through run-r2dfly.sh's pg-start and is
+# started once every stream is connected. Every run sets the state it needs, so a run that stopped
+# early cannot leave the reconciler disabled for the next one.
+RECONCILER_WANTED="STOPPED"
+[[ "$LIVE_SOURCE" == "replication" ]] && RECONCILER_WANTED="DISABLED"
+RECONCILER_STATE="$(nifi_api_get "processors/$PROC_RECONCILER" | py3 "import json, sys; print(json.load(sys.stdin)['component']['state'])")" || true
+[[ "$RECONCILER_STATE" != "$RECONCILER_WANTED" ]] && set_processor_state "$PROC_RECONCILER" "$RECONCILER_WANTED"
 
 # Wired, not started. The two connection-pool controller services these processors depend on are
 # still blank and DISABLED at this point - deploy-to-nifi.sh leaves them that way deliberately
@@ -1321,6 +1339,11 @@ RUN_ARGS+=(--claim-timeout-ms "$CLAIM_TIMEOUT_MS" --source-read-from "$SOURCE_RE
 [[ -n "$TTL_RESET_OFFSET_MS" ]] && RUN_ARGS+=(--ttl-reset-offset-ms "$TTL_RESET_OFFSET_MS")
 [[ -n "$TRANSFORM_SCRIPT" ]] && RUN_ARGS+=(--transform-script "$TRANSFORM_SCRIPT")
 
+# Read from NiFi's own clock, which the reader's "connected at" gauge also uses.
+NIFI_STARTED_AT="$(runtime_exec "$NIFI_CONTAINER_NAME" date +%s | tr -d '[:space:]')" || true
+if ! [[ "$NIFI_STARTED_AT" =~ ^[0-9]+$ ]]; then
+  echo "error: could not read the time inside $NIFI_CONTAINER_NAME (got '$NIFI_STARTED_AT')" >&2; exit 1
+fi
 RUN_MARKER="/tmp/r2dfly-run-$MIGRATION_ID"
 runtime_exec "$NIFI_CONTAINER_NAME" touch "$RUN_MARKER" || true
 "$PROJECT_ROOT/scripts/run-r2dfly.sh" "${RUN_ARGS[@]}"
@@ -1413,6 +1436,33 @@ for live_proc in "${LIVE_PROCS_DOWNSTREAM_FIRST[@]}"; do
     exit 1
   fi
 done
+
+if [[ "$LIVE_SOURCE" == "replication" ]]; then
+  echo "  waiting for RedisReplicationReader's streams to connect before starting MigrationReconciler"
+  replication_connected_at() {
+    nifi_api_get "counters" | py3 "
+import json, sys
+print(max([int(c['valueCount']) for c in json.load(sys.stdin)['counters']['aggregateSnapshot']['counters']
+           if c['name'] == 'Replication Streams Connected At (epoch seconds)' and not c['context'].startswith('All ')] or [0]))
+"
+  }
+  CONNECT_WAITED=0
+  until [[ "$(replication_connected_at || echo 0)" -ge "$NIFI_STARTED_AT" ]]; do
+    if [[ "$CONNECT_WAITED" -ge 300 ]]; then
+      report_processor_failure "$PROC_READER" "RedisReplicationReader"
+      echo "error: RedisReplicationReader did not connect to every source master within 300s, so MigrationReconciler was not started." >&2
+      exit 1
+    fi
+    sleep 2
+    CONNECT_WAITED=$((CONNECT_WAITED + 2))
+  done
+  set_processor_state "$PROC_RECONCILER" STOPPED
+  if ! start_and_wait_running "$PROC_RECONCILER" "MigrationReconciler"; then
+    report_processor_failure "$PROC_RECONCILER" "MigrationReconciler"
+    echo "error: MigrationReconciler is not running, so nothing repairs drift the replication stream cannot see." >&2
+    exit 1
+  fi
+fi
 
 echo
 echo "=================================================="

@@ -581,6 +581,13 @@ public class RedisReplicationReader extends AbstractProcessor {
         }
         current.lagCheckedAtMs = now;
         Map<String, ReplicationEndpoint> desired = current.desired;
+        // A time, not a flag, so a value left from an earlier schedule cannot pass for this one: once it is
+        // set, every change after it reaches a stream, and a reconciler started then cannot race the handshake.
+        if (current.connectedAtMs == 0 && !desired.isEmpty()
+                && current.dirty.progress().streaming().keySet().containsAll(desired.keySet())) {
+            current.connectedAtMs = now;
+        }
+        gauges.set(session, "Replication Streams Connected At (epoch seconds)", current.connectedAtMs / 1000);
         long lagBytes = 0;
         // Read the masters first, so an offset that has reached its master's is caught up.
         Map<String, Long> masterOffsets = new HashMap<>();
@@ -653,6 +660,7 @@ public class RedisReplicationReader extends AbstractProcessor {
         volatile boolean running = true;
         volatile long lagCheckedAtMs;
         volatile long caughtUpAtMs = System.currentTimeMillis();
+        volatile long connectedAtMs;
         volatile Thread supervisor;
 
         Run(Setup setup) {

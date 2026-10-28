@@ -111,10 +111,12 @@ class ClusterTopologyIT {
             s.set("k:" + i, "v" + i);
             s.hset("h:" + i, Map.of("f", String.valueOf(i)));
         }
+        long startedAt = System.currentTimeMillis() / 1000;
         ReplicationPipeline pipeline = new ReplicationPipeline(SEED, "CLUSTER", DRAGONFLY, reader());
         pipeline.pumpUntilQuiet();
         ReplicationPipeline.assertTargetMatchesSource(s, target.sync(), false);
         assertEquals(3L, pipeline.counter("Replication Full Resyncs"), "one snapshot per shard");
+        assertTrue(pipeline.counter("Replication Streams Connected At (epoch seconds)") >= startedAt, "every shard's stream connected");
 
         String failedOver = masters().keySet().iterator().next();
         underWrites(pipeline, 1, () -> failover(failedOver));
