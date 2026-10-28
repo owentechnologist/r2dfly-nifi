@@ -245,6 +245,24 @@ from Redis 7.4 and Redis Stack 7.4 into Dragonfly v2.0.2.
 Checked end to end by running `scripts/headless-migration.sh` against scratch containers; no
 automated test covers it.
 
+## RedisShake with module keys, side by side with r2dfly
+
+Tested on 2026-10-28 with RedisShake at commit 014e2f4 (v4.6.2 plus "restore unknown MODULE_2
+values"), from a Redis Stack source filled by `scripts/populate-test-data.sh --count 1500 --types
+json,string,hash,zset,set,list,stream,topk` (12,000 keys) into a Dragonfly Cloud `df-i1.40.8`
+target, renaming keys with RedisShake's documented Lua prefix rewrite. Every key was compared by
+type, value and TTL.
+
+- RedisShake writes JSON and TopK keys with `RESTORE`. The target rejects the TopK payload ("ERR Bad
+  data format"), and RedisShake stops at that first error reply: `sync_reader` exited 1 with 103 of
+  12,000 keys written. r2dfly copied all 12,000, rebuilding TopK from its items.
+- With TopK left out (`block_key_prefix`, or `scan_reader`'s `skip_unknown_type`), RedisShake's
+  `sync_reader` and `scan_reader` copied the other 10,500 keys exactly, as r2dfly did.
+- In the live phase RedisShake does not know `JSON.SET` ("unknown command"), so its Lua function
+  gets no key positions and the prefix rewrite does not apply: the command went to the un-renamed
+  key, the target answered "ERR no such key", and RedisShake stopped, so the hash and TTL changes
+  made after it never arrived. r2dfly's continuous run applied all five live changes.
+
 ## NiFi 2.11
 
 - Processor counters are exported on `/nifi-api/flow/metrics/prometheus` as
