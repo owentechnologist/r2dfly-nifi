@@ -5,7 +5,26 @@ It maps RedisShake's settings to r2dfly's, explains where the two behave differe
 through cutover and rollback. For when to choose which tool, see
 [r2dfly vs. RedisShake](r2dfly-vs-redisshake.md).
 
-r2dfly has no `shake.toml` importer yet. Translate a config by hand with the tables below.
+## Translate your config
+
+`scripts/import-shake.sh` translates a RedisShake 4.x `shake.toml` into an r2dfly TOML file:
+
+```bash
+./scripts/import-shake.sh shake.toml -o migrate.toml
+```
+
+The first line of `migrate.toml` names the script to run it with, for example
+`./continuous-migration.sh --toml-file migrate.toml`. The importer translates what the tables below
+map. It lists everything else as a note on the terminal and as a comment at the top of the file:
+settings with no r2dfly equivalent, places where r2dfly behaves differently, and keys that are not
+RedisShake options at all, which RedisShake ignores without a word. Read the notes before you run
+the file. A Lua `function` is translated only when it matches one of RedisShake's documented
+examples (a prefix filter, a database filter or move, a command-group filter, a prefix rewrite);
+any other function is printed for you to port.
+
+`./scripts/import-shake.sh --self-test` checks the translation against built-in cases.
+
+The tables below are what it does, for reading a translation or translating by hand.
 
 ## Pick the equivalent run
 
