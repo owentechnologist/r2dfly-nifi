@@ -239,6 +239,14 @@ from Redis 7.4 and Redis Stack 7.4 into Dragonfly v2.0.2.
   "Scan Partitions Complete" counter reaches the partition count and nothing is queued.
 - A write to a target that refuses connections fails the trigger, so a headless run ends with
   that error instead of retrying.
+- Stateless never comes back for a penalized FlowFile. The first failure a processor penalizes
+  leaves the trigger waiting forever, and while it waits the JVM's heap fills until it runs out:
+  a run copying 1,200,000 keys into a target that answered "ERR Out of memory" hung, then failed
+  with OutOfMemoryError, and 20 JSON keys refused by a plain Redis target hung a 520-key run. The
+  headless flow therefore sets every processor's penalty to 0 (its failures go to the dead-letter
+  writer once; retries use RedisBatchWriter's own delay), and its JVM runs with
+  `-XX:+ExitOnOutOfMemoryError`. With both, the 1,200,000-key run into a target capped at 5.82 GiB
+  finished in 126 s with exit 0 and 158,044 keys dead-lettered with the target's reason.
 - A TLS connection through the added SSL Context Service was checked only as far as a valid flow
   and a refused connection; no TLS handshake has been tested headless.
 

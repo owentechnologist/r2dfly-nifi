@@ -32,6 +32,7 @@ TOML keys it takes (the same keys as simple-migration.sh; any other key is an er
   [run] migration-id
 
 --work-dir holds the run's flow, logs and dead-letter records (default: ./r2dfly-headless-<migration-id>).
+HEADLESS_JVM_OPTS passes options to the engine's JVM, for example HEADLESS_JVM_OPTS=-Xmx4g.
 A connection string with localhost means the container runtime's host (on macOS, its VM).
 Exit status: 0 when the copy is complete; non-zero, with the log's last lines, otherwise.
 USAGE
@@ -170,6 +171,8 @@ for s in fc["controllerServices"]:
 for p in fc["processors"]:
     kind = p["type"].rsplit(".", 1)[-1]
     props = p["properties"]
+    # Stateless never comes back for a penalized FlowFile: the trigger waits on it forever.
+    p["penaltyDuration"] = "0 sec"
     if kind == "RedisScanReader":
         props.update({"migration-id": "#{migration-id}", "key-type-filter": key_types, "partition-count": "1",
                       "prefix-only-list": opt(prefix_only), "prefix-deny-list": opt(prefix_deny)})
@@ -209,7 +212,7 @@ echo "==> copying (migration id $MIGRATION_ID, key types $KEY_TYPES); log: $WORK
 rc=0
 $RUNTIME run --rm --network host --user 0 \
   -v "$STATELESS_HOME":/stateless:ro -v "$PROJECT_ROOT/scripts/headless":/driver:ro -v "$WORK_DIR":/work \
-  --entrypoint java "$NIFI_IMAGE" -Dlogback.configurationFile=/stateless/conf/stateless-logback.xml \
+  --entrypoint java "$NIFI_IMAGE" -XX:+ExitOnOutOfMemoryError ${HEADLESS_JVM_OPTS:-} -Dlogback.configurationFile=/stateless/conf/stateless-logback.xml \
   -cp '/stateless/lib/*:/stateless/conf' /driver/HeadlessCopy.java /work/engine.properties /work/flow.properties 1 \
   > "$WORK_DIR/headless.log" 2>&1 || rc=$?
 rm -f "$WORK_DIR/flow.properties"

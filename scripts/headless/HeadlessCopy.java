@@ -16,10 +16,11 @@ import java.util.regex.Pattern;
  * <p>java -cp "STATELESS/lib/*:STATELESS/conf" HeadlessCopy.java ENGINE_PROPERTIES FLOW_PROPERTIES PARTITIONS
  *
  * <p>Exit status: 0 done, 1 a trigger failed, 2 the flow is invalid, 3 no progress for five minutes.
+ * The flow it runs must not penalize: Stateless never comes back for a penalized FlowFile.
  */
 public class HeadlessCopy {
 
-    private static final long STALL_MS = 300_000;
+    private static final long STALL_MS = Long.getLong("r2dfly.headless.stallMs", 300_000);
     private static final Pattern COUNTERS = Pattern.compile(".*(Scan Partitions Complete|Keys Scanned|Keys Written|Write Errors|Dead-Letter Records Pending)$");
     private static final Pattern TYPE_SKIPS = Pattern.compile("(?:Scan )?Keys Skipped by Type Filter \\((.*)\\)$");
 
@@ -38,6 +39,7 @@ public class HeadlessCopy {
         long lastProgressAt = started;
         long lastScanned = -1;
         int exit = 0;
+        watchForStall(flow);
         try {
             while (true) {
                 TriggerResult result = flow.trigger().getResult();
@@ -84,6 +86,40 @@ public class HeadlessCopy {
             flow.shutdown();
         }
         System.exit(exit);
+    }
+
+    /**
+     * Ends the run when no key has been scanned, written or dead-lettered for STALL_MS, including while a
+     * trigger is still running: a trigger that never returns would otherwise hang the run without a word.
+     */
+    private static void watchForStall(StatelessDataflow flow) {
+        Thread watchdog = new Thread(() -> {
+            long last = -1;
+            long changedAt = System.currentTimeMillis();
+            try {
+                while (true) {
+                    Thread.sleep(10_000);
+                    Map<String, Long> counters = flow.getCounters(COUNTERS);
+                    long progress = counter(counters, "Keys Scanned") + counter(counters, "Keys Written")
+                            + counter(counters, "Write Errors") + counter(counters, "Dead-Letter Records Pending");
+                    long now = System.currentTimeMillis();
+                    if (progress != last) {
+                        last = progress;
+                        changedAt = now;
+                    } else if (now - changedAt > STALL_MS) {
+                        System.err.println("headless: no key scanned, written or dead-lettered for " + STALL_MS / 1000 + " s; stopping");
+                        Runtime.getRuntime().halt(3);
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Throwable t) {
+                // Out of memory, most likely: a JVM in that state cannot finish the run either.
+                Runtime.getRuntime().halt(3);
+            }
+        }, "headless-watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
     }
 
     /** Counters are listed per component and again as an "All ..." total; the largest is the total. */
