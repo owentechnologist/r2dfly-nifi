@@ -371,6 +371,8 @@ public class RedisScanReader extends AbstractProcessor {
             } catch (IOException e) {
                 getLogger().warn("Failed to mark partition {} complete", partitionIndex, e);
             }
+            // The headless run's stop signal: a finished partition otherwise reads like one another task holds.
+            session.adjustCounter("Scan Partitions Complete", 1, true);
             // Clear so this thread, if NiFi's pool reuses it for a later invocation, claims a
             // fresh partition instead of forever re-returning this now-complete one and yielding.
             assignedPartition.remove();

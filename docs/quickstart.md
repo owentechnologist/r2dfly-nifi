@@ -59,6 +59,25 @@ This single command:
 6. Configures and starts the migration
 7. Prints a summary of keys migrated
 
+## Run a one-time copy without a NiFi server
+
+`headless-migration.sh` runs the same one-time copy on NiFi's Stateless engine, inside the
+`apache/nifi` image, with no NiFi server, UI or login. It exits when the copy is complete:
+
+```bash
+./headless-migration.sh --toml-file migrate.toml
+./headless-migration.sh --source-connection-string redis://source-host:6379 \
+  --target-connection-string rediss://default:password@target-host:6385
+```
+
+It reads the same TOML keys as `simple-migration.sh`, limited to the connection strings, modes
+and TLS, `key-types`, `disallow-key-types`, `topk-mode`, the prefix lists, `batch-size`,
+`rename-prefix`, the TTL strategy and `migration-id`. Any other key is an error that names
+`simple-migration.sh`, which supports them all. The first run downloads the Stateless engine
+(about 40 MB, checksum-verified) into `~/.cache/r2dfly`. Each run keeps its flow, log and
+dead-letter records in `./r2dfly-headless-<migration-id>`, or in `--work-dir`. A headless run
+does not resume after a crash: run it again, and it copies everything again.
+
 ## Run a continuous migration
 
 `continuous-migration.sh` runs the same copy as `simple-migration.sh`, then keeps applying the

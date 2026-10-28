@@ -215,6 +215,26 @@ the SELECT. Redis 8.10.3 also sent `SELECT 0` to a second replica's full resync 
 replica had seen `SELECT 0`, both with the first replica disconnected and with it still connected,
 so the trigger on the scratch containers is still unknown and nothing guards the fix.
 
+## NiFi's Stateless engine
+
+Tested with `nifi-stateless-assembly-2.11.0`, the r2dfly NAR and NiFi's standard NARs, copying
+from Redis 7.4 and Redis Stack 7.4 into Dragonfly v2.0.2.
+
+- The one-time copy flow runs unchanged, with its MapCacheServer and MapCacheClientService pair
+  inside the flow. Every key arrived, JSON included, at 1,000 and 50,000 keys.
+- `nifi-stateless.sh` cannot end a scan at the right time. Without `-c` it triggers once: in
+  Stateless, a commit waits until the whole invocation is acknowledged, which happens once the
+  first page has drained, so the run stops after 200 keys. With `-c` it triggers forever. So
+  `scripts/headless/HeadlessCopy.java` triggers the flow itself until RedisScanReader's
+  "Scan Partitions Complete" counter reaches the partition count and nothing is queued.
+- A write to a target that refuses connections fails the trigger, so a headless run ends with
+  that error instead of retrying.
+- A TLS connection through the added SSL Context Service was checked only as far as a valid flow
+  and a refused connection; no TLS handshake has been tested headless.
+
+Checked end to end by running `scripts/headless-migration.sh` against scratch containers; no
+automated test covers it.
+
 ## NiFi 2.11
 
 - Processor counters are exported on `/nifi-api/flow/metrics/prometheus` as
