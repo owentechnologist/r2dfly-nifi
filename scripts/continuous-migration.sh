@@ -48,6 +48,16 @@ Live Phase options:
   --reconcile-interval-ms N      time between reconcile passes (env RECONCILE_INTERVAL_MS, default: 600000)
   --reconcile-sample-size N      keys drawn from each side per SAMPLE pass (env RECONCILE_SAMPLE_SIZE,
                                  default: 1000)
+  --reconcile-spare-target-keys MODE
+                                 which target keys with no source key the reconciler leaves in place
+                                 instead of deleting (env RECONCILE_SPARE_TARGET_KEYS): NONE (default,
+                                 delete them all, which is how a source FLUSHALL reaches the target),
+                                 ALL_KEYS, SPARED_PREFIXES or SPARED_TYPES. Use it when the target held
+                                 data of its own before the migration.
+  --reconcile-spared-prefixes L  comma-separated target key prefixes kept with SPARED_PREFIXES (env
+                                 RECONCILE_SPARED_PREFIXES)
+  --reconcile-spared-types L     comma-separated types kept with SPARED_TYPES, e.g. hash,ReJSON-RL (env
+                                 RECONCILE_SPARED_TYPES)
   --live-source SOURCE           keyspace (default) or replication (env LIVE_SOURCE). replication
                                  follows the source as a replica (PSYNC): it sees every write,
                                  including JSON/TopK/Bloom module commands that publish no keyspace
@@ -340,6 +350,9 @@ LIVE_SOURCE="${LIVE_SOURCE:-keyspace}"
 RECONCILE_MODE="${RECONCILE_MODE:-}"
 RECONCILE_INTERVAL_MS="${RECONCILE_INTERVAL_MS:-600000}"
 RECONCILE_SAMPLE_SIZE="${RECONCILE_SAMPLE_SIZE:-1000}"
+RECONCILE_SPARE_TARGET_KEYS="${RECONCILE_SPARE_TARGET_KEYS:-NONE}"
+RECONCILE_SPARED_PREFIXES="${RECONCILE_SPARED_PREFIXES:-}"
+RECONCILE_SPARED_TYPES="${RECONCILE_SPARED_TYPES:-}"
 RECONCILIATION_SIGNALS="${RECONCILIATION_SIGNALS:-false}"
 ASSUME_DEFAULTS="${ASSUME_DEFAULTS:-false}"
 DISABLE_PROVENANCE="${DISABLE_PROVENANCE:-true}"
@@ -433,6 +446,9 @@ MAPPING = {
     ("live", "reconcile-mode"): "RECONCILE_MODE",
     ("live", "reconcile-interval-ms"): "RECONCILE_INTERVAL_MS",
     ("live", "reconcile-sample-size"): "RECONCILE_SAMPLE_SIZE",
+    ("live", "reconcile-spare-target-keys"): "RECONCILE_SPARE_TARGET_KEYS",
+    ("live", "reconcile-spared-prefixes"): "RECONCILE_SPARED_PREFIXES",
+    ("live", "reconcile-spared-types"): "RECONCILE_SPARED_TYPES",
     ("live", "reconciliation-signals"): "RECONCILIATION_SIGNALS",
     ("run", "defaults"): "ASSUME_DEFAULTS",
     ("run", "verbose"): "VERBOSE",
@@ -575,6 +591,9 @@ while [[ $# -gt 0 ]]; do
     --reconcile-mode) require_value "$@"; RECONCILE_MODE="$2"; shift 2 ;;
     --reconcile-interval-ms) require_value "$@"; RECONCILE_INTERVAL_MS="$2"; shift 2 ;;
     --reconcile-sample-size) require_value "$@"; RECONCILE_SAMPLE_SIZE="$2"; shift 2 ;;
+    --reconcile-spare-target-keys) require_value "$@"; RECONCILE_SPARE_TARGET_KEYS="$2"; shift 2 ;;
+    --reconcile-spared-prefixes) require_value "$@"; RECONCILE_SPARED_PREFIXES="$2"; shift 2 ;;
+    --reconcile-spared-types) require_value "$@"; RECONCILE_SPARED_TYPES="$2"; shift 2 ;;
     --reconciliation-signals) RECONCILIATION_SIGNALS="true"; shift ;;
     --defaults) ASSUME_DEFAULTS="true"; shift ;;
     --disable-provenance) DISABLE_PROVENANCE="true"; shift ;;
@@ -603,6 +622,13 @@ fi
 if [[ -z "$RECONCILE_MODE" ]]; then
   if [[ "$LIVE_SOURCE" == "reconcile" ]]; then RECONCILE_MODE="FULL"; else RECONCILE_MODE="SAMPLE"; fi
 fi
+RECONCILE_SPARE_TARGET_KEYS="$(tr '[:lower:]' '[:upper:]' <<< "$RECONCILE_SPARE_TARGET_KEYS")"
+case "$RECONCILE_SPARE_TARGET_KEYS" in
+  NONE|ALL_KEYS) ;;
+  SPARED_PREFIXES) [[ -n "$RECONCILE_SPARED_PREFIXES" ]] || { echo "error: --reconcile-spare-target-keys SPARED_PREFIXES needs --reconcile-spared-prefixes" >&2; exit 1; } ;;
+  SPARED_TYPES) [[ -n "$RECONCILE_SPARED_TYPES" ]] || { echo "error: --reconcile-spare-target-keys SPARED_TYPES needs --reconcile-spared-types" >&2; exit 1; } ;;
+  *) echo "error: --reconcile-spare-target-keys must be NONE, ALL_KEYS, SPARED_PREFIXES or SPARED_TYPES (got '$RECONCILE_SPARE_TARGET_KEYS')" >&2; usage; exit 1 ;;
+esac
 if [[ "$SOURCE_READ_FROM" != "master" ]]; then
   echo "error: --source-read-from $SOURCE_READ_FROM is not allowed with a Live Phase: a replica lags its master, so" >&2
   echo "       a key re-read after a change can come back with the value from before it. Use simple-migration.sh" >&2
@@ -1233,8 +1259,11 @@ LIVE_BODY="{\"revision\":{\"version\":$CONSUMER_VER},\"component\":{\"id\":\"$PR
 nifi_api_put_checked "processors/$PROC_KEYSPACE" "$LIVE_BODY" > /dev/null
 fi
 echo "  reconcile-mode=$RECONCILE_MODE  reconcile-interval-ms=$RECONCILE_INTERVAL_MS  reconcile-sample-size=$RECONCILE_SAMPLE_SIZE"
+echo "  reconcile-spare-target-keys=$RECONCILE_SPARE_TARGET_KEYS${RECONCILE_SPARED_PREFIXES:+  spared-prefixes=$RECONCILE_SPARED_PREFIXES}${RECONCILE_SPARED_TYPES:+  spared-types=$RECONCILE_SPARED_TYPES}"
 RECONCILER_VER="$(nifi_current_version "processors/$PROC_RECONCILER")" || true
 RECONCILER_PROPS="\"mode\":\"$RECONCILE_MODE\",\"pass-interval-ms\":\"$RECONCILE_INTERVAL_MS\",\"sample-size\":\"$RECONCILE_SAMPLE_SIZE\""
+RECONCILER_PROPS="$RECONCILER_PROPS,\"spare-target-only-keys\":\"$RECONCILE_SPARE_TARGET_KEYS\""
+RECONCILER_PROPS="$RECONCILER_PROPS,\"spared-prefixes\":$(json_or_null "$RECONCILE_SPARED_PREFIXES"),\"spared-types\":$(json_or_null "$RECONCILE_SPARED_TYPES")"
 nifi_api_put_checked "processors/$PROC_RECONCILER" \
   "{\"revision\":{\"version\":$RECONCILER_VER},\"component\":{\"id\":\"$PROC_RECONCILER\",\"config\":{\"properties\":{$RECONCILER_PROPS}}}}" > /dev/null
 

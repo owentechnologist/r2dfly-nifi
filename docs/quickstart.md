@@ -94,6 +94,16 @@ alongside the live phase, repairs those gaps: its default SAMPLE passes find par
 time, and a FULL pass (`--reconcile-mode FULL`) finds all of it. Run
 `./continuous-migration.sh --help` for the other limitations.
 
+The reconciler also deletes every target key whose source key does not exist. That is how a
+source `FLUSHALL` reaches the target, and it also deletes data the target held before the
+migration. If the target has data of its own, keep it with `--reconcile-spare-target-keys`:
+`ALL_KEYS` keeps every such key, `SPARED_PREFIXES` with `--reconcile-spared-prefixes legacy:,cache:`
+keeps keys with those prefixes, and `SPARED_TYPES` with `--reconcile-spared-types hash,set` keeps
+keys of those types. The counter `Reconcile Target-Only Keys Spared` counts what was kept.
+
+With `--live-source replication`, the reconciler starts only once the replication reader has
+connected to every source master, and `continuous-migration.sh` waits up to 300 seconds for that.
+
 To switch the application over, run `./cutover.sh`. It says when the live phase has caught up,
 and with `--writes-stopped` it confirms the target with a final full reconcile and prints the
 steps to switch. [Migrating from RedisShake](migrating-from-redisshake.md#cut-over) walks through
@@ -103,7 +113,8 @@ cutover and rollback.
 
 These options apply to `simple-migration.sh` and `continuous-migration.sh` alike.
 `continuous-migration.sh` takes no `--mode` and no file options, and adds `--live-source`,
-`--reconcile-mode`, `--reconcile-interval-ms`, `--reconcile-sample-size`, `--keyspace-pattern`,
+`--reconcile-mode`, `--reconcile-interval-ms`, `--reconcile-sample-size`,
+`--reconcile-spare-target-keys`, `--reconcile-spared-prefixes`, `--reconcile-spared-types`, `--keyspace-pattern`,
 `--event-types`, `--max-queue-depth`, `--skip-keyspace-check`, `--require-config-check` and
 `--reconciliation-signals`; see its `--help`.
 

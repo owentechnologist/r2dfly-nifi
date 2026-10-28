@@ -156,6 +156,33 @@ class MigrationReconcilerIT {
         assertEquals(0, pipeline.pass().get("differences").asLong(), "the skipped keys stay out of every pass");
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource(delimiter = '|', value = {
+            "NONE            |               | ",
+            "ALL_KEYS        |               | legacy:h,legacy:s,other:h,other:s",
+            "SPARED_PREFIXES | legacy:       | legacy:h,legacy:s",
+            "SPARED_TYPES    | set           | legacy:s,other:s"})
+    void targetOnlyKeysAreSparedAsConfigured(String spare, String list, String survivors) throws Exception {
+        RedisCommands<String, String> t = tgt.sync();
+        t.hset("legacy:h", "f", "v");
+        t.sadd("legacy:s", "m");
+        t.hset("other:h", "f", "v");
+        t.sadd("other:s", "m");
+        List<String> expected = survivors == null ? List.of() : List.of(survivors.split(","));
+
+        Pipeline pipeline = new Pipeline("FULL");
+        pipeline.reconciler.setProperty(MigrationReconciler.SPARE_TARGET_ONLY_KEYS, spare);
+        if (list != null) {
+            pipeline.reconciler.setProperty(spare.equals("SPARED_TYPES") ? MigrationReconciler.SPARED_TYPES : MigrationReconciler.SPARED_PREFIXES, list);
+        }
+        JsonNode report = pipeline.pass();
+
+        assertEquals(4 - expected.size(), report.get("differences").asLong());
+        assertEquals(expected, t.keys("*").stream().sorted().toList());
+        assertEquals(expected.isEmpty() ? null : (long) expected.size(), pipeline.reconciler.getCounterValue("Reconcile Target-Only Keys Spared"));
+        assertEquals(0, pipeline.pass().get("differences").asLong(), "spared keys never make a pass dirty");
+    }
+
     @Test
     void comparesEachKeyUnderItsRenamedNameAndTheTtlStrategy() throws Exception {
         RedisCommands<String, String> s = src.sync();

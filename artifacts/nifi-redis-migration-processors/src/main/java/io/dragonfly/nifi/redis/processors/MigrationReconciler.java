@@ -37,6 +37,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -73,6 +74,9 @@ public class MigrationReconciler extends AbstractProcessor {
     public enum Mode { FULL, SAMPLE }
 
     public enum ReportFormat { JSON, MARKDOWN }
+
+    /** Which target keys with no source key a pass leaves in place instead of sending them to repair, which deletes them. */
+    public enum SpareTargetOnlyKeys { NONE, ALL_KEYS, SPARED_PREFIXES, SPARED_TYPES }
 
     public static final PropertyDescriptor SOURCE_CONNECTION_POOL = new PropertyDescriptor.Builder()
             .name("source-connection-pool")
@@ -165,6 +169,38 @@ public class MigrationReconciler extends AbstractProcessor {
             .defaultValue("50")
             .build();
 
+    public static final PropertyDescriptor SPARE_TARGET_ONLY_KEYS = new PropertyDescriptor.Builder()
+            .name("spare-target-only-keys")
+            .displayName("Spare Target-Only Keys")
+            .description("A target key whose source key does not exist is deleted from the target, which is how a "
+                    + "FLUSHALL or a missed delete is repaired, and which also deletes data the target held before the "
+                    + "migration. NONE deletes every such key. ALL_KEYS deletes none. SPARED_PREFIXES keeps keys whose "
+                    + "target name starts with one of Spared Prefixes; SPARED_TYPES keeps keys whose target type is one "
+                    + "of Spared Types. A spared key is counted in 'Reconcile Target-Only Keys Spared', not as a difference.")
+            .required(true)
+            .allowableValues(Arrays.stream(SpareTargetOnlyKeys.values()).map(Enum::name).toArray(String[]::new))
+            .defaultValue(SpareTargetOnlyKeys.NONE.name())
+            .build();
+
+    public static final PropertyDescriptor SPARED_PREFIXES = new PropertyDescriptor.Builder()
+            .name("spared-prefixes")
+            .displayName("Spared Prefixes")
+            .description("Comma-separated target key prefixes that are never deleted for having no source key.")
+            .required(true)
+            .addValidator(StandardValidators.NON_BLANK_VALIDATOR)
+            .dependsOn(SPARE_TARGET_ONLY_KEYS, SpareTargetOnlyKeys.SPARED_PREFIXES.name())
+            .build();
+
+    public static final PropertyDescriptor SPARED_TYPES = new PropertyDescriptor.Builder()
+            .name("spared-types")
+            .displayName("Spared Types")
+            .description("Comma-separated target key types, as TYPE names them (string, hash, ReJSON-RL, ...), that are "
+                    + "never deleted for having no source key.")
+            .required(true)
+            .addValidator(StandardValidators.NON_BLANK_VALIDATOR)
+            .dependsOn(SPARE_TARGET_ONLY_KEYS, SpareTargetOnlyKeys.SPARED_TYPES.name())
+            .build();
+
     public static final PropertyDescriptor REPORT_FORMAT = new PropertyDescriptor.Builder()
             .name("report-format")
             .displayName("Report Format")
@@ -181,7 +217,8 @@ public class MigrationReconciler extends AbstractProcessor {
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
             SOURCE_CONNECTION_POOL, TARGET_CONNECTION_POOL, MODE, PASS_INTERVAL_MS, SAMPLE_SIZE, SCAN_COUNT,
             TIME_BUDGET_MS, TTL_TOLERANCE_MS, COMPARE_VALUES, RedisScanReader.PREFIX_DENY_LIST,
-            RedisScanReader.PREFIX_ONLY_LIST, RedisSingleKeyFetch.KEY_TYPE_FILTER, DBSIZE_DROP_PERCENT, REPORT_FORMAT,
+            RedisScanReader.PREFIX_ONLY_LIST, RedisSingleKeyFetch.KEY_TYPE_FILTER, DBSIZE_DROP_PERCENT, SPARE_TARGET_ONLY_KEYS, SPARED_PREFIXES,
+            SPARED_TYPES, REPORT_FORMAT,
             KeyMapping.KEY_RENAME, RedisBatchWriter.KEY_PREFIX, RedisBatchWriter.KEY_PREFIX_SEPARATOR,
             RedisBatchWriter.TTL_STRATEGY, RedisBatchWriter.TTL_RESET_OFFSET_MS);
     private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_REPAIR, REL_REPORT);
@@ -284,7 +321,7 @@ public class MigrationReconciler extends AbstractProcessor {
         if (current.mode == Mode.SAMPLE) {
             int size = context.getProperty(SAMPLE_SIZE).asInteger();
             compareSourceKeys(context, session, source, target, randomKeys(source, size, filter), filter, current);
-            findKeysOnlyOnTarget(context, session, source, randomKeys(target, size, ANY_KEY), filter, current);
+            findKeysOnlyOnTarget(context, session, source, target, randomKeys(target, size, ANY_KEY), filter, current);
             finish(context, session, current);
             return;
         }
@@ -317,7 +354,7 @@ public class MigrationReconciler extends AbstractProcessor {
             current.sourceCursor = page;
         } else if (current.targetCursor == null || !current.targetCursor.isFinished()) {
             KeyScanCursor<byte[]> page = scan(target, current.targetCursor, scanCount);
-            findKeysOnlyOnTarget(context, session, source, page.getKeys(), filter, current);
+            findKeysOnlyOnTarget(context, session, source, target, page.getKeys(), filter, current);
             current.targetCursor = page;
         } else {
             finish(context, session, current);
@@ -430,22 +467,60 @@ public class MigrationReconciler extends AbstractProcessor {
     }
 
     /**
-     * Target keys whose source key is gone: the repair, keyed by the source key, deletes them. A target
-     * key no source key maps to was not written by this migration, so it is outside its scope.
+     * Target keys whose source key is gone: the repair, keyed by the source key, deletes them, unless
+     * Spare Target-Only Keys keeps them. A target key no source key maps to was not written by this
+     * migration, so it is outside its scope.
      */
     private void findKeysOnlyOnTarget(ProcessContext context, ProcessSession session, RedisConnectionPoolService source,
-                                      List<byte[]> targetKeys, KeyFilter filter, Pass current) {
+                                      RedisConnectionPoolService target, List<byte[]> targetKeys, KeyFilter filter, Pass current) {
         KeyMapping mapping = KeyMapping.of(context, RedisBatchWriter.KEY_PREFIX, RedisBatchWriter.KEY_PREFIX_SEPARATOR);
-        List<byte[]> keys = targetKeys.stream().map(mapping::toSource).flatMap(Optional::stream).filter(filter::allowsKey).toList();
+        List<byte[]> keys = new ArrayList<>();
+        List<byte[]> mappedTargetKeys = new ArrayList<>();
+        for (byte[] targetKey : targetKeys) {
+            mapping.toSource(targetKey).filter(filter::allowsKey).ifPresent(key -> {
+                keys.add(key);
+                mappedTargetKeys.add(targetKey);
+            });
+        }
         if (keys.isEmpty()) {
             return;
         }
         List<Long> exists = pipeline(source, keys, (cmds, key) -> cmds.exists(key));
+        List<byte[]> extra = new ArrayList<>();
+        List<byte[]> extraOnTarget = new ArrayList<>();
         for (int i = 0; i < keys.size(); i++) {
             if (exists.get(i) == 0) {
-                repair(session, current, keys.get(i), "extra_on_target");
+                extra.add(keys.get(i));
+                extraOnTarget.add(mappedTargetKeys.get(i));
             }
         }
+        List<Boolean> spared = spared(context, target, extraOnTarget);
+        long sparedCount = 0;
+        for (int i = 0; i < extra.size(); i++) {
+            if (spared.get(i)) {
+                sparedCount++;
+            } else {
+                repair(session, current, extra.get(i), "extra_on_target");
+            }
+        }
+        if (sparedCount > 0) {
+            session.adjustCounter("Reconcile Target-Only Keys Spared", sparedCount, false);
+        }
+    }
+
+    private static List<Boolean> spared(ProcessContext context, RedisConnectionPoolService target, List<byte[]> targetKeys) {
+        return switch (SpareTargetOnlyKeys.valueOf(context.getProperty(SPARE_TARGET_ONLY_KEYS).getValue())) {
+            case NONE -> targetKeys.stream().map(key -> false).toList();
+            case ALL_KEYS -> targetKeys.stream().map(key -> true).toList();
+            case SPARED_PREFIXES -> {
+                KeyFilter prefixes = KeyFilter.parse(null, null, context.getProperty(SPARED_PREFIXES).getValue());
+                yield targetKeys.stream().map(prefixes::allowsKey).toList();
+            }
+            case SPARED_TYPES -> {
+                KeyFilter types = KeyFilter.parse(context.getProperty(SPARED_TYPES).getValue(), null, null);
+                yield pipeline(target, targetKeys, (cmds, key) -> cmds.type(key)).stream().map(types::allowsType).toList();
+            }
+        };
     }
 
     /** {@code expectedTtl} is what the writer gives the key, null for none. */
