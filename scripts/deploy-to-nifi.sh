@@ -29,15 +29,30 @@ M2_CACHE_VOLUME="${M2_CACHE_VOLUME:-nifi-redis-migration-m2-cache}"
 # run_with_progress in toolbox-lib.sh). Turning provenance recording off (see further down for
 # why - it stalled real migrations, by disk on a small host and by index on a large run) is on by
 # default; --no-disable-provenance restores this project's own default (1GB, full lineage/audit
-# history) for anyone who actually wants that and has the disk for it. No other flags are
-# accepted - every other setting here is env-var driven (see the block above and below).
+# history) for anyone who actually wants that and has the disk for it. Every other setting here
+# is env-var driven (see the block above and below).
 VERBOSE="${VERBOSE:-false}"
 DISABLE_PROVENANCE="${DISABLE_PROVENANCE:-true}"
+BUILD_ONLY=false
+usage() {
+  cat <<USAGE
+Usage: $(basename "$0") [--verbose] [--disable-provenance | --no-disable-provenance] [--build-only]
+
+Builds the r2dfly NAR and deploys it, with the flow, into the NiFi container named by
+NIFI_CONTAINER_NAME (default: nifi-redis-migration), creating the container if needed.
+  --build-only   build the NAR (artifacts/nifi-redis-migration-nar/target) and stop; no container is touched
+USAGE
+}
+# Unknown arguments are an error: this script acts on a real container, so a mistyped or
+# unsupported flag must never fall through to a deploy.
 for arg in "$@"; do
   case "$arg" in
     --verbose) VERBOSE=true ;;
     --disable-provenance) DISABLE_PROVENANCE=true ;;
     --no-disable-provenance) DISABLE_PROVENANCE=false ;;
+    --build-only) BUILD_ONLY=true ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "error: unknown argument '$arg'" >&2; usage >&2; exit 1 ;;
   esac
 done
 # Container resource limits (only applied when the container is first created - see below).
@@ -119,6 +134,7 @@ else
   echo "==> built $(basename "$NAR_FILE")"
   echo "$SOURCE_HASH" > "$BUILD_HASH_FILE"
 fi
+[[ "$BUILD_ONLY" == "true" ]] && exit 0
 
 # --- ensure the NiFi container exists and is running ---
 CONTAINER_WAS_RUNNING=false
