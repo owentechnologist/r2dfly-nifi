@@ -155,12 +155,15 @@ These options apply to `simple-migration.sh` and `continuous-migration.sh` alike
 --parallelism N                concurrent tasks for the scan/read side of the flow, and
                                RedisScanReader's Partition Count (default: 1)
 --writer-concurrency N          concurrent tasks for the write side of the flow (default: 1)
---key-types LIST               comma-separated Redis types to scan/migrate (see run-r2dfly.sh
-                               --help for the full alias/TopK/dfly-to-dfly interaction notes)
+--key-types LIST               comma-separated Redis types to scan/migrate (default: every core
+                               type and every module type; each key is copied or dead-lettered
+                               with its reason. See run-r2dfly.sh --help for the aliases and
+                               the TopK/dfly-to-dfly interaction notes)
 --disallow-key-types LIST       comma-separated Redis types to exclude from whatever
                                --key-types would otherwise include (accepts the same
                                type strings/aliases; see run-r2dfly.sh --help for exactly
-                               when this is applied relative to --topk-mode/--dfly-to-dfly)
+                               when this is applied relative to --topk-mode/--dfly-to-dfly).
+                               The summary counts the keys these filters leave out, by type.
 --prefix-deny-list LIST         comma-separated key prefixes to exclude (see run-r2dfly.sh --help)
 --prefix-only-list LIST         comma-separated key prefixes to exclusively migrate (see
                                run-r2dfly.sh --help)

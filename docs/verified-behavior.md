@@ -266,10 +266,11 @@ type, value and TTL.
   `RESTORE` once TopK was blocked (49 keys written), and copied the other types exactly once both
   were blocked. Dragonfly `df-i1.40.8` still rejects RedisBloom's dump formats: `RESTORE` gives "ERR
   Bad data format" and `BF.LOADCHUNK` of `BF.SCANDUMP` chunks gives "ERR INVALIDOBJ invalid bloom
-  dump payload". A Bloom filter does not keep its items, so no tool can rebuild one. r2dfly's
-  default key types leave Bloom out (they are tried only with `--dfly-to-dfly`), so it copied the
-  other 12,000 keys and skipped the Bloom keys, counting them only in "Scan Keys Skipped by Type
-  Filter".
+  dump payload". A Bloom filter does not keep its items, so no tool can rebuild one. r2dfly
+  copied the other 12,000 keys. Its default key types then left Bloom out, so the Bloom keys were
+  skipped with only a NiFi counter to show it; they now include every module type, so each Bloom
+  key is dead-lettered with "no lossless copy path for MBbloom-- on this Dragonfly version; RESTORE
+  was rejected: ERR Bad data format", and the summary reports keys a user's type filter leaves out.
 
 ## NiFi 2.11
 

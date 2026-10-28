@@ -152,7 +152,8 @@ Optional:
                                  WRITER_CONCURRENCY, default: 1)
   --key-types LIST               comma-separated Redis types to scan/migrate, forwarded as-is
                                  to run-r2dfly.sh (env KEY_TYPES, default: run-r2dfly.sh's own
-                                 default - string,hash,set,zset,list,stream,ReJSON-RL). Accepts
+                                 default - every core and module type, each copied or
+                                 dead-lettered with its reason). Accepts
                                  the real Redis type strings, or case-insensitive aliases: json
                                  (ReJSON-RL), topk (TopK-TYPE), sortedset (zset), streams
                                  (stream). See run-r2dfly.sh --help for the full type/TopK
@@ -1333,6 +1334,7 @@ if ! [[ "$NIFI_STARTED_AT" =~ ^[0-9]+$ ]]; then
 fi
 RUN_MARKER="/tmp/r2dfly-run-$MIGRATION_ID"
 runtime_exec "$NIFI_CONTAINER_NAME" touch "$RUN_MARKER" || true
+TYPE_SKIPS_BEFORE="$(nifi_lib_type_filter_skips)"
 "$PROJECT_ROOT/scripts/run-r2dfly.sh" "${RUN_ARGS[@]}"
 
 processor_run_status() {
@@ -1474,6 +1476,7 @@ fi
 if [[ "${DEAD_LETTERS_ALL:-0}" -gt "${DEAD_LETTERS:-0}" ]]; then
   echo "  $(( DEAD_LETTERS_ALL - ${DEAD_LETTERS:-0} )) older dead-letter records from earlier runs are still in that directory"
 fi
+nifi_lib_report_type_filter_skips "$TYPE_SKIPS_BEFORE"
 echo "  the initial snapshot is complete, and the Live Phase is still running."
 echo "  NiFi keeps running unsupervised after this script exits, and the Live Phase keeps applying"
 echo "  source changes to the target until it is stopped."

@@ -248,7 +248,10 @@ redis_lib_warn_capability_gaps() {
 
 # The scan's key-type filter, shared by run-r2dfly.sh and headless-migration.sh. The NiFi flows
 # match real Redis type strings, while --key-types and --disallow-key-types also take aliases.
-DEFAULT_KEY_TYPES="string,hash,set,zset,list,stream,ReJSON-RL"
+# The default holds every type ModuleTypeHandler accounts for (util/ModuleCopy), so a key of each
+# is copied or dead-lettered with its reason, never left out unreported; TopK joins through
+# --topk-mode exact.
+DEFAULT_KEY_TYPES="string,hash,set,zset,list,stream,ReJSON-RL,MBbloom--,MBbloomCF,CMSk-TYPE,TSDB-TYPE,TDIS-TYPE,graphdata,vectorset"
 
 # --key-types accepts friendly/short aliases (case-insensitively) alongside the real Redis type
 # strings the rest of this script and the NiFi flow actually match against - translate those

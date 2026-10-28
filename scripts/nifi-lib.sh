@@ -187,6 +187,36 @@ nifi_lib_require_credentials() {
   fi
 }
 
+# nifi_lib_type_filter_skips - "<type> <count>" per line: keys a scan or a live fetch left out
+# because of the key-type filter, summed over components. NiFi's counters add up for as long as
+# NiFi runs, so a run's own count is the difference between two of these.
+nifi_lib_type_filter_skips() {
+  nifi_api_get "counters" | py3 "
+import json, re, sys
+totals = {}
+for c in json.load(sys.stdin)['counters']['aggregateSnapshot']['counters']:
+    m = re.fullmatch(r'(?:Scan )?Keys Skipped by Type Filter \((.*)\)', c['name'])
+    if m and not c['context'].startswith('All '):
+        totals[m.group(1)] = totals.get(m.group(1), 0) + int(c['valueCount'])
+for kind, count in sorted(totals.items()):
+    print(kind, count)
+" || true
+}
+
+# nifi_lib_report_type_filter_skips <before> - the summary line for keys the type filter left out
+# since <before> (an earlier nifi_lib_type_filter_skips), or nothing when there were none.
+nifi_lib_report_type_filter_skips() {
+  local skipped
+  # The earlier snapshot is the first file (NR == FNR), the current counters the second.
+  skipped="$(nifi_lib_type_filter_skips | awk '
+    NR == FNR { b[$1] = $2; next }
+    { d = $2 - b[$1]; if (d > 0) { list = list (list ? ", " : "") $1 " " d; total += d } }
+    END { if (total) print total " (" list ")" }' <(printf '%s\n' "$1") -)"
+  [[ -n "$skipped" ]] || return 0
+  echo "  keys left out by the key-type filter: $skipped - neither copied nor dead-lettered;"
+  echo "    widen --key-types, or drop them from --disallow-key-types, to include them"
+}
+
 nifi_cli() {
   runtime_exec "$CONTAINER_NAME" "$NIFI_CLI" nifi "$@" \
     -u "$NIFI_INTERNAL_URL" -ts "$NIFI_TRUSTSTORE" -tst PKCS12 -tsp "$NIFI_TS_PASS" -btk "$NIFI_TOKEN"

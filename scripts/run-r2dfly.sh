@@ -60,9 +60,11 @@ Transforms, applied wherever keys are written, deleted, compared or indexed:
 
 Scan behavior:
   --key-types LIST              comma-separated Redis types to scan/migrate (env KEY_TYPES,
-                                 default: string,hash,set,zset,list,stream,ReJSON-RL - ReJSON-RL
-                                 routes through ModuleTypeHandler, not RedisTypeDeserializer.
-                                 TopK is handled separately, see --topk-mode). Accepts the real
+                                 default: every type below; each key is copied or dead-lettered
+                                 with its reason: string,hash,set,zset,list,stream, and the module
+                                 types ReJSON-RL,MBbloom--,MBbloomCF,CMSk-TYPE,TSDB-TYPE,TDIS-TYPE,
+                                 graphdata,vectorset, which route through ModuleTypeHandler. TopK
+                                 is handled separately, see --topk-mode). Accepts the real
                                  Redis type strings, or these case-insensitive aliases: json
                                  (ReJSON-RL), topk (TopK-TYPE), sortedset (zset), streams
                                  (stream), cuckoofilter/cf (MBbloomCF) - string/hash/list match
@@ -350,6 +352,7 @@ POLL_MODE="yes"
 # --dfly-to-dfly, with exact counts either way (TopK-TYPE included - see --topk-mode above).
 # Anything else (MBbloom--, CMSk-TYPE, MBbloomCF/cuckoofilter) only has a reconstruction path via
 # --dfly-to-dfly's DUMP/RESTORE fast path - see the validation block below.
+KEY_TYPES_GIVEN="${KEY_TYPES:+true}"
 KEY_TYPES="${KEY_TYPES:-$DEFAULT_KEY_TYPES}"
 DISALLOW_KEY_TYPES="${DISALLOW_KEY_TYPES:-}"
 PREFIX_DENY_LIST="${PREFIX_DENY_LIST:-}"
@@ -585,7 +588,9 @@ if [[ -n "$TARGET_FILE" ]]; then
   unset _KT_ALL _KT_CORE _KT_DROPPED _kt
 fi
 
-if [[ "$DFLY_TO_DFLY" != "true" ]]; then
+# Only for a list the user gave: the default names these types on purpose, and the summary counts
+# their dead-lettered keys.
+if [[ "$DFLY_TO_DFLY" != "true" && "$KEY_TYPES_GIVEN" == "true" ]]; then
   UNIVERSAL_KEY_TYPES=(string hash set zset list stream rejson-rl topk-type)
   IFS=',' read -ra KEY_TYPES_CHECK <<< "$KEY_TYPES"
   for kt in "${KEY_TYPES_CHECK[@]}"; do

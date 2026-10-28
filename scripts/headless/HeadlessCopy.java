@@ -21,6 +21,7 @@ public class HeadlessCopy {
 
     private static final long STALL_MS = 300_000;
     private static final Pattern COUNTERS = Pattern.compile(".*(Scan Partitions Complete|Keys Scanned|Keys Written|Write Errors|Dead-Letter Records Pending)$");
+    private static final Pattern TYPE_SKIPS = Pattern.compile("(?:Scan )?Keys Skipped by Type Filter \\((.*)\\)$");
 
     public static void main(String[] args) throws Exception {
         int partitions = Integer.parseInt(args[2]);
@@ -68,6 +69,17 @@ public class HeadlessCopy {
             System.out.printf("headless: keys scanned %d, keys written %d, write errors %d, dead-letter records %d, %d s%n",
                     counter(counters, "Keys Scanned"), counter(counters, "Keys Written"), counter(counters, "Write Errors"),
                     counter(counters, "Dead-Letter Records Pending"), (System.currentTimeMillis() - started) / 1000);
+            Map<String, Long> skipped = new java.util.TreeMap<>();
+            // Each count appears per component and again as a total, as in counter(); the largest is the total.
+            flow.getCounters(Pattern.compile(".*Skipped by Type Filter.*")).forEach((name, count) -> {
+                var m = TYPE_SKIPS.matcher(name);
+                if (m.find()) {
+                    skipped.merge(m.group(1), count, Math::max);
+                }
+            });
+            if (!skipped.isEmpty()) {
+                System.out.println("headless: keys left out by the key-type filter, neither copied nor dead-lettered: " + skipped);
+            }
         } finally {
             flow.shutdown();
         }
