@@ -38,18 +38,39 @@ class KeyRecordFileTest {
     }
 
     @Test
-    void joinsChunksIntoOneLineAndAppendsAcrossRuns() throws Exception {
+    void joinsAKeysChunksEvenPastTheBatchSizeAndAppendsAcrossRuns() throws Exception {
         Path file = dir.resolve("out.jsonl");
         TestRunner writer = writer(file, "jsonl");
-        writer.enqueue("{\"key\":\"h\",\"type\":\"hash\",\"ttl_ms\":0,\"value\":{\"a\":\"1\"}}", Map.of("redis.chunk.index", "0", "redis.chunk.total", "2"));
-        writer.run();
-        assertEquals("", Files.readString(file), "nothing until the last chunk arrives");
-        writer.enqueue("{\"key\":\"h\",\"type\":\"hash\",\"ttl_ms\":0,\"value\":{\"b\":\"2\"}}", Map.of("redis.chunk.index", "1", "redis.chunk.total", "2"));
+        writer.setProperty(KeyRecordFileWriter.BATCH_SIZE, "1");
+        writer.enqueue("{\"key\":\"h\",\"type\":\"hash\",\"ttl_ms\":0,\"value\":{\"a\":\"1\"}}", chunk("h", 0, 3));
+        writer.enqueue("{\"key\":\"h\",\"type\":\"hash\",\"ttl_ms\":0,\"value\":{\"b\":\"2\"}}", chunk("h", 1, 3));
+        writer.enqueue("{\"key\":\"h\",\"type\":\"hash\",\"ttl_ms\":0,\"value\":{\"c\":\"3\"}}", chunk("h", 2, 3));
         writer.enqueue("{\"key\":\"s\",\"type\":\"string\",\"ttl_ms\":0,\"value\":\"x\"}");
         writer.run();
+        assertEquals(1, writer.getQueueSize().getObjectCount(), "the three chunks were one batch, the string waits");
+        writer.run();
 
-        assertEquals(List.of("{\"key\":\"h\",\"type\":\"hash\",\"value\":{\"a\":\"1\",\"b\":\"2\"},\"ttl_ms\":0}",
+        assertEquals(List.of("{\"key\":\"h\",\"type\":\"hash\",\"value\":{\"a\":\"1\",\"b\":\"2\",\"c\":\"3\"},\"ttl_ms\":0}",
                 "{\"key\":\"s\",\"type\":\"string\",\"value\":\"x\",\"ttl_ms\":0}"), Files.readAllLines(file));
+    }
+
+    @Test
+    void aKeyMissingAChunkWaitsInTheQueueThenFailsWithAReason() throws Exception {
+        Path file = dir.resolve("out.jsonl");
+        TestRunner writer = writer(file, "jsonl");
+        writer.enqueue("{\"key\":\"h\",\"type\":\"hash\",\"ttl_ms\":0,\"value\":{\"a\":\"1\"}}", chunk("h", 0, 2));
+
+        writer.run();
+        assertEquals(1, writer.getQueueSize().getObjectCount(), "an incomplete key goes back to the queue, not into memory");
+        assertEquals("", Files.readString(file));
+        writer.run(10);
+
+        MockFlowFile failed = writer.getFlowFilesForRelationship(KeyRecordFileWriter.REL_FAILURE).get(0);
+        assertEquals("only 1 of the key's 2 chunks arrived; the others failed earlier in the flow", failed.getAttribute("redis.failure.reason"));
+    }
+
+    private static Map<String, String> chunk(String key, int index, int total) {
+        return Map.of("redis.key", key, "redis.chunk.index", String.valueOf(index), "redis.chunk.total", String.valueOf(total));
     }
 
     @Test

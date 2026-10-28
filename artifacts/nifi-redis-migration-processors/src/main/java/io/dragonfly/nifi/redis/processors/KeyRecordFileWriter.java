@@ -31,7 +31,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -81,7 +83,6 @@ public class KeyRecordFileWriter extends AbstractProcessor {
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(FILE, FORMAT, BATCH_SIZE);
     private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_FAILURE);
 
-    private final ChunkReassembler chunks = new ChunkReassembler();
     private volatile FileChannel channel;
 
     @Override
@@ -111,52 +112,80 @@ public class KeyRecordFileWriter extends AbstractProcessor {
 
     @Override
     public void onTrigger(ProcessContext context, ProcessSession session) throws ProcessException {
-        List<FlowFile> batch = session.get(context.getProperty(BATCH_SIZE).asInteger());
+        List<FlowFile> batch = session.get(ChunkReassembler.batchOf(context.getProperty(BATCH_SIZE).asInteger()));
         if (batch.isEmpty()) {
             context.yield();
             return;
         }
         boolean resp = FORMAT_RESP.getValue().equals(context.getProperty(FORMAT).getValue());
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        long written = 0;
+        List<ChunkReassembler.Chunk> parsed = new ArrayList<>();
         for (FlowFile flowFile : batch) {
             if ("true".equals(flowFile.getAttribute("redis.dfly-dump"))) {
                 session.transfer(FailureReason.tag(session, flowFile,
                         "a DUMP payload cannot be written to a file; copy without the RESTORE fast path"), REL_FAILURE);
                 continue;
             }
-            Optional<KeyRecord> record;
             try (InputStream in = session.read(flowFile)) {
-                record = complete(RedisTypeSerializer.readJson(in), flowFile);
-                if (record.isPresent()) {
-                    out.write(resp ? RespRecorder.encode(record.get()) : jsonLine(record.get()));
-                    written++;
-                }
+                parsed.add(new ChunkReassembler.Chunk(flowFile, RedisTypeSerializer.readJson(in)));
             } catch (Exception e) {
-                session.transfer(FailureReason.tag(session, flowFile, "rendering the key record failed", e), REL_FAILURE);
-                continue;
+                session.transfer(FailureReason.tag(session, flowFile, "parsing the key record failed", e), REL_FAILURE);
             }
-            session.remove(flowFile);
         }
-        try {
-            ByteBuffer bytes = ByteBuffer.wrap(out.toByteArray());
-            while (bytes.hasRemaining()) {
-                channel.write(bytes);
+        Map<String, List<ChunkReassembler.Chunk>> groups = ChunkReassembler.byKey(
+                parsed.stream().filter(c -> ChunkReassembler.isChunk(c.flowFile())).toList());
+        Map<String, Integer> lastChunkAt = new HashMap<>();
+        for (int i = 0; i < parsed.size(); i++) {
+            if (ChunkReassembler.isChunk(parsed.get(i).flowFile())) {
+                lastChunkAt.put(parsed.get(i).record().key, i);
             }
-            channel.force(false);
-        } catch (IOException e) {
-            throw new ProcessException("Appending to " + context.getProperty(FILE).getValue() + " failed", e);
         }
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        long written = 0;
+        for (int i = 0; i < parsed.size(); i++) {
+            ChunkReassembler.Chunk item = parsed.get(i);
+            if (ChunkReassembler.isChunk(item.flowFile())) {
+                if (lastChunkAt.get(item.record().key) != i) {
+                    continue;
+                }
+                Optional<ChunkReassembler.Chunk> joined = ChunkReassembler.join(session, groups.get(item.record().key), REL_FAILURE);
+                if (joined.isEmpty()) {
+                    continue;
+                }
+                item = joined.get();
+            }
+            try {
+                out.write(resp ? RespRecorder.encode(item.record()) : jsonLine(item.record()));
+                written++;
+                session.remove(item.flowFile());
+            } catch (Exception e) {
+                session.transfer(FailureReason.tag(session, item.flowFile(), "rendering the key record failed", e), REL_FAILURE);
+            }
+        }
+        append(context, out.toByteArray());
         session.adjustCounter("File Records Written", written, false);
     }
 
-    private Optional<KeyRecord> complete(KeyRecord record, FlowFile flowFile) {
-        String index = flowFile.getAttribute("redis.chunk.index");
-        String total = flowFile.getAttribute("redis.chunk.total");
-        if (index == null || total == null) {
-            return Optional.of(record);
+    /** All of a batch or none of it: a failed append is cut back, so the retried batch does not follow torn bytes. */
+    private void append(ProcessContext context, byte[] bytes) {
+        long sizeBefore = -1;
+        try {
+            sizeBefore = channel.size();
+            ByteBuffer buffer = ByteBuffer.wrap(bytes);
+            while (buffer.hasRemaining()) {
+                channel.write(buffer);
+            }
+            channel.force(false);
+        } catch (IOException e) {
+            if (sizeBefore >= 0) {
+                try {
+                    channel.truncate(sizeBefore);
+                } catch (IOException truncateFailed) {
+                    e.addSuppressed(truncateFailed);
+                }
+            }
+            throw new ProcessException("Appending to " + context.getProperty(FILE).getValue() + " failed", e);
         }
-        return chunks.accumulate(record.key, record, Integer.parseInt(index), Integer.parseInt(total));
     }
 
     private static byte[] jsonLine(KeyRecord record) {

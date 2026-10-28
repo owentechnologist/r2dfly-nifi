@@ -67,6 +67,28 @@ class CommandBuilderTest {
         assertEquals(Map.of("field1", "value1"), decode(fake.hsetCalls.get(0)));
     }
 
+    @Test
+    void writesInfiniteScoresTheWayJacksonCarriesThem() throws Exception {
+        KeyRecord record = RedisTypeSerializer.readJson(RedisTypeSerializer.toJsonBytes(new KeyRecord("z", "zset", 0, null,
+                List.of(Map.of("member", "top", "score", Double.POSITIVE_INFINITY), Map.of("member", "bottom", "score", Double.NEGATIVE_INFINITY)))));
+
+        String commands = new String(RespRecorder.encode(record), StandardCharsets.UTF_8);
+
+        // Lettuce spells the scores Infinity and -Infinity, which Redis and Dragonfly both parse.
+        assertTrue(commands.contains("$8\r\nInfinity\r\n$3\r\ntop") && commands.contains("$9\r\n-Infinity\r\n$6\r\nbottom"), commands);
+    }
+
+    @Test
+    void aRecordThatCannotBecomeCommandsFailsItsOwnWrite() {
+        FakeCommands fake = new FakeCommands();
+        KeyRecord record = new KeyRecord("z", "zset", 0, null, "not a list of members");
+
+        CompletableFuture<CommandBuilder.WriteOutcome> write = CommandBuilder.write(fake.asyncCommands(), fake.rawConnection(), record, record.key,
+                CommandBuilder.TtlStrategy.PRESERVE, 0, CommandBuilder.ConflictStrategy.OVERWRITE);
+
+        assertTrue(write.isCompletedExceptionally());
+    }
+
     private static Map<String, String> decode(Map<byte[], byte[]> raw) {
         Map<String, String> decoded = new LinkedHashMap<>();
         raw.forEach((k, v) -> decoded.put(new String(k, StandardCharsets.UTF_8), new String(v, StandardCharsets.UTF_8)));

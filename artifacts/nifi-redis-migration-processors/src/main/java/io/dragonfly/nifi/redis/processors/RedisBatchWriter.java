@@ -186,8 +186,6 @@ public class RedisBatchWriter extends AbstractProcessor {
 
     private static final Set<Relationship> RELATIONSHIPS = Set.of(REL_SUCCESS, REL_SKIPPED, REL_FAILURE, REL_RETRY, REL_RESTORE_REJECTED);
 
-    private final ChunkReassembler chunkReassembler = new ChunkReassembler();
-
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
         return PROPERTY_DESCRIPTORS;
@@ -226,7 +224,7 @@ public class RedisBatchWriter extends AbstractProcessor {
             return;
         }
 
-        List<PendingWrite> ready = new ArrayList<>();
+        List<PendingWrite> inOrder = new ArrayList<>();
         for (FlowFile flowFile : batch) {
             if ("true".equals(flowFile.getAttribute("redis.dfly-dump"))) {
                 byte[] payload;
@@ -241,7 +239,7 @@ public class RedisBatchWriter extends AbstractProcessor {
                         flowFile.getAttribute("redis.key"), flowFile.getAttribute("redis.type"),
                         parseLong(flowFile.getAttribute("redis.ttl.ms"), -1), null, null);
                 dumpRecord.dumpPayload = payload;
-                ready.add(new PendingWrite(flowFile, dumpRecord, null));
+                inOrder.add(new PendingWrite(flowFile, dumpRecord, null));
                 continue;
             }
 
@@ -254,18 +252,9 @@ public class RedisBatchWriter extends AbstractProcessor {
                 continue;
             }
 
-            String chunkIndexAttr = flowFile.getAttribute("redis.chunk.index");
-            String chunkTotalAttr = flowFile.getAttribute("redis.chunk.total");
-            if (chunkIndexAttr != null && chunkTotalAttr != null) {
-                int chunkIndex = Integer.parseInt(chunkIndexAttr);
-                int chunkTotal = Integer.parseInt(chunkTotalAttr);
-                Optional<KeyRecord> merged = chunkReassembler.accumulate(record.key, record, chunkIndex, chunkTotal);
-                session.remove(flowFile);
-                merged.ifPresent(mergedRecord -> ready.add(new PendingWrite(session.create(), mergedRecord, null)));
-            } else {
-                ready.add(new PendingWrite(flowFile, record, null));
-            }
+            inOrder.add(new PendingWrite(flowFile, record, null));
         }
+        List<PendingWrite> ready = joinChunks(session, inOrder);
 
         if (ready.isEmpty()) {
             session.commit();
@@ -333,6 +322,32 @@ public class RedisBatchWriter extends AbstractProcessor {
             }
         }
         session.commit();
+    }
+
+    /**
+     * The batch with each chunked key joined into one write, placed where its last chunk was, so a later
+     * write of the same key in the batch still wins in {@link #latestPerKey}.
+     */
+    private List<PendingWrite> joinChunks(ProcessSession session, List<PendingWrite> inOrder) {
+        Map<String, List<ChunkReassembler.Chunk>> groups = ChunkReassembler.byKey(inOrder.stream()
+                .filter(p -> ChunkReassembler.isChunk(p.flowFile)).map(p -> new ChunkReassembler.Chunk(p.flowFile, p.record)).toList());
+        Map<String, Integer> lastChunkAt = new HashMap<>();
+        for (int i = 0; i < inOrder.size(); i++) {
+            if (ChunkReassembler.isChunk(inOrder.get(i).flowFile)) {
+                lastChunkAt.put(inOrder.get(i).record.key, i);
+            }
+        }
+        List<PendingWrite> ready = new ArrayList<>(inOrder.size());
+        for (int i = 0; i < inOrder.size(); i++) {
+            PendingWrite pending = inOrder.get(i);
+            if (!ChunkReassembler.isChunk(pending.flowFile)) {
+                ready.add(pending);
+            } else if (lastChunkAt.get(pending.record.key) == i) {
+                ChunkReassembler.join(session, groups.get(pending.record.key), REL_FAILURE)
+                        .ifPresent(joined -> ready.add(new PendingWrite(joined.flowFile(), joined.record(), null)));
+            }
+        }
+        return ready;
     }
 
     /** A write's outcome, or a null outcome and why it failed. */
@@ -470,6 +485,8 @@ public class RedisBatchWriter extends AbstractProcessor {
         private final Map<String, Integer> acceptedByBucket = new HashMap<>();
         /** Keys passed over in this scan: a later FlowFile of the same key must not overtake them. */
         private final Set<String> heldBack = new HashSet<>();
+        /** Chunked keys taken in this scan: their other chunks come along whatever the batch size, so the key joins in one batch. */
+        private final Set<String> chunkedKeys = new HashSet<>();
         private int scanned = 0;
 
         ReadyBatchFilter(int defaultBatchSize, Map<String, Integer> perTypeLimits, long now) {
@@ -485,9 +502,19 @@ public class RedisBatchWriter extends AbstractProcessor {
             if (key != null && heldBack.contains(key)) {
                 return FlowFileFilterResult.REJECT_AND_CONTINUE;
             }
+            boolean chunk = ChunkReassembler.isChunk(flowFile);
+            if (chunk && chunkedKeys.contains(key)) {
+                return FlowFileFilterResult.ACCEPT_AND_CONTINUE;
+            }
             FlowFileFilterResult result = decide(flowFile);
             if (result != FlowFileFilterResult.ACCEPT_AND_CONTINUE && key != null) {
                 heldBack.add(key);
+            } else if (chunk) {
+                chunkedKeys.add(key);
+            }
+            // The rest of a chunked key may still follow a full batch.
+            if (result == FlowFileFilterResult.REJECT_AND_TERMINATE && !chunkedKeys.isEmpty() && scanned < (long) defaultBatchSize * MAX_SCAN_MULTIPLIER) {
+                return FlowFileFilterResult.REJECT_AND_CONTINUE;
             }
             return result;
         }

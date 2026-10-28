@@ -111,6 +111,25 @@ class ScanPhaseIT {
     }
 
     @Test
+    void aChunkedKeyThatFailsCarriesItsWholeRecord() throws Exception {
+        Map<String, String> fields = new LinkedHashMap<>();
+        for (int i = 0; i < 25; i++) {
+            fields.put("field" + i, "value" + i);
+        }
+        seedRedis(cmds -> cmds.hset("it:bighash-conflict", fields));
+        dragonflyCheck().set("it:bighash-conflict", "already here");
+
+        TestRunner writer = runFullPipeline(1, runner -> runner.setProperty(RedisTypeDeserializer.HASH_FIELD_BATCH_SIZE, "10"),
+                runner -> runner.setProperty(RedisBatchWriter.CONFLICT_STRATEGY, "FAIL"));
+
+        MockFlowFile failed = writer.getFlowFilesForRelationship(RedisBatchWriter.REL_FAILURE).stream()
+                .filter(f -> "it:bighash-conflict".equals(f.getAttribute("redis.key"))).findFirst().orElseThrow();
+        assertEquals(fields, io.dragonfly.nifi.redis.util.RedisTypeSerializer.readJson(failed.toByteArray()).value,
+                "the dead-letter record holds the joined hash, not an empty FlowFile");
+        assertEquals(null, failed.getAttribute("redis.chunk.index"));
+    }
+
+    @Test
     void rewritesHashExactlyOnRerunAfterASourceFieldIsRemoved() throws Exception {
         Map<String, String> fields = new LinkedHashMap<>();
         for (int i = 0; i < 25; i++) {
@@ -147,6 +166,10 @@ class ScanPhaseIT {
     }
 
     private void runFullPipeline(int partitionCount, Consumer<TestRunner> deserializerCustomizer) throws Exception {
+        runFullPipeline(partitionCount, deserializerCustomizer, r -> { });
+    }
+
+    private TestRunner runFullPipeline(int partitionCount, Consumer<TestRunner> deserializerCustomizer, Consumer<TestRunner> writerCustomizer) throws Exception {
         TestRunner scanRunner = TestRunners.newTestRunner(RedisScanReader.class);
         // RedisScanReader/RedisTypeDeserializer/RedisBatchWriter all call session.commit()
         // directly, which MockProcessSession rejects by default since nifi-mock 1.14.0 unless
@@ -197,9 +220,11 @@ class ScanPhaseIT {
         writerRunner.enableControllerService(targetPool);
         writerRunner.setProperty(RedisBatchWriter.DRAGONFLY_CONNECTION_POOL, "target-pool");
 
+        writerCustomizer.accept(writerRunner);
         for (MockFlowFile flowFile : deserializerRunner.getFlowFilesForRelationship(RedisTypeDeserializer.REL_SUCCESS)) {
             writerRunner.enqueue(flowFile.toByteArray(), flowFile.getAttributes());
         }
         writerRunner.run();
+        return writerRunner;
     }
 }

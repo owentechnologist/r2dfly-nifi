@@ -92,7 +92,23 @@ public final class CommandBuilder {
             long ttlResetOffsetMs,
             ConflictStrategy conflictStrategy,
             int writeChunkSize) {
+        // A record that cannot even be turned into commands fails as its own write, not the caller's batch.
+        try {
+            return dispatch(target, rawConn, record, targetKeyName, ttlStrategy, ttlResetOffsetMs, conflictStrategy, writeChunkSize);
+        } catch (RuntimeException e) {
+            return CompletableFuture.failedFuture(e);
+        }
+    }
 
+    private static CompletableFuture<WriteOutcome> dispatch(
+            RedisClusterAsyncCommands<byte[], byte[]> target,
+            StatefulConnection<byte[], byte[]> rawConn,
+            KeyRecord record,
+            String targetKeyName,
+            TtlStrategy ttlStrategy,
+            long ttlResetOffsetMs,
+            ConflictStrategy conflictStrategy,
+            int writeChunkSize) {
         byte[] targetKey = targetKeyName.getBytes(StandardCharsets.UTF_8);
         Long effectiveTtl = effectiveTtl(record.ttlMs, ttlStrategy, ttlResetOffsetMs);
         boolean keepFieldTtls = ttlStrategy != TtlStrategy.STRIP;
@@ -271,7 +287,7 @@ public final class CommandBuilder {
         ScoredValue<byte[]>[] scored = new ScoredValue[items.size()];
         for (int i = 0; i < items.size(); i++) {
             Map<String, Object> entry = (Map<String, Object>) items.get(i);
-            double score = ((Number) entry.get("score")).doubleValue();
+            double score = score(entry.get("score"));
             byte[] member = String.valueOf(entry.get("member")).getBytes(StandardCharsets.UTF_8);
             scored[i] = ScoredValue.just(score, member);
         }
@@ -281,6 +297,11 @@ public final class CommandBuilder {
             futures.add(toCf(target.zadd(key, part)));
         }
         return allOf(futures).thenCompose(v -> applyTtl(target, key, ttlMs));
+    }
+
+    /** Jackson writes an infinite score as the string "Infinity" or "-Infinity". */
+    private static double score(Object value) {
+        return value instanceof Number n ? n.doubleValue() : Double.parseDouble(String.valueOf(value));
     }
 
     /** Dispatches every chunk (and, for list/set/zset, the leading DEL) as concurrent pipelined
