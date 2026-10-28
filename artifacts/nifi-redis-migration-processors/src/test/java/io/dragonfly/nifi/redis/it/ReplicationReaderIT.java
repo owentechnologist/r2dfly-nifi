@@ -183,6 +183,23 @@ class ReplicationReaderIT {
         }
     }
 
+    @org.junit.jupiter.api.Test
+    void refusesAPoolThatReadsFromReplicas() throws Exception {
+        try (GenericContainer<?> source = source("redis:7.4")) {
+            TestRunner reader = reader(source);
+            reader.disableControllerService(reader.getControllerService("source-pool"));
+            reader.setProperty(reader.getControllerService("source-pool"), AbstractRedisConnectionPoolService.READ_FROM, "REPLICA_PREFERRED");
+            reader.enableControllerService(reader.getControllerService("source-pool"));
+            AssertionError refused = org.junit.jupiter.api.Assertions.assertThrows(AssertionError.class, reader::run);
+            Throwable root = refused;
+            while (root.getCause() != null) {
+                root = root.getCause();
+            }
+            assertTrue(String.valueOf(root.getMessage()).contains("reads from replicas"), String.valueOf(root));
+            assertEquals(List.of(), reader.getFlowFilesForRelationship(RedisReplicationReader.REL_KEY_CHANGED));
+        }
+    }
+
     private static GenericContainer<?> source(String image) {
         GenericContainer<?> source = new GenericContainer<>(DockerImageName.parse(image)).withExposedPorts(6379);
         source.start();

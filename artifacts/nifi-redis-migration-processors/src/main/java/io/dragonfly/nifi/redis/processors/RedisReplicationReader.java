@@ -189,6 +189,10 @@ public class RedisReplicationReader extends AbstractProcessor {
     @OnScheduled
     public void onScheduled(ProcessContext context) throws IOException {
         RedisConnectionPoolService pool = context.getProperty(REDIS_CONNECTION_POOL).asControllerService(RedisConnectionPoolService.class);
+        if (pool.prefersReplicas()) {
+            throw new ProcessException("The connection pool reads from replicas (Read From is REPLICA_PREFERRED). A replica lags "
+                    + "its master, so the snapshot after a full resync could miss a key written just before it; set Read From to MASTER");
+        }
         Map<String, ReplicationEndpoint> first = pool.replicationEndpoints();
         if (first.isEmpty()) {
             throw new ProcessException("The connection pool names no master to replicate from");
