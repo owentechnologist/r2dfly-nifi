@@ -797,7 +797,7 @@ public class RedisReplicationReader extends AbstractProcessor {
         /** A new snapshot of this shard supersedes whatever an earlier one had not finished. */
         synchronized void fullResync(String shard, String replId, long offset) {
             Stream stream = streams.computeIfAbsent(shard, s -> new Stream(null, false));
-            stream.position = new Position(replId, offset, -1);
+            stream.position = new Position(replId, offset, 0);
             stream.active = true;
             stream.snapshotDone = false;
             stream.generation++;

@@ -192,6 +192,17 @@ argument.
 Guarded by `BinaryDataIT`: the typed copy, the RESTORE path, a JSON-lines file, the replication
 live phase, the reconciler and a prefix rename.
 
+## Writes with no SELECT after a full resync
+
+A Redis 8.10 master that has already selected database 0 for a replica sends its later writes
+with no SELECT before them, including to a new replica after its full resync: a `SET` grew
+`master_repl_offset` by the 32 bytes of the `SET` alone. A real replica's connection to its master
+starts in database 0. The replication reader used to treat the database as unknown until the
+first SELECT, so it skipped every write in that state: in one run, the first `DEL` after startup
+never reached the target. It now starts a full-resync stream in database 0. Seen on scratch
+containers; an integration test with a fresh master did not reproduce it, since that master sent
+the SELECT.
+
 ## NiFi 2.11
 
 - Processor counters are exported on `/nifi-api/flow/metrics/prometheus` as

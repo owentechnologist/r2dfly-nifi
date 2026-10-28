@@ -101,7 +101,9 @@ public final class ReplicationStream implements Closeable {
             String[] parts = reply.split(" ");
             ReplicationStream stream;
             if (parts[0].equals("+FULLRESYNC")) {
-                stream = new ReplicationStream(socket, SyncKind.FULL, parts[1], Long.parseLong(parts[2]), -1);
+                // A replica's connection to its master starts in database 0, and a master that has already
+                // selected 0 for another replica sends its next writes with no SELECT (Redis 8.10 does).
+                stream = new ReplicationStream(socket, SyncKind.FULL, parts[1], Long.parseLong(parts[2]), 0);
                 stream.skipRdb();
             } else if (parts[0].equals("+CONTINUE")) {
                 stream = new ReplicationStream(socket, SyncKind.CONTINUE, parts.length > 1 ? parts[1] : replId, offset, db);
@@ -128,7 +130,7 @@ public final class ReplicationStream implements Closeable {
         return offset;
     }
 
-    /** The database selected at {@link #offset()}, or -1 before the first SELECT. */
+    /** The database selected at {@link #offset()}: 0 after a full resync until a SELECT says otherwise. */
     public int db() {
         return db;
     }
