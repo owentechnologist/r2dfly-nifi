@@ -262,6 +262,14 @@ type, value and TTL.
   gets no key positions and the prefix rewrite does not apply: the command went to the un-renamed
   key, the target answered "ERR no such key", and RedisShake stopped, so the hash and TTL changes
   made after it never arrived. r2dfly's continuous run applied all five live changes.
+- With 1,500 Bloom keys added (13,500 keys), RedisShake stopped at the first rejected Bloom
+  `RESTORE` once TopK was blocked (49 keys written), and copied the other types exactly once both
+  were blocked. Dragonfly `df-i1.40.8` still rejects RedisBloom's dump formats: `RESTORE` gives "ERR
+  Bad data format" and `BF.LOADCHUNK` of `BF.SCANDUMP` chunks gives "ERR INVALIDOBJ invalid bloom
+  dump payload". A Bloom filter does not keep its items, so no tool can rebuild one. r2dfly's
+  default key types leave Bloom out (they are tried only with `--dfly-to-dfly`), so it copied the
+  other 12,000 keys and skipped the Bloom keys, counting them only in "Scan Keys Skipped by Type
+  Filter".
 
 ## NiFi 2.11
 
