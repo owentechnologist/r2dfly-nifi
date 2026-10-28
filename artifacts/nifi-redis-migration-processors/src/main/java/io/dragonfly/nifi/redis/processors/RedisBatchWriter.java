@@ -11,9 +11,12 @@ import io.dragonfly.nifi.redis.util.RedisTypeSerializer;
 import io.dragonfly.nifi.redis.util.RetryPolicy;
 import io.lettuce.core.api.StatefulConnection;
 import io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands;
+import org.apache.nifi.annotation.behavior.Stateful;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
+import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.processor.AbstractProcessor;
@@ -24,8 +27,11 @@ import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
 
+import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -36,8 +42,11 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Tags({"redis", "dragonfly", "migration", "sink", "target"})
+@Stateful(scopes = Scope.LOCAL, description = "Keys with a write waiting on retry, and until when a newer read of each "
+        + "waits behind it, so the order survives a restart.")
 @CapabilityDescription("Accepts FlowFiles from RedisTypeDeserializer/RedisSingleKeyFetch, batches them, and "
         + "issues pipelined write commands to Dragonfly. Spec section 4.3.")
 public class RedisBatchWriter extends AbstractProcessor {
@@ -195,11 +204,38 @@ public class RedisBatchWriter extends AbstractProcessor {
 
     /**
      * Keys with a write waiting on retry, and until when a newer read of one waits behind it: the
-     * retry sits behind that read in the queue and would otherwise land on top of it. The wait ends
-     * a minute after the retry is due, so a retry that never comes back cannot hold a key forever.
+     * retry sits behind that read in the queue and would otherwise land on top of it. Kept in local
+     * state as well, because the retry outlives a restart in NiFi's queue. The wait ends ten minutes
+     * after the retry is due, so a retry that never comes back (auto-terminated, or removed from the
+     * queue by hand) cannot hold a key forever.
      */
     private final Map<String, Long> retryingUntil = new ConcurrentHashMap<>();
-    private static final long RETRY_HOLD_GRACE_MS = 60_000;
+    private final AtomicLong retryHoldChanges = new AtomicLong();
+    private static final long RETRY_HOLD_GRACE_MS = 600_000;
+
+    @OnScheduled
+    public void restoreRetryHolds(ProcessContext context) throws IOException {
+        retryingUntil.clear();
+        long now = System.currentTimeMillis();
+        context.getStateManager().getState(Scope.LOCAL).toMap().forEach((key, until) -> {
+            long deadline = Long.parseLong(until);
+            if (deadline > now) {
+                retryingUntil.put(new String(Base64.getDecoder().decode(key), StandardCharsets.ISO_8859_1), deadline);
+            }
+        });
+    }
+
+    /** State keys are the key's bytes in base64, so any key name is safe to store. */
+    private synchronized void saveRetryHolds(ProcessContext context) {
+        Map<String, String> state = new HashMap<>();
+        retryingUntil.forEach((key, until) -> state.put(
+                Base64.getEncoder().encodeToString(key.getBytes(StandardCharsets.ISO_8859_1)), String.valueOf(until)));
+        try {
+            context.getStateManager().setState(state, Scope.LOCAL);
+        } catch (IOException e) {
+            getLogger().warn("Could not save the keys waiting on retry; a restart now would forget them", e);
+        }
+    }
 
     @Override
     public Set<Relationship> getRelationships() {
@@ -208,6 +244,17 @@ public class RedisBatchWriter extends AbstractProcessor {
 
     @Override
     public void onTrigger(ProcessContext context, ProcessSession session) throws ProcessException {
+        long changesBefore = retryHoldChanges.get();
+        try {
+            writeBatch(context, session);
+        } finally {
+            if (retryHoldChanges.get() != changesBefore) {
+                saveRetryHolds(context);
+            }
+        }
+    }
+
+    private void writeBatch(ProcessContext context, ProcessSession session) {
         int batchSize = context.getProperty(BATCH_SIZE).asInteger();
         Map<String, Integer> perTypeBatchSize = new HashMap<>();
         putIfSet(perTypeBatchSize, "string", context, BATCH_SIZE_STRING);
@@ -228,7 +275,9 @@ public class RedisBatchWriter extends AbstractProcessor {
         RetryPolicy retryPolicy = RetryPolicy.standard();
 
         long now = System.currentTimeMillis();
-        retryingUntil.values().removeIf(until -> until <= now);
+        if (retryingUntil.values().removeIf(until -> until <= now)) {
+            retryHoldChanges.incrementAndGet();
+        }
         List<FlowFile> batch = session.get(new ReadyBatchFilter(batchSize, perTypeBatchSize, now, retryingUntil.keySet()));
         if (batch.isEmpty()) {
             context.yield();
@@ -237,7 +286,9 @@ public class RedisBatchWriter extends AbstractProcessor {
         for (FlowFile flowFile : batch) {
             byte[] key = RedisBytes.key(flowFile);
             if (key != null && flowFile.getAttribute(RetryPolicy.RETRY_COUNT_ATTRIBUTE) != null) {
-                retryingUntil.remove(RedisBytes.identity(key));
+                if (retryingUntil.remove(RedisBytes.identity(key)) != null) {
+                    retryHoldChanges.incrementAndGet();
+                }
             }
         }
 
@@ -451,6 +502,7 @@ public class RedisBatchWriter extends AbstractProcessor {
         byte[] key = RedisBytes.key(flowFile);
         if (key != null) {
             retryingUntil.merge(RedisBytes.identity(key), notBefore + RETRY_HOLD_GRACE_MS, Math::max);
+            retryHoldChanges.incrementAndGet();
         }
         session.transfer(updated, REL_RETRY);
     }

@@ -11,6 +11,7 @@ import io.dragonfly.nifi.redis.services.StandardRedisConnectionPoolService;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.api.StatefulRedisConnection;
 import org.apache.nifi.controller.ControllerService;
+import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.util.MockFlowFile;
 import org.apache.nifi.util.TestRunner;
 import org.apache.nifi.util.TestRunners;
@@ -95,8 +96,10 @@ class DeadLetterIT {
         assertEquals(null, afterReview.getCounterValue("Dead-Letter Records Pending"), "nothing pending once it is moved away");
     }
 
-    @Test
-    void aRetriedWriteNeverLandsOnTopOfANewerOne() throws Exception {
+    /** {@code restart}: a new writer takes over from the processor state alone, as after a NiFi restart. */
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void aRetriedWriteNeverLandsOnTopOfANewerOne(boolean restart) throws Exception {
         TestRunner deserializer = TestRunners.newTestRunner(RedisTypeDeserializer.class);
         deserializer.setAllowSynchronousSessionCommits(true);
         addPool(deserializer, "source-pool", new StandardRedisConnectionPoolService(), redis);
@@ -114,32 +117,42 @@ class DeadLetterIT {
             tgt.connection.sync().del("k");
             tgt.connection.sync().aclSetuser("writer", io.lettuce.core.AclSetuserArgs.Builder.on().addPassword("pw")
                     .allKeys().allCommands().removeCommand(io.lettuce.core.protocol.CommandType.SET));
-            TestRunner writer = TestRunners.newTestRunner(RedisBatchWriter.class);
-            writer.setAllowSynchronousSessionCommits(true);
-            writer.addControllerService("target-pool", new StandardDragonflyConnectionPoolService());
-            writer.setProperty(writer.getControllerService("target-pool"), AbstractRedisConnectionPoolService.CONNECTION_STRING,
-                    "redis://writer:pw@" + dragonfly.getHost() + ":" + dragonfly.getMappedPort(6379));
-            writer.setProperty(writer.getControllerService("target-pool"), AbstractRedisConnectionPoolService.REQUIRE_TLS, "false");
-            writer.enableControllerService(writer.getControllerService("target-pool"));
-            writer.setProperty(RedisBatchWriter.DRAGONFLY_CONNECTION_POOL, "target-pool");
-
+            TestRunner writer = limitedWriter();
             forward(reads.subList(0, 1), writer);
             writer.run(1, false, true);
             List<MockFlowFile> retry = writer.getFlowFilesForRelationship(RedisBatchWriter.REL_RETRY);
             assertEquals(1, retry.size(), "the refused write is retried");
             writer.clearTransferState();
+            if (restart) {
+                TestRunner restarted = limitedWriter();
+                restarted.getStateManager().setState(writer.getStateManager().getState(Scope.LOCAL).toMap(), Scope.LOCAL);
+                writer = restarted;
+            }
 
             tgt.connection.sync().aclSetuser("writer", io.lettuce.core.AclSetuserArgs.Builder.on().addPassword("pw")
                     .allKeys().allCommands());
             forward(reads.subList(1, 2), writer);
             forward(retry, writer);
             for (int i = 0; i < 4; i++) {
-                writer.run(1, false, false);
+                writer.run(1, false, restart && i == 0);
                 Thread.sleep(300);
             }
             assertEquals(List.of(), writer.getFlowFilesForRelationship(RedisBatchWriter.REL_RETRY));
             assertEquals("new", tgt.connection.sync().get("k"), "the retry of the older read did not overwrite the newer one");
         }
+    }
+
+    /** A writer connecting as the target user "writer", which the test grants and revokes SET for. */
+    private static TestRunner limitedWriter() throws Exception {
+        TestRunner writer = TestRunners.newTestRunner(RedisBatchWriter.class);
+        writer.setAllowSynchronousSessionCommits(true);
+        writer.addControllerService("target-pool", new StandardDragonflyConnectionPoolService());
+        writer.setProperty(writer.getControllerService("target-pool"), AbstractRedisConnectionPoolService.CONNECTION_STRING,
+                "redis://writer:pw@" + dragonfly.getHost() + ":" + dragonfly.getMappedPort(6379));
+        writer.setProperty(writer.getControllerService("target-pool"), AbstractRedisConnectionPoolService.REQUIRE_TLS, "false");
+        writer.enableControllerService(writer.getControllerService("target-pool"));
+        writer.setProperty(RedisBatchWriter.DRAGONFLY_CONNECTION_POOL, "target-pool");
+        return writer;
     }
 
     private static TestRunner deadLetterWriter(Path directory) {
