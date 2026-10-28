@@ -215,7 +215,7 @@ public class RedisScanReader extends AbstractProcessor {
     private static final Set<Relationship> RELATIONSHIPS = Set.of(
             REL_STRING, REL_HASH, REL_LIST, REL_SET, REL_ZSET, REL_STREAM, REL_UNKNOWN, REL_FAILURE);
 
-    private final ThreadLocal<Integer> assignedPartition = new ThreadLocal<>();
+    private final ThreadLocal<PartitionAssigner.Claim> assignedPartition = new ThreadLocal<>();
     private final CounterGauge gauges = new CounterGauge();
 
     @Override
@@ -236,12 +236,13 @@ public class RedisScanReader extends AbstractProcessor {
         PartitionAssigner assigner = new PartitionAssigner(cache, migrationId);
         int partitionCount = context.getProperty(PARTITION_COUNT).asInteger();
 
-        int partitionIndex = getOrClaimPartition(assigner, partitionCount, context.getProperty(CLAIM_TIMEOUT_MS).asLong());
-        if (partitionIndex < 0) {
+        PartitionAssigner.Claim claim = getOrClaimPartition(assigner, partitionCount, context.getProperty(CLAIM_TIMEOUT_MS).asLong());
+        if (claim == null) {
             getLogger().info("No partition available to claim for migration '{}' ({} partitions); yielding", migrationId, partitionCount);
             context.yield();
             return;
         }
+        int partitionIndex = claim.partition();
         try {
             if (assigner.isPartitionComplete(partitionIndex)) {
                 getLogger().info("Partition {} already marked complete for migration '{}'; yielding", partitionIndex, migrationId);
@@ -330,12 +331,25 @@ public class RedisScanReader extends AbstractProcessor {
                 gauges.set(session, "Source Latency (ms)", pageMs);
             }
             place = next;
+            // Checked before the page leaves: a task that stalled past the claim timeout while another took
+            // its partition over must neither emit the page nor move the new owner's cursor.
+            boolean held;
+            try {
+                held = assigner.heartbeat(claim);
+            } catch (IOException e) {
+                throw new ProcessException("Unable to heartbeat the scan partition claim", e);
+            }
+            if (!held) {
+                session.rollback();
+                assignedPartition.remove();
+                getLogger().warn("Partition {} of migration '{}' was taken over by another task while this one stalled; stopping here", partitionIndex, migrationId);
+                return;
+            }
             // The page's FlowFiles first: a cursor saved ahead of them would skip the page if the commit failed.
             // A crash between the two re-reads the page, which only copies its keys again.
             session.commit();
             try {
                 assigner.checkpointCursor(partitionIndex, place == null ? "" : place.encode());
-                assigner.heartbeat(partitionIndex);
             } catch (IOException e) {
                 throw new ProcessException("Unable to checkpoint SCAN cursor", e);
             }
@@ -671,15 +685,16 @@ public class RedisScanReader extends AbstractProcessor {
         }
     }
 
-    private int getOrClaimPartition(PartitionAssigner assigner, int partitionCount, long claimTimeoutMs) {
-        Integer partitionIndex = assignedPartition.get();
-        if (partitionIndex != null) {
-            return partitionIndex;
+    /** The partition this thread holds, or a newly claimed one; null when none is free. */
+    private PartitionAssigner.Claim getOrClaimPartition(PartitionAssigner assigner, int partitionCount, long claimTimeoutMs) {
+        PartitionAssigner.Claim held = assignedPartition.get();
+        if (held != null) {
+            return held;
         }
         try {
-            Optional<Integer> claimed = assigner.claimPartition(partitionCount, claimTimeoutMs);
+            Optional<PartitionAssigner.Claim> claimed = assigner.claimPartition(partitionCount, claimTimeoutMs);
             if (claimed.isEmpty()) {
-                return -1;
+                return null;
             }
             assignedPartition.set(claimed.get());
             return claimed.get();

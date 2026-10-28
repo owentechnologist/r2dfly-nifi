@@ -19,8 +19,9 @@ class PartitionAssignerTest {
     void aClaimStillBeingHeartbeatIsNotTakenOver() throws Exception {
         FakeAtomicMapCacheClient cache = new FakeAtomicMapCacheClient();
         PartitionAssigner owner = new PartitionAssigner(cache, "migration-1");
-        assertEquals(Optional.of(0), owner.claimPartition(1, 60_000));
-        owner.heartbeat(0);
+        PartitionAssigner.Claim claim = owner.claimPartition(1, 60_000).orElseThrow();
+        assertEquals(0, claim.partition());
+        assertTrue(owner.heartbeat(claim));
 
         assertEquals(Optional.empty(), new PartitionAssigner(cache, "migration-1").claimPartition(1, 60_000));
     }
@@ -30,8 +31,8 @@ class PartitionAssignerTest {
         FakeAtomicMapCacheClient cache = new FakeAtomicMapCacheClient();
         cache.put(CLAIM_0, String.valueOf(System.currentTimeMillis() - 120_000), STRING, STRING);
 
-        Optional<Integer> first = new PartitionAssigner(cache, "migration-1").claimPartition(1, 60_000);
-        Optional<Integer> second = new PartitionAssigner(cache, "migration-1").claimPartition(1, 60_000);
+        Optional<Integer> first = new PartitionAssigner(cache, "migration-1").claimPartition(1, 60_000).map(PartitionAssigner.Claim::partition);
+        Optional<PartitionAssigner.Claim> second = new PartitionAssigner(cache, "migration-1").claimPartition(1, 60_000);
 
         assertEquals(Optional.of(0), first, "the dead owner's claim is taken over");
         assertEquals(Optional.empty(), second, "the take-over refreshed it, so the next task leaves it alone");
@@ -45,7 +46,7 @@ class PartitionAssignerTest {
         cache.put(CLAIM_0.replace(".claim.0", ".claim.1"), stale, STRING, STRING);
         new PartitionAssigner(cache, "migration-1").markPartitionComplete(0);
 
-        assertEquals(Optional.of(1), new PartitionAssigner(cache, "migration-1").claimPartition(2, 60_000));
+        assertEquals(Optional.of(1), new PartitionAssigner(cache, "migration-1").claimPartition(2, 60_000).map(PartitionAssigner.Claim::partition));
     }
 
     @Test
@@ -53,7 +54,7 @@ class PartitionAssignerTest {
         FakeAtomicMapCacheClient cache = new FakeAtomicMapCacheClient();
         cache.put(CLAIM_0, "claimed", STRING, STRING);
 
-        assertEquals(Optional.of(0), new PartitionAssigner(cache, "migration-1").claimPartition(1, 60_000));
+        assertEquals(Optional.of(0), new PartitionAssigner(cache, "migration-1").claimPartition(1, 60_000).map(PartitionAssigner.Claim::partition));
     }
 
     @Test
@@ -70,27 +71,28 @@ class PartitionAssignerTest {
         PartitionAssigner first = new PartitionAssigner(cache, "migration-1");
         PartitionAssigner second = new PartitionAssigner(cache, "migration-1");
 
-        Optional<Integer> firstClaim = first.claimPartition(2);
-        Optional<Integer> secondClaim = second.claimPartition(2);
+        Optional<Integer> firstClaim = first.claimPartition(2).map(PartitionAssigner.Claim::partition);
+        Optional<Integer> secondClaim = second.claimPartition(2).map(PartitionAssigner.Claim::partition);
 
         assertTrue(firstClaim.isPresent());
         assertTrue(secondClaim.isPresent());
         assertFalse(firstClaim.get().equals(secondClaim.get()), "two claimers must not receive the same partition");
 
-        Optional<Integer> thirdClaim = new PartitionAssigner(cache, "migration-1").claimPartition(2);
+        Optional<PartitionAssigner.Claim> thirdClaim = new PartitionAssigner(cache, "migration-1").claimPartition(2);
         assertTrue(thirdClaim.isEmpty(), "no partitions left to claim");
     }
 
     @Test
-    void releasePartitionAllowsReclaiming() throws Exception {
-        FakeDistributedMapCacheClient cache = new FakeDistributedMapCacheClient();
-        PartitionAssigner assigner = new PartitionAssigner(cache, "migration-2");
+    void anOwnerWhoseClaimWasTakenOverLearnsItAndCannotTakeItBack() throws Exception {
+        FakeAtomicMapCacheClient cache = new FakeAtomicMapCacheClient();
+        PartitionAssigner stalled = new PartitionAssigner(cache, "migration-1");
+        PartitionAssigner.Claim old = stalled.claimPartition(1, 50).orElseThrow();
+        Thread.sleep(100);
+        PartitionAssigner taker = new PartitionAssigner(cache, "migration-1");
+        PartitionAssigner.Claim taken = taker.claimPartition(1, 50).orElseThrow();
 
-        int claimed = assigner.claimPartition(1).orElseThrow();
-        assigner.releasePartition(claimed);
-
-        Optional<Integer> reclaimed = new PartitionAssigner(cache, "migration-2").claimPartition(1);
-        assertEquals(claimed, reclaimed.orElseThrow());
+        assertFalse(stalled.heartbeat(old), "the stalled owner learns its claim is gone");
+        assertTrue(taker.heartbeat(taken), "and has not taken it back from the new owner");
     }
 
     @Test

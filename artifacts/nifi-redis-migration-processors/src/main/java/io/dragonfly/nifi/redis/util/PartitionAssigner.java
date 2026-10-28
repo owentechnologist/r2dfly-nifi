@@ -9,6 +9,7 @@ import org.apache.nifi.distributed.cache.client.Serializer;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * Claims scan partitions and checkpoints SCAN cursors via {@link DistributedMapCacheClient},
@@ -23,10 +24,11 @@ import java.util.Optional;
  * one independent key per partition, since read-modify-write on a shared collection value
  * would not be safe with these primitives.
  *
- * <p>A claim's value is the time its owner last heartbeat it. A claim whose heartbeat is older than
- * the stale timeout belonged to a task that died (a killed NiFi node), and is taken over, but only
- * through an {@link AtomicDistributedMapCacheClient} compare-and-replace, so of two tasks that both
- * see it stale exactly one wins. A cache without that never takes a claim over: the claim stays
+ * <p>A claim's value is its owner's token and the time its owner last heartbeat it. A claim whose
+ * heartbeat is older than the stale timeout belonged to a task that died (a killed NiFi node), or
+ * stalled, and is taken over, but only through an {@link AtomicDistributedMapCacheClient}
+ * compare-and-replace, so of two tasks that both see it stale exactly one wins. The token fences
+ * the old owner: its next heartbeat finds another token and tells it to stop. A cache without that never takes a claim over: the claim stays
  * until it is cleared by hand or a new migration id is used.
  */
 public class PartitionAssigner {
@@ -45,6 +47,10 @@ public class PartitionAssigner {
     private final DistributedMapCacheClient cache;
     private final String migrationId;
 
+    /** A partition this task holds, and the token that tells its claim apart from a later owner's. */
+    public record Claim(int partition, String token) {
+    }
+
     public PartitionAssigner(DistributedMapCacheClient cache, String migrationId) {
         this.cache = cache;
         // Versioned: state an earlier release saved for the same migration id meant different
@@ -53,57 +59,72 @@ public class PartitionAssigner {
     }
 
     /** Attempts to claim the first unclaimed partition in [0, partitionCount), never taking one over. */
-    public Optional<Integer> claimPartition(int partitionCount) throws IOException {
+    public Optional<Claim> claimPartition(int partitionCount) throws IOException {
         return claimPartition(partitionCount, Long.MAX_VALUE);
     }
 
     /** Like {@link #claimPartition(int)}, but also takes over a claim not heartbeat for {@code staleAfterMs}. */
-    public Optional<Integer> claimPartition(int partitionCount, long staleAfterMs) throws IOException {
+    public Optional<Claim> claimPartition(int partitionCount, long staleAfterMs) throws IOException {
         for (int i = 0; i < partitionCount; i++) {
             // A finished partition stops heartbeating, so its claim looks stale; taking it over would
             // only keep a task from the partitions a dead node left unfinished.
             if (isPartitionComplete(i)) {
                 continue;
             }
-            String now = String.valueOf(System.currentTimeMillis());
-            if (cache.putIfAbsent(claimKey(i), now, STRING_SERIALIZER, STRING_SERIALIZER) || takeOverIfStale(i, staleAfterMs)) {
-                return Optional.of(i);
+            Claim claim = new Claim(i, UUID.randomUUID().toString());
+            if (cache.putIfAbsent(claimKey(i), claimValue(claim), STRING_SERIALIZER, STRING_SERIALIZER) || takeOverIfStale(claim, staleAfterMs)) {
+                return Optional.of(claim);
             }
         }
         return Optional.empty();
     }
 
     @SuppressWarnings("unchecked")
-    private boolean takeOverIfStale(int partitionIndex, long staleAfterMs) throws IOException {
+    private boolean takeOverIfStale(Claim claim, long staleAfterMs) throws IOException {
         if (!(cache instanceof AtomicDistributedMapCacheClient<?> atomic) || staleAfterMs == Long.MAX_VALUE) {
             return false;
         }
         AtomicCacheEntry<String, String, Object> entry = ((AtomicDistributedMapCacheClient<Object>) atomic)
-                .fetch(claimKey(partitionIndex), STRING_SERIALIZER, STRING_DESERIALIZER);
+                .fetch(claimKey(claim.partition()), STRING_SERIALIZER, STRING_DESERIALIZER);
         if (entry == null || entry.getValue() == null || System.currentTimeMillis() - heartbeatOf(entry.getValue()) < staleAfterMs) {
             return false;
         }
-        entry.setValue(String.valueOf(System.currentTimeMillis()));
+        entry.setValue(claimValue(claim));
         return ((AtomicDistributedMapCacheClient<Object>) atomic).replace(entry, STRING_SERIALIZER, STRING_SERIALIZER);
     }
 
-    /** A claim written before heartbeats existed holds the word "claimed", which reads as never heartbeat. */
+    /** "token|heartbeat ms". */
+    private static String claimValue(Claim claim) {
+        return claim.token() + "|" + System.currentTimeMillis();
+    }
+
+    /** A claim from an earlier release holds the word "claimed" or a bare time, which read as never heartbeat. */
     private static long heartbeatOf(String value) {
         try {
-            return Long.parseLong(value);
+            return Long.parseLong(value.substring(value.indexOf('|') + 1));
         } catch (NumberFormatException e) {
             return 0;
         }
     }
 
-    /** Keeps a claim fresh so other tasks do not take it over while its owner is still working. */
-    public void heartbeat(int partitionIndex) throws IOException {
-        cache.put(claimKey(partitionIndex), String.valueOf(System.currentTimeMillis()), STRING_SERIALIZER, STRING_SERIALIZER);
-    }
-
-    /** Releases a previously claimed partition so another task may claim it. */
-    public void releasePartition(int partitionIndex) throws IOException {
-        cache.remove(claimKey(partitionIndex), STRING_SERIALIZER);
+    /**
+     * Keeps a claim fresh so other tasks do not take it over while its owner is still working, and
+     * false once another task has taken it over: its owner must then stop, without writing to it.
+     * A cache without compare-and-replace never takes a claim over, so there the claim is always held.
+     */
+    @SuppressWarnings("unchecked")
+    public boolean heartbeat(Claim claim) throws IOException {
+        if (!(cache instanceof AtomicDistributedMapCacheClient<?> atomic)) {
+            cache.put(claimKey(claim.partition()), claimValue(claim), STRING_SERIALIZER, STRING_SERIALIZER);
+            return true;
+        }
+        AtomicCacheEntry<String, String, Object> entry = ((AtomicDistributedMapCacheClient<Object>) atomic)
+                .fetch(claimKey(claim.partition()), STRING_SERIALIZER, STRING_DESERIALIZER);
+        if (entry == null || entry.getValue() == null || !entry.getValue().startsWith(claim.token() + "|")) {
+            return false;
+        }
+        entry.setValue(claimValue(claim));
+        return ((AtomicDistributedMapCacheClient<Object>) atomic).replace(entry, STRING_SERIALIZER, STRING_SERIALIZER);
     }
 
     public void checkpointCursor(int partitionIndex, String cursor) throws IOException {

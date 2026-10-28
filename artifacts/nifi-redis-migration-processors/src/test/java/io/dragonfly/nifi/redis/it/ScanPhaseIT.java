@@ -193,6 +193,50 @@ class ScanPhaseIT {
                 failed.get(0).getAttribute("redis.failure.reason"));
     }
 
+    @Test
+    void aScanWhosePartitionIsTakenOverStopsWithoutEmittingMore() throws Exception {
+        seedRedis(cmds -> {
+            for (int i = 0; i < 300; i++) {
+                cmds.set("it:fenced:" + i, "v");
+            }
+        });
+        io.dragonfly.nifi.redis.util.FakeAtomicMapCacheClient cache = new io.dragonfly.nifi.redis.util.FakeAtomicMapCacheClient() {
+            private int heartbeats;
+
+            @Override
+            public synchronized <K, V> org.apache.nifi.distributed.cache.client.AtomicCacheEntry<K, V, Long> fetch(K key,
+                    org.apache.nifi.distributed.cache.client.Serializer<K> keySerializer,
+                    org.apache.nifi.distributed.cache.client.Deserializer<V> valueDeserializer) throws java.io.IOException {
+                if (String.valueOf(key).contains(".claim.") && ++heartbeats == 2) {
+                    org.apache.nifi.distributed.cache.client.Serializer<String> text = (v, out) -> out.write(v.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    put(String.valueOf(key), "another-task|" + System.currentTimeMillis(), text, text);
+                }
+                return super.fetch(key, keySerializer, valueDeserializer);
+            }
+        };
+        TestRunner scanRunner = TestRunners.newTestRunner(RedisScanReader.class);
+        scanRunner.setAllowSynchronousSessionCommits(true);
+        StandardRedisConnectionPoolService sourcePool = new StandardRedisConnectionPoolService();
+        scanRunner.addControllerService("source-pool", sourcePool);
+        scanRunner.setProperty(sourcePool, AbstractRedisConnectionPoolService.CONNECTION_STRING,
+                "redis://" + redis.getHost() + ":" + redis.getMappedPort(6379));
+        scanRunner.setProperty(sourcePool, AbstractRedisConnectionPoolService.REQUIRE_TLS, "false");
+        scanRunner.enableControllerService(sourcePool);
+        scanRunner.addControllerService("cursor-cache", cache);
+        scanRunner.enableControllerService(cache);
+        scanRunner.setProperty(RedisScanReader.REDIS_CONNECTION_POOL, "source-pool");
+        scanRunner.setProperty(RedisScanReader.CURSOR_STATE_CACHE, "cursor-cache");
+        scanRunner.setProperty(RedisScanReader.MIGRATION_ID, "it-fenced");
+        scanRunner.setProperty(RedisScanReader.KEY_PATTERN, "it:fenced:*");
+        scanRunner.setProperty(RedisScanReader.SCAN_COUNT, "20");
+        scanRunner.run();
+
+        int emitted = scanRunner.getFlowFilesForRelationship(RedisScanReader.REL_STRING).size();
+        assertTrue(emitted > 0 && emitted < 300, "only the pages before the take-over were emitted, was " + emitted);
+        assertTrue(!new io.dragonfly.nifi.redis.util.PartitionAssigner(cache, "it-fenced").isPartitionComplete(0), "the partition is left to its new owner");
+        seedRedis(cmds -> cmds.del(cmds.keys("it:fenced:*").toArray(new String[0])));
+    }
+
     private void runFullPipeline(int partitionCount) throws Exception {
         runFullPipeline(partitionCount, r -> { });
     }
