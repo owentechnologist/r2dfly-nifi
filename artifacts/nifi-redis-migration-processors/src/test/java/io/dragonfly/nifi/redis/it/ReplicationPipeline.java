@@ -94,9 +94,10 @@ final class ReplicationPipeline {
         forward(deserializer.getFlowFilesForRelationship(RedisTypeDeserializer.REL_MODULE_TYPE), modules);
         forward(deserializer.getFlowFilesForRelationship(RedisTypeDeserializer.REL_KEY_MISSING), delete);
         deserializer.clearTransferState();
-        runAndCheck(writer, RedisBatchWriter.REL_FAILURE, RedisBatchWriter.REL_SUCCESS, RedisBatchWriter.REL_RETRY);
-        runAndCheck(modules, ModuleTypeHandler.REL_FAILURE, ModuleTypeHandler.REL_SUCCESS);
-        runAndCheck(delete, DeleteRedisKey.REL_FAILURE, DeleteRedisKey.REL_SUCCESS);
+        List<MockFlowFile> retries = runAndCheck(writer, RedisBatchWriter.REL_FAILURE, RedisBatchWriter.REL_RETRY);
+        forward(retries, writer);
+        runAndCheck(modules, ModuleTypeHandler.REL_FAILURE);
+        runAndCheck(delete, DeleteRedisKey.REL_FAILURE);
     }
 
     void pumpFor(long ms) {
@@ -130,13 +131,19 @@ final class ReplicationPipeline {
         return value == null ? 0L : value;
     }
 
-    private static void runAndCheck(TestRunner runner, org.apache.nifi.processor.Relationship failure,
-                                    org.apache.nifi.processor.Relationship... ok) {
+    /** Runs what is queued, checks nothing failed, and returns what went to {@code loopBack}, which the flow sends back in. */
+    private static List<MockFlowFile> runAndCheck(TestRunner runner, org.apache.nifi.processor.Relationship failure,
+                                                  org.apache.nifi.processor.Relationship... loopBack) {
         if (runner.getQueueSize().getObjectCount() > 0) {
             runner.run(runner.getQueueSize().getObjectCount() / 50 + 1);
         }
         assertEquals(List.of(), reasons(runner.getFlowFilesForRelationship(failure)), runner.getProcessor().getClass().getSimpleName() + " failures");
+        List<MockFlowFile> back = new java.util.ArrayList<>();
+        for (org.apache.nifi.processor.Relationship relationship : loopBack) {
+            back.addAll(runner.getFlowFilesForRelationship(relationship));
+        }
         runner.clearTransferState();
+        return back;
     }
 
     private static List<String> reasons(List<MockFlowFile> failed) {

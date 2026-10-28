@@ -240,6 +240,14 @@ public final class RedisValueFetcher {
         return Optional.of(List.of(KeyRecord.of(key, base64, "zset", ttlMs, encoding, items)));
     }
 
+    /** Orders stream ids ("ms-seq") as the server does. */
+    static int compareStreamIds(String a, String b) {
+        String[] x = a.split("-");
+        String[] y = b.split("-");
+        int byTime = Long.compareUnsigned(Long.parseUnsignedLong(x[0]), Long.parseUnsignedLong(y[0]));
+        return byTime != 0 ? byTime : Long.compareUnsigned(Long.parseUnsignedLong(x[1]), Long.parseUnsignedLong(y[1]));
+    }
+
     private static Optional<List<KeyRecord>> fetchStream(
             RedisClusterAsyncCommands<byte[], byte[]> cmds, byte[] key, long ttlMs, String encoding,
             int readCount, boolean includeConsumerGroups) throws Exception {
@@ -285,7 +293,10 @@ public final class RedisValueFetcher {
             entries.add(entry);
         }
         KeyRecord record = KeyRecord.of(key, base64, "stream", ttlMs, encoding, entries);
-        record.lastGeneratedId = lastGeneratedId;
+        // An entry added between XINFO and XRANGE is newer than the id XINFO reported, and the target
+        // refuses an XSETID below its top entry; the stream's last id was at least that entry's.
+        record.lastGeneratedId = lastId != null && (lastGeneratedId == null || compareStreamIds(lastId, lastGeneratedId) > 0)
+                ? lastId : lastGeneratedId;
         if (includeConsumerGroups) {
             record.consumerGroups = fetchConsumerGroups(cmds, key);
         }

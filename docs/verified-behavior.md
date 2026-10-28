@@ -50,6 +50,13 @@ RESTORE path. Guarded by `StreamHashFidelityIT` (Redis 8.10 and Valkey 9.1 sourc
 Guarded by `StreamHashFidelityIT`, which compares `XINFO STREAM`, `XINFO GROUPS`,
 `XINFO CONSUMERS` and `XPENDING` on both sides.
 
+A stream read while the source keeps adding entries can return entries newer than the
+`last-generated-id` that `XINFO STREAM` reported a moment earlier. Dragonfly then refuses the
+record's `XSETID` ("The ID specified in XSETID is equal or smaller than the target stream top
+item") on every attempt, so the key used to end in the dead-letter directory. r2dfly now raises the
+last id to the newest entry it read. Guarded by `ReplicationReaderIT`, whose test pipeline loops
+writer retries back the way the flow does instead of dropping them, which had hidden this.
+
 ## Module types on Dragonfly
 
 Tested with Redis Stack 7.4 and Redis 8.10 sources.
