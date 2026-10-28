@@ -204,7 +204,9 @@ starts in database 0. The replication reader used to treat the database as unkno
 first SELECT, so it skipped every write in that state: in one run, the first `DEL` after startup
 never reached the target. It now starts a full-resync stream in database 0. Seen on scratch
 containers; an integration test with a fresh master did not reproduce it, since that master sent
-the SELECT.
+the SELECT. Redis 8.10.3 also sent `SELECT 0` to a second replica's full resync after a first
+replica had seen `SELECT 0`, both with the first replica disconnected and with it still connected,
+so the trigger on the scratch containers is still unknown and nothing guards the fix.
 
 ## NiFi 2.11
 
