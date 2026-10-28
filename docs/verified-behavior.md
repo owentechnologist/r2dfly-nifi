@@ -76,6 +76,16 @@ reason. Time series, T-Digest, graph and vector set keys are dead-lettered witho
 `JSON.SET key $` over an existing key drops the key's TTL on Dragonfly v2.0.2, so rebuilding a
 JSON key needs no `PERSIST` when the source key has no TTL. Guarded by `ModuleTypeHandlerIT`.
 
+## TopK counts on Dragonfly
+
+Dragonfly's TopK can count an item differently from RedisBloom's when items collide in the
+sketch. Tested on Dragonfly Cloud `df-i1.40.8` with `TOPK.RESERVE k 50 2000 7 0.925` and three
+items added once each, as `scripts/populate-test-data.sh` does: in about 0.7% of keys (12 of 1,500),
+Dragonfly reports one of the three items with count 0 where Redis Stack reports 1. The same happens
+writing straight to Dragonfly with `TOPK.ADD` or with `TOPK.INCRBY`, so r2dfly's TopK rebuild
+cannot avoid it, and which item gets 0 depends on the order the items are written. The list of
+items always matches.
+
 ## Keyspace notifications from Redis 8 module commands
 
 Redis 8 publishes no keyspace notification for `TOPK.*`, `BF.*`, `CF.*` or `CMS.*`. `JSON.*` and
