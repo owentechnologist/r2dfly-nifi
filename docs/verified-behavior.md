@@ -66,6 +66,9 @@ tried with RESTORE, which works between Dragonfly instances, and otherwise dead-
 reason. Time series, T-Digest, graph and vector set keys are dead-lettered without an attempt.
 `util/ModuleCopy` holds this table. Guarded by `ModuleTypesIT`.
 
+`JSON.SET key $` over an existing key drops the key's TTL on Dragonfly v2.0.2, so rebuilding a
+JSON key needs no `PERSIST` when the source key has no TTL. Guarded by `ModuleTypeHandlerIT`.
+
 ## Keyspace notifications from Redis 8 module commands
 
 Redis 8 publishes no keyspace notification for `TOPK.*`, `BF.*`, `CF.*` or `CMS.*`. `JSON.*` and

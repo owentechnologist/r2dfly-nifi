@@ -50,7 +50,7 @@ class ModuleTypeHandlerIT {
             new GenericContainer<>(DockerImageName.parse("docker.dragonflydb.io/dragonflydb/dragonfly:latest")).withExposedPorts(6379);
 
     private enum RawCommand implements ProtocolKeyword {
-        TOPK_RESERVE("TOPK.RESERVE"), TOPK_INCRBY("TOPK.INCRBY"), TOPK_LIST("TOPK.LIST");
+        TOPK_RESERVE("TOPK.RESERVE"), TOPK_INCRBY("TOPK.INCRBY"), TOPK_LIST("TOPK.LIST"), JSON_SET("JSON.SET");
 
         private final byte[] bytes;
 
@@ -162,6 +162,38 @@ class ModuleTypeHandlerIT {
 
         runner.assertAllFlowFilesTransferred(ModuleTypeHandler.REL_SUCCESS, 1);
         assertEquals(0L, target.exists("gone:doc"), "the stale copy is gone with the source key");
+    }
+
+    @Test
+    void aJsonRewriteTakesTheSourceTtlNotTheTargetsOldOne() throws Exception {
+        CommandArgs<String, String> doc = new CommandArgs<>(StringCodec.UTF8).addKey("ttl:doc").add("$").add("{\"v\":1}");
+        sourceConnection.sync().dispatch(RawCommand.JSON_SET, new StatusOutput<>(StringCodec.UTF8), doc);
+        RedisCommands<String, String> target = targetConnection.sync();
+        target.dispatch(RawCommand.JSON_SET, new StatusOutput<>(StringCodec.UTF8), doc);
+        target.expire("ttl:doc", 1000);
+
+        TestRunner runner = TestRunners.newTestRunner(ModuleTypeHandler.class);
+        runner.setAllowSynchronousSessionCommits(true);
+        StandardRedisConnectionPoolService sourcePool = new StandardRedisConnectionPoolService();
+        runner.addControllerService("source-pool", sourcePool);
+        runner.setProperty(sourcePool, AbstractRedisConnectionPoolService.CONNECTION_STRING,
+                "redis://" + sourceDragonfly.getHost() + ":" + sourceDragonfly.getMappedPort(6379));
+        runner.setProperty(sourcePool, AbstractRedisConnectionPoolService.REQUIRE_TLS, "false");
+        runner.enableControllerService(sourcePool);
+        StandardDragonflyConnectionPoolService targetPool = new StandardDragonflyConnectionPoolService();
+        runner.addControllerService("target-pool", targetPool);
+        runner.setProperty(targetPool, AbstractRedisConnectionPoolService.CONNECTION_STRING,
+                "redis://" + targetDragonfly.getHost() + ":" + targetDragonfly.getMappedPort(6379));
+        runner.setProperty(targetPool, AbstractRedisConnectionPoolService.REQUIRE_TLS, "false");
+        runner.enableControllerService(targetPool);
+        runner.setProperty(ModuleTypeHandler.SOURCE_CONNECTION_POOL, "source-pool");
+        runner.setProperty(ModuleTypeHandler.TARGET_CONNECTION_POOL, "target-pool");
+
+        runner.enqueue(new byte[0], Map.of("redis.key", "ttl:doc", "redis.type", "ReJSON-RL", "redis.ttl.ms", "-1"));
+        runner.run();
+
+        runner.assertAllFlowFilesTransferred(ModuleTypeHandler.REL_SUCCESS, 1);
+        assertEquals(-1L, target.ttl("ttl:doc"), "the source key never expires, so neither does the copy");
     }
 
     private Map<String, Long> readTargetTopkCounts(String key) {

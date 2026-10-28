@@ -161,6 +161,38 @@ class ScanPhaseIT {
         assertTrue(ttlMs > 0 && ttlMs <= 3_600_000, "TTL should be preserved within the original bound, was " + ttlMs);
     }
 
+    @Test
+    void aKeyWhoseTtlCannotBeReadFailsInsteadOfBecomingPersistent() throws Exception {
+        seedRedis(cmds -> {
+            cmds.set("it:unreadable-ttl", "v", io.lettuce.core.SetArgs.Builder.ex(3600));
+            cmds.aclSetuser("nopttl", io.lettuce.core.AclSetuserArgs.Builder.on().addPassword("pw")
+                    .allKeys().allCommands().removeCommand(io.lettuce.core.protocol.CommandType.PTTL));
+        });
+
+        TestRunner scanRunner = TestRunners.newTestRunner(RedisScanReader.class);
+        scanRunner.setAllowSynchronousSessionCommits(true);
+        StandardRedisConnectionPoolService sourcePool = new StandardRedisConnectionPoolService();
+        scanRunner.addControllerService("source-pool", sourcePool);
+        scanRunner.setProperty(sourcePool, AbstractRedisConnectionPoolService.CONNECTION_STRING,
+                "redis://nopttl:pw@" + redis.getHost() + ":" + redis.getMappedPort(6379));
+        scanRunner.setProperty(sourcePool, AbstractRedisConnectionPoolService.REQUIRE_TLS, "false");
+        scanRunner.enableControllerService(sourcePool);
+        FakeDistributedMapCacheClient cache = new FakeDistributedMapCacheClient();
+        scanRunner.addControllerService("cursor-cache", cache);
+        scanRunner.enableControllerService(cache);
+        scanRunner.setProperty(RedisScanReader.REDIS_CONNECTION_POOL, "source-pool");
+        scanRunner.setProperty(RedisScanReader.CURSOR_STATE_CACHE, "cursor-cache");
+        scanRunner.setProperty(RedisScanReader.MIGRATION_ID, "it-unreadable-ttl");
+        scanRunner.setProperty(RedisScanReader.KEY_PATTERN, "it:unreadable-ttl");
+        scanRunner.run();
+
+        assertEquals(List.of(), scanRunner.getFlowFilesForRelationship(RedisScanReader.REL_STRING));
+        List<MockFlowFile> failed = scanRunner.getFlowFilesForRelationship(RedisScanReader.REL_FAILURE);
+        assertEquals(1, failed.size());
+        assertTrue(failed.get(0).getAttribute("redis.failure.reason").startsWith("PTTL on the source failed"),
+                failed.get(0).getAttribute("redis.failure.reason"));
+    }
+
     private void runFullPipeline(int partitionCount) throws Exception {
         runFullPipeline(partitionCount, r -> { });
     }

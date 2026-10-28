@@ -742,7 +742,8 @@ public class RedisScanReader extends AbstractProcessor {
                 try {
                     ttlMs = ttlFutures.get(i).get();
                 } catch (Exception e) {
-                    ttlMs = -1;
+                    failures.add(new ScanEntry(ttlKeys.get(i), ttlTypes.get(i), -2, null, "PTTL on the source failed: " + FailureReason.describe(e)));
+                    continue;
                 }
             }
             if (skipVolatile && ttlMs >= 0 && ttlMs < volatileThresholdMs) {
