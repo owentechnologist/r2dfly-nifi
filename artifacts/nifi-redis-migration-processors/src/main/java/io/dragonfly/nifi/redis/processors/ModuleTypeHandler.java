@@ -200,7 +200,8 @@ public class ModuleTypeHandler extends AbstractProcessor {
         for (FlowFile flowFile : batch) {
             byte[] key = RedisBytes.key(flowFile);
             String moduleType = flowFile.getAttribute("redis.type");
-            Long ttl = CommandBuilder.effectiveTtl(parseLong(flowFile.getAttribute("redis.ttl.ms"), -1), ttlStrategy, ttlResetOffsetMs);
+            Long ttl = CommandBuilder.effectiveTtl(CommandBuilder.remainingTtl(parseLong(flowFile.getAttribute("redis.ttl.ms"), -1),
+                    flowFile.getAttribute(CommandBuilder.TTL_READ_AT), System.currentTimeMillis()), ttlStrategy, ttlResetOffsetMs);
             if (key == null || moduleType == null) {
                 session.transfer(session.penalize(FailureReason.tag(session, flowFile, "no redis.key or redis.type attribute")), REL_FAILURE);
                 continue;

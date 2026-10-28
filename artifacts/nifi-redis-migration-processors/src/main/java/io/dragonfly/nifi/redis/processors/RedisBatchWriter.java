@@ -253,7 +253,8 @@ public class RedisBatchWriter extends AbstractProcessor {
                     continue;
                 }
                 KeyRecord dumpRecord = KeyRecord.of(RedisBytes.key(flowFile), false, flowFile.getAttribute("redis.type"),
-                        parseLong(flowFile.getAttribute("redis.ttl.ms"), -1), null, null);
+                        CommandBuilder.remainingTtl(parseLong(flowFile.getAttribute("redis.ttl.ms"), -1),
+                                flowFile.getAttribute(CommandBuilder.TTL_READ_AT), now), null, null);
                 dumpRecord.dumpPayload = payload;
                 inOrder.add(new PendingWrite(flowFile, dumpRecord, null));
                 continue;
@@ -267,6 +268,7 @@ public class RedisBatchWriter extends AbstractProcessor {
                 session.transfer(session.penalize(FailureReason.tag(session, flowFile, "parsing the key record failed", e)), REL_FAILURE);
                 continue;
             }
+            record.ttlMs = CommandBuilder.remainingTtl(record.ttlMs, flowFile.getAttribute(CommandBuilder.TTL_READ_AT), now);
 
             inOrder.add(new PendingWrite(flowFile, record, null));
         }

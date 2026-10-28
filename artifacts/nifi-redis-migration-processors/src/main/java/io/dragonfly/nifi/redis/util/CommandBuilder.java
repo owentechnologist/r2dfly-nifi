@@ -442,6 +442,21 @@ public final class CommandBuilder {
         return toCf(target.pexpire(key, ttlMs)).thenApply(v -> null);
     }
 
+    /** When a key's TTL was read, in epoch ms, so a writer can take the time it spent in the flow off it. */
+    public static final String TTL_READ_AT = "redis.ttl.read.at";
+
+    /** {@code ttlMs} as it stands at {@code nowMs}, given {@code readAt} (a {@link #TTL_READ_AT} value, or null); at least 1 while it had one. */
+    public static long remainingTtl(long ttlMs, String readAt, long nowMs) {
+        if (ttlMs <= 0 || readAt == null) {
+            return ttlMs;
+        }
+        try {
+            return Math.max(1, ttlMs - (nowMs - Long.parseLong(readAt)));
+        } catch (NumberFormatException e) {
+            return ttlMs;
+        }
+    }
+
     /** The TTL a key gets on the target, or null for none. */
     public static Long effectiveTtl(long sourceTtlMs, TtlStrategy strategy, long resetOffsetMs) {
         return switch (strategy) {

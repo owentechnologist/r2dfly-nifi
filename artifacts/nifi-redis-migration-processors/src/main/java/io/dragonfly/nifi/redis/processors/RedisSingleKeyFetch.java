@@ -1,6 +1,7 @@
 package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
+import io.dragonfly.nifi.redis.util.CommandBuilder;
 import io.dragonfly.nifi.redis.util.FailureReason;
 import io.dragonfly.nifi.redis.util.KeyFilter;
 import io.dragonfly.nifi.redis.util.KeyRecord;
@@ -21,6 +22,7 @@ import org.apache.nifi.processor.util.StandardValidators;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -119,7 +121,8 @@ public class RedisSingleKeyFetch extends AbstractProcessor {
                 session.remove(flowFile);
                 return;
             }
-            flowFile = session.putAttribute(flowFile, "redis.ttl.ms", String.valueOf(meta.ttlMs()));
+            flowFile = session.putAllAttributes(flowFile, Map.of("redis.ttl.ms", String.valueOf(meta.ttlMs()),
+                    CommandBuilder.TTL_READ_AT, String.valueOf(System.currentTimeMillis())));
             if (!CORE_TYPES.contains(type)) {
                 flowFile = session.putAttribute(flowFile, "redis.type", type);
                 session.transfer(flowFile, REL_MODULE_TYPE);

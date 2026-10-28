@@ -237,6 +237,22 @@ class ScanPhaseIT {
         seedRedis(cmds -> cmds.del(cmds.keys("it:fenced:*").toArray(new String[0])));
     }
 
+    @Test
+    void aTtlIsReducedByTheTimeTheKeySpentInTheFlow() throws Exception {
+        seedRedis(cmds -> cmds.set("it:queued-ttl", "v", io.lettuce.core.SetArgs.Builder.px(10_000)));
+
+        runFullPipeline(1, r -> { }, writer -> {
+            try {
+                Thread.sleep(3_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        Long ttlMs = dragonflyCheck().pttl("it:queued-ttl");
+        assertTrue(ttlMs > 0 && ttlMs <= 7_500, "the copy expires with the source key, not 3 s later; PTTL was " + ttlMs);
+    }
+
     private void runFullPipeline(int partitionCount) throws Exception {
         runFullPipeline(partitionCount, r -> { });
     }

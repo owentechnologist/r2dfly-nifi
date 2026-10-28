@@ -2,6 +2,7 @@ package io.dragonfly.nifi.redis.processors;
 
 import io.dragonfly.nifi.redis.services.DragonflyConnectionPoolService;
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
+import io.dragonfly.nifi.redis.util.CommandBuilder;
 import io.dragonfly.nifi.redis.util.FailureReason;
 import io.dragonfly.nifi.redis.util.Futures;
 import io.dragonfly.nifi.redis.util.KeyFilter;
@@ -337,7 +338,8 @@ public class RedisTypeDeserializer extends AbstractProcessor {
                         out -> RedisTypeSerializer.writeJson(KeyRecord.of(key, false, KeyRecord.DELETED, -1, null, null), out));
                 session.transfer(tombstone, REL_SUCCESS);
             } else {
-                Map<String, String> attrs = new HashMap<>(Map.of("redis.type", type, "redis.ttl.ms", String.valueOf(ttlMs)));
+                Map<String, String> attrs = new HashMap<>(Map.of("redis.type", type, "redis.ttl.ms", String.valueOf(ttlMs),
+                        CommandBuilder.TTL_READ_AT, String.valueOf(System.currentTimeMillis())));
                 // The RESTORE probe keys its verdicts by encoding (a Redis 7.4 hash with field TTLs is
                 // listpackex and restores nowhere); a source without OBJECT ENCODING only loses that detail.
                 try {

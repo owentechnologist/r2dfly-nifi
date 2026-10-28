@@ -3,6 +3,7 @@ package io.dragonfly.nifi.redis.processors;
 import io.dragonfly.nifi.redis.services.RedisConnectionPoolService;
 import io.dragonfly.nifi.redis.util.RedisBytes;
 import io.dragonfly.nifi.redis.util.ClusterTopologySnapshot;
+import io.dragonfly.nifi.redis.util.CommandBuilder;
 import io.dragonfly.nifi.redis.util.CounterGauge;
 import io.dragonfly.nifi.redis.util.FailureReason;
 import io.dragonfly.nifi.redis.util.Futures;
@@ -815,6 +816,7 @@ public class RedisScanReader extends AbstractProcessor {
             attrs.putAll(RedisBytes.keyAttributes(key));
             attrs.put("redis.type", type);
             attrs.put("redis.ttl.ms", String.valueOf(ttlMs));
+            attrs.put(CommandBuilder.TTL_READ_AT, String.valueOf(System.currentTimeMillis()));
             attrs.put("redis.partition.index", String.valueOf(partitionIndex));
             attrs.put("redis.scan.cursor", cursor.getCursor());
             if (databaseIndex != null) {
