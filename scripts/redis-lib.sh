@@ -245,3 +245,113 @@ redis_lib_warn_capability_gaps() {
     echo "  note: the warnings above come from pre-flight command-support checks on each server, not from a scan of the actual keys - ignore any of them if the source doesn't really hold keys of that type" >&2
   fi
 }
+
+# The scan's key-type filter, shared by run-r2dfly.sh and headless-migration.sh. The NiFi flows
+# match real Redis type strings, while --key-types and --disallow-key-types also take aliases.
+DEFAULT_KEY_TYPES="string,hash,set,zset,list,stream,ReJSON-RL"
+
+# --key-types accepts friendly/short aliases (case-insensitively) alongside the real Redis type
+# strings the rest of this script and the NiFi flow actually match against - translate those
+# here, once, so everything downstream (the TopK-TYPE/dfly-to-dfly auto-additions below, the
+# processor property, the summary echo) only ever sees real type strings. Anything not in this
+# table (e.g. MBbloom--, CMSk-TYPE, or a real type string already) passes through unchanged.
+# The lone value "all" is a separate special case - not a per-token alias, since it replaces the
+# whole list - expanding to DEFAULT_KEY_TYPES lets the existing topk-mode/dfly-to-dfly
+# auto-addition logic below add TopK-TYPE/MBbloom--/CMSk-TYPE on top of it exactly as it already
+# does for the plain default, instead of duplicating that conditional logic here.
+normalize_key_types() {
+  local input="$1" part lower
+  local -a parts out=()
+  if [[ "$(tr '[:upper:]' '[:lower:]' <<< "$input" | tr -d '[:space:]')" == "all" ]]; then
+    echo "$DEFAULT_KEY_TYPES"
+    return
+  fi
+  IFS=',' read -ra parts <<< "$input"
+  for part in "${parts[@]}"; do
+    lower="$(tr '[:upper:]' '[:lower:]' <<< "$part")"
+    case "$lower" in
+      json|rejson-rl) out+=("ReJSON-RL") ;;
+      topk|topk-type) out+=("TopK-TYPE") ;;
+      sortedset|zset) out+=("zset") ;;
+      stream|streams) out+=("stream") ;;
+      cuckoofilter|cf) out+=("MBbloomCF") ;;
+      string|hash|list) out+=("$lower") ;;
+      *) out+=("$part") ;;
+    esac
+  done
+  local IFS=','
+  echo "${out[*]}"
+}
+
+# redis_lib_resolve_key_types - resolves KEY_TYPES in place from KEY_TYPES, DISALLOW_KEY_TYPES,
+# TOPK_MODE and DFLY_TO_DFLY; returns 1, with the reason on stderr, when nothing is left.
+redis_lib_resolve_key_types() {
+  KEY_TYPES="$(normalize_key_types "$KEY_TYPES")"
+
+  # --topk-mode exact (the default) reconstructs TopK keys via RedisScanReader -> ModuleTypeHandler,
+  # so it needs TopK-TYPE in the scan filter; off skips them, deliberately leaving TopK-TYPE out so
+  # RedisScanReader/ModuleTypeHandler never touch the original key.
+  if [[ "$TOPK_MODE" == "exact" ]]; then
+    shopt -s nocasematch
+    if [[ ",$KEY_TYPES," != *",TopK-TYPE,"* ]]; then
+      KEY_TYPES="$KEY_TYPES,TopK-TYPE"
+    fi
+    shopt -u nocasematch
+  fi
+
+  # Bloom (MBbloom--), Cuckoo Filter (MBbloomCF), and CMS (CMSk-TYPE) have no reconstruction path
+  # in ModuleTypeHandler other than --dfly-to-dfly's DUMP/RESTORE fast path, so they're only worth
+  # including in the scan filter at all once that's enabled - otherwise RedisScanReader would just
+  # skip them anyway. Cuckoo Filter support is itself version-gated on Dragonfly's side (confirmed
+  # present in df-v1.40.2, absent in df-v1.39.0), same reasoning as Bloom/CMS otherwise - all three
+  # verified directly with a real DUMP/RESTORE round-trip between two current Dragonfly instances.
+  if [[ "$DFLY_TO_DFLY" == "true" ]]; then
+    shopt -s nocasematch
+    [[ ",$KEY_TYPES," == *",MBbloom--,"* ]] || KEY_TYPES="$KEY_TYPES,MBbloom--"
+    [[ ",$KEY_TYPES," == *",MBbloomCF,"* ]] || KEY_TYPES="$KEY_TYPES,MBbloomCF"
+    [[ ",$KEY_TYPES," == *",CMSk-TYPE,"* ]] || KEY_TYPES="$KEY_TYPES,CMSk-TYPE"
+    shopt -u nocasematch
+  fi
+
+  # --disallow-key-types removes types from the fully-resolved KEY_TYPES (after the default
+  # expansion above AND the topk-mode/dfly-to-dfly auto-additions), regardless of how a type ended
+  # up there - it's a final subtraction, not just a filter on what --key-types itself listed. Runs
+  # through the exact same alias table as --key-types (normalize_key_types) so "topk"/"json"/
+  # "sortedset"/etc. mean the same thing on both flags. Applied before the BAD_TYPES validation
+  # below so disallowing an unsupported type (e.g. --disallow-key-types cuckoofilter without
+  # --dfly-to-dfly) removes it cleanly instead of tripping that check on a type the user just said
+  # not to migrate. --disallow-key-types topk and --topk-mode off end up equivalent for TopK-TYPE -
+  # both just keep it out of the scan filter.
+  if [[ -n "$DISALLOW_KEY_TYPES" ]]; then
+    DISALLOW_KEY_TYPES="$(normalize_key_types "$DISALLOW_KEY_TYPES")"
+    IFS=',' read -ra _KT_KEEP <<< "$KEY_TYPES"
+    IFS=',' read -ra _KT_DENY <<< "$DISALLOW_KEY_TYPES"
+    _KT_OUT=()
+    shopt -s nocasematch
+    for _kt in "${_KT_KEEP[@]}"; do
+      _kt_denied=false
+      for _dt in "${_KT_DENY[@]}"; do
+        [[ "$_kt" == "$_dt" ]] && { _kt_denied=true; break; }
+      done
+      [[ "$_kt_denied" == "true" ]] || _KT_OUT+=("$_kt")
+    done
+    shopt -u nocasematch
+    # `${_KT_OUT[*]}` under this script's `set -u` throws "unbound variable" when _KT_OUT has zero
+    # elements (every type got denied) - a real bash quirk with empty arrays, not something a
+    # length check can be skipped for. Handled explicitly rather than expanding the array at all
+    # in that case. `$(...)` runs in a subshell for the non-empty case, so the `IFS=','` used to
+    # join with commas doesn't leak out and change word-splitting for the rest of this script -
+    # unlike a bare `IFS=',' KEY_TYPES=...` prefix assignment with no command, which would set IFS
+    # permanently in the current shell.
+    if [[ ${#_KT_OUT[@]} -eq 0 ]]; then
+      KEY_TYPES=""
+    else
+      KEY_TYPES="$(IFS=','; echo "${_KT_OUT[*]}")"
+    fi
+    unset _KT_KEEP _KT_DENY _KT_OUT _kt _kt_denied _dt
+    if [[ -z "$KEY_TYPES" ]]; then
+      echo "error: --disallow-key-types removed every type --key-types would otherwise have included - nothing left to migrate" >&2
+      return 1
+    fi
+  fi
+}
