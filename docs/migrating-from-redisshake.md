@@ -13,14 +13,17 @@ through cutover and rollback. For when to choose which tool, see
 ./scripts/import-shake.sh shake.toml -o migrate.toml
 ```
 
-The first line of `migrate.toml` names the script to run it with, for example
-`./continuous-migration.sh --toml-file migrate.toml`. The importer translates what the tables below
-map. It lists everything else as a note on the terminal and as a comment at the top of the file:
-settings with no r2dfly equivalent, places where r2dfly behaves differently, and keys that are not
-RedisShake options at all, which RedisShake ignores without a word. Read the notes before you run
-the file. A Lua `function` is translated only when it matches one of RedisShake's documented
-examples (a prefix filter, a database filter or move, a command-group filter, a prefix rewrite);
-any other function is printed for you to port.
+The first line of `migrate.toml` names the script to run it with, from `scripts/`, for example
+`./continuous-migration.sh --toml-file migrate.toml`. The reader picks the script: `sync_reader`
+(unless `sync_aof = false`) and `scan_reader` with `ksn = true` become a continuous migration;
+anything else, and any config with a `file_writer`, becomes a one-time copy. The importer
+translates what the tables below map. It lists everything else as a note on the terminal and as a
+comment at the top of the file: settings with no r2dfly equivalent, places where r2dfly behaves
+differently, and keys that are not RedisShake options at all, which RedisShake ignores without a
+word. Read the notes before you run the file. A Lua `function` is translated only when it matches
+one of RedisShake's documented examples (a prefix filter, a database filter or move, a
+command-group filter, a prefix rewrite); any other function is printed for you to port.
+`pipeline_count_limit` is not carried over, so the batch sizes keep their defaults.
 
 `./scripts/import-shake.sh --self-test` checks the translation against built-in cases.
 
@@ -38,10 +41,19 @@ The tables below are what it does, for reading a translation or translating by h
 | `aof_reader` | `scripts/simple-migration.sh --source-aof appendonlydir` (a multi-part AOF directory, or one AOF file) |
 | `file_writer` with `type = "json"` | `scripts/simple-migration.sh --target-file backup.jsonl`, loaded back with `--source-file` |
 | `file_writer` with `type = "cmd"` or `"aof"` | `scripts/simple-migration.sh --target-file backup.aof --target-file-format resp` |
+| A one-time copy with no server to manage | `scripts/headless-migration.sh --toml-file migrate.toml` (see below) |
 
-Both scripts deploy NiFi and the r2dfly flow into a container on first use, then run the
-migration. Every flag also has a TOML key, so a whole run can live in one file passed with
-`--toml-file`. See [the quickstart](quickstart.md) for the full key reference.
+`simple-migration.sh` and `continuous-migration.sh` deploy NiFi and the r2dfly flow into a
+container on first use, then run the migration. Every flag also has a TOML key, so a whole run can
+live in one file passed with `--toml-file`. See [the quickstart](quickstart.md) for the full key
+reference.
+
+`headless-migration.sh` runs a one-time copy on NiFi's Stateless engine, with no NiFi server or
+UI, and exits when the copy is done. It takes only the connection settings, the key-type and
+prefix filters, `batch-size`, the prefix rename, the TTL strategy and `migration-id`; any other
+key is an error. It cannot read from a replica or from files, does not migrate search indexes,
+and does not resume after a crash. Its dead-letter records go to
+`./r2dfly-headless-<migration-id>`, or to `--work-dir`.
 
 ## Map the settings
 
@@ -99,7 +111,7 @@ live phase follow them too. See [Transforms](quickstart.md#transforms) for the d
 | `rdb_restore_command_behavior = "skip"` | `conflict-strategy` `SKIP`, set on RedisBatchWriter in NiFi |
 | `rdb_restore_command_behavior = "panic"` | `conflict-strategy` `FAIL`, which dead-letters the one key and carries on rather than stopping the run |
 | `target_redis_max_qps` | No write rate limit. `--max-source-ops-per-sec` and `--max-source-latency-ms` slow the scan instead, to protect the source. |
-| `pipeline_count_limit` | `--batch-size` and its per-type forms |
+| `pipeline_count_limit` | `--batch-size` and its per-type forms (set by hand; the importer leaves the defaults) |
 | `ncpu` | `--parallelism` and `--writer-concurrency`, but measure first: one task each was fastest on the benchmark machine |
 | `empty_db_before_sync` | No equivalent: flush the target yourself if it must start empty |
 | `aws_psync` | Not supported. On ElastiCache, use the default keyspace-notification live source, with notifications enabled in the parameter group. |
@@ -107,26 +119,40 @@ live phase follow them too. See [Transforms](quickstart.md#transforms) for the d
 
 ## What behaves differently
 
-- **The live phase copies keys, not commands.** RedisShake replays each command it reads.
-  r2dfly notes which keys changed and copies each key's current value. A key written a million
-  times while the flow is busy is copied once, and a command replayed after a crash cannot apply
-  twice. In the benchmark, r2dfly caught up after a write burst in about a third of RedisShake's
+- **The live phase copies keys, not commands.** RedisShake replays each command it reads. r2dfly
+  notes which keys changed and copies each key's current value. A key written a million times
+  while the flow is busy is copied once, and a command replayed after a crash cannot apply twice.
+  Newer writes of a key wait behind that key's pending retry, so the retry does not overwrite
+  them. In the benchmark, r2dfly caught up after a write burst in about a third of RedisShake's
   time.
 - **A restart resumes.** The copy restarts from its checkpointed cursors. The replication live
-  source resumes with a partial resync from its saved offset. RedisShake starts over.
+  source resumes with a partial resync from its saved offset. RedisShake starts over, and so does
+  a headless copy.
 - **A cluster can change underneath it.** With `--live-source replication`, a failover continues
   on the promoted replica, resharded keys are copied as they move, and a new shard gets its own
   snapshot. RedisShake's documentation says a topology change stops it.
-- **One bad key does not stop the run.** A key that cannot be copied gets a dead-letter record
-  with its reason, and the flow continues. Read the records in the dead-letter directory
+- **The reconciler deletes target keys the source does not have.** RedisShake does not compare the
+  target with the source. A continuous migration's reconciler deletes every target key that no
+  source key maps to, including data the target held before the migration. If the target holds
+  data you want to keep, set `--reconcile-spare-target-keys` to `ALL_KEYS`, or to
+  `SPARED_PREFIXES` or `SPARED_TYPES` with `--reconcile-spared-prefixes` or
+  `--reconcile-spared-types`. A one-time copy deletes nothing.
+- **One bad key does not stop the run.** In testing, RedisShake stopped at the first error reply
+  from the target. r2dfly gives a key that cannot be copied a dead-letter record with its
+  reason, and the flow continues. Read the records in the dead-letter directory
   (`/opt/nifi/nifi-current/r2dfly-dead-letter` inside the NiFi container). Each key has one
   record. It holds the latest `reason` and `failed_at`, the earlier reasons under `history`
   (newest first, up to 20), the FlowFile's attributes, and its content in `content_base64`. A
   chunk of a large key that failed on its own has a record of its own.
-- **Some module types cannot be copied from Redis.** Dragonfly v2.0.2 rejects Redis's Bloom,
-  Cuckoo and Count-Min Sketch payloads, and has no time series, T-Digest, graph or vector sets.
-  r2dfly dead-letters those keys with the reason. JSON and TopK are rebuilt from their values.
-  See [verified behavior](verified-behavior.md) for exactly what was tested.
+- **Some module types cannot be copied from Redis.** Dragonfly (v2.0.2, and Dragonfly Cloud
+  `df-i1.40.8`) rejects Redis's Bloom, Cuckoo and Count-Min Sketch payloads, and has no time
+  series, T-Digest, graph or vector sets. A Bloom filter does not keep its items, so no tool can
+  rebuild one. r2dfly dead-letters those keys with the reason; the default key types include
+  every module type, so none is skipped silently. JSON and TopK are rebuilt from their values.
+  RedisShake writes module keys with `RESTORE`, so it stops at the first TopK or Bloom key. See
+  [verified behavior](verified-behavior.md) for exactly what was tested.
+- **The summary counts keys the type filter left out.** Keys that `--key-types` or
+  `--disallow-key-types` excludes are reported by type at the end of the run.
 - **Bulk copy is slower.** RedisShake's `sync_reader` copied small keys about 1.7 to 2.1 times
   faster on the benchmark machine. See the
   [measured throughput](r2dfly-vs-redisshake.md#throughput-measured).
@@ -144,9 +170,10 @@ live phase follow them too. See [Transforms](quickstart.md#transforms) for the d
 2. Run `scripts/cutover.sh`. It waits until the live phase is less than `--max-lag-seconds`
    behind, then tells you to stop writes.
 3. Stop application writes to the source, then run `scripts/cutover.sh --writes-stopped`. It
-   waits for the flow to drain, runs full reconcile passes until one finds no difference, and
-   prints the switch checklist. Keys that were not copied block it until you review their
-   dead-letter records and move them out of the directory.
+   waits for the flow to drain, runs full reconcile passes until one finds no difference (up to
+   `--reconcile-rounds`, default 3), and prints the switch checklist. Keys that were not copied
+   block it until you review their dead-letter records and move them out of the directory. Keys
+   of a type you chose to skip are listed but do not block.
 4. Run `scripts/stop-continuous-migration.sh`. It stops every live processor, the reconciler
    included, which would otherwise copy the old source's values back over the application's new
    writes.
@@ -162,6 +189,7 @@ scripts/continuous-migration.sh --source-connection-string <dragonfly> \
   --target-connection-string <old redis> --live-source reconcile --reconcile-interval-ms 60000
 ```
 
-Each full pass copies what changed on Dragonfly, so the old Redis trails by up to one interval.
+Each full pass copies what changed on Dragonfly, and deletes keys from the old Redis that
+Dragonfly no longer has, so the old Redis trails by up to one interval.
 Dragonfly publishes only expiry notifications and does not serve `PSYNC`, so there is no
 continuous change stream in this direction.

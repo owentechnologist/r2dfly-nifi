@@ -169,11 +169,10 @@ guidance, e.g. N <= source Redis / NiFi container CPU headroom, W <= target Drag
   --parallelism N                 concurrent tasks for RedisScanReader, RedisTypeDeserializer,
                                  and ModuleTypeHandler - the scan/read side of the flow (env
                                  PARALLELISM, default: 1). Also sets RedisScanReader's Partition
-                                 Count to N, since NiFi requires the two to match. Redis SCAN
-                                 has no native range-partitioning, so each of the N tasks scans
-                                 the full keyspace and filters to its own partition by key hash -
-                                 more source-side scan overhead per task added, in exchange for
-                                 more parallel throughput through the pipeline.
+                                 Count to N, since the two must match. A standalone or Sentinel
+                                 source is still scanned once, by one task; the other tasks read
+                                 and decode values in parallel. A cluster source's masters are
+                                 dealt out among the N scan tasks, each master scanned once.
   --writer-concurrency N          concurrent tasks for RedisBatchWriter - the write side (env
                                  WRITER_CONCURRENCY, default: 1). Independent of --parallelism;
                                  no benefit raising it past the target Dragonfly's core count.

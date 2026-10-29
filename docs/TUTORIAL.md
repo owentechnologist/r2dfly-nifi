@@ -1,48 +1,65 @@
 # Tutorial: Copy all keys from Redis to Dragonfly with NiFi
 
-> **This is now automatic.** `./deploy-to-nifi.sh` imports the exact flow this
-> tutorial builds — as `r2dfly.json` — into a fresh container via the NiFi CLI
-> (`pg-import`), with the two connection-pool controller services left
-> deliberately unconfigured. After running it you only need to set each pool's
-> **Connection String** property, enable those two services, and start the
-> flow — skip straight to step 4. The walkthrough below is for understanding
-> what got built, changing it, or regenerating `r2dfly.json` after a processor
-> change (build it here, then `nifi pg-export -pgid <id> -o r2dfly.json`).
+> **You do not need to build this by hand.** `./deploy-to-nifi.sh` imports a ready-made
+> flow, `artifacts/r2dfly.json`, into the container with the NiFi CLI (`pg-import`). The
+> imported flow holds everything this tutorial builds, plus the search-index processors,
+> a `RedisDeadLetterWriter` that records every failed key, and a few more connections (see
+> "Handling failures" below). Its two connection pools have no **Connection String**. Set
+> it on each pool, enable those two services, and start the flow: skip to step 4.
+> `simple-migration.sh` and `run-r2dfly.sh` do all of that for you (see
+> [`quickstart.md`](quickstart.md)). Read the walkthrough to understand what the flow does,
+> to change it, or to regenerate `r2dfly.json` after a processor change (build it here, then
+> `nifi pg-export -pgid <id> -o r2dfly.json`).
 
-This walks through starting the local NiFi test container, wiring up the controller
-services the migration processors need, and building a minimal flow that does a
-one-time full copy of every key from a source Redis to a target Dragonfly instance.
+This tutorial starts the local NiFi test container, adds the controller services the
+migration processors need, and builds a minimal flow that copies every key once from a
+source Redis to a target Dragonfly instance.
 
-It only covers the **full-copy scan phase** (`RedisScanReader` → `RedisTypeDeserializer`
-→ `RedisBatchWriter`, plus `RedisScanReader`'s `unknown` relationship → `ModuleTypeHandler`
-for ReJSON-RL/TopK keys) — not the live keyspace-notification phase described in
-[`NIFI_REDIS_MIGRATION_SPEC.md`](../artifacts/NIFI_REDIS_MIGRATION_SPEC.md).
+It covers only the **one-time scan**: `RedisScanReader` → `RedisTypeDeserializer` →
+`RedisBatchWriter`, plus `RedisScanReader`'s `unknown` relationship → `ModuleTypeHandler`
+for module keys. For other ways to run a migration, see [`quickstart.md`](quickstart.md):
 
-`RedisScanReader`'s **Key Type Filter** property controls which types get scanned at all
-(default: `string,hash,list,set,zset,stream`); anything not in that list is skipped
-entirely, not routed anywhere. Add `ReJSON-RL`/`TopK-TYPE` to include those non-core types -
-they go out the `unknown` relationship instead of to
-`RedisTypeDeserializer`, since `RedisTypeDeserializer`/`RedisBatchWriter` only know the six
-core Redis types. `ModuleTypeHandler` reads and writes ReJSON-RL keys directly via
-`JSON.GET`/`JSON.SET`, and TopK keys via `TOPK.INFO`/`TOPK.LIST WITHCOUNT`/`TOPK.RESERVE`/
-`TOPK.ADD` (an approximate reconstruction - membership is preserved, per-item counts are
-not, since it replays each surviving member once rather than replaying its recorded count),
-bypassing the core pipeline entirely. Other module types NiFi's `TYPE` command reports
-(`CMSk-TYPE`, `MBbloom--`, etc.) fall through `ModuleTypeHandler` to its `failure`
-relationship by default - only ReJSON-RL and TopK are implemented that way (spec section
-8.3). See **Dragonfly-to-Dragonfly Optimizations** below for a way to migrate those too.
+- `continuous-migration.sh` adds a Live Phase that keeps applying source changes. It follows
+  keyspace notifications by default, or the replication stream (PSYNC) with
+  `--live-source replication`. `MigrationReconciler` repairs drift, and `cutover.sh` tells
+  you when it is safe to switch.
+- `headless-migration.sh` runs a one-time copy on NiFi's Stateless engine, with no NiFi
+  server or UI.
+- `simple-migration.sh` reads from RDB/AOF files and writes JSON-lines or RESP files
+  (`--source-rdb-file`, `--source-aof`, `--source-file`, `--target-file`).
+- `import-shake.sh` translates a RedisShake config into an r2dfly one.
 
-If **both** source and target are Dragonfly, `ModuleTypeHandler`'s **Dragonfly-to-Dragonfly
-Optimizations** property switches ReJSON-RL, TopK-TYPE, `MBbloom--` (Bloom filter), and
-`CMSk-TYPE` (Count-Min Sketch) keys to a `DUMP`/`RESTORE` fast path instead - a byte-for-byte
-copy of the key's internal serialization, roughly half the round trips of a type-specific
-read-then-rebuild, and (for TopK) exact rather than approximate, since nothing gets replayed
-from scratch. ReJSON-RL and TopK-TYPE fall back to their normal reconstruction above for any
-individual key where `DUMP`/`RESTORE` itself fails; Bloom and CMS have no other
-reconstruction path in this processor, so they're only migrated at all when this is enabled.
-Verified directly between two real Dragonfly instances for all four types - **not safe**
-against a real Redis source/target, or mismatched Dragonfly versions, since `DUMP` payloads
-aren't a portable format.
+`RedisScanReader`'s **Key Type Filter** property sets which types it scans. The
+processor's default is `string,hash,list,set,zset,stream`. It skips a key of any other type
+and counts it in the `Scan Keys Skipped by Type Filter (<type>)` counter; the key is not
+routed anywhere. `run-r2dfly.sh` and `simple-migration.sh` set a wider filter by default:
+every core type and every module type, so each key is copied or dead-lettered with a reason
+(see `--key-types` in `./run-r2dfly.sh --help`).
+
+Module types such as `ReJSON-RL` and `TopK-TYPE` go out the `unknown` relationship to
+`ModuleTypeHandler`, because `RedisTypeDeserializer` and `RedisBatchWriter` handle only the
+six core types. `ModuleTypeHandler` writes module keys to the target itself:
+
+- **ReJSON-RL**: read with `JSON.GET`, written with `JSON.SET`.
+- **TopK**: read with `TOPK.INFO` and `TOPK.LIST WITHCOUNT`, rebuilt with `TOPK.RESERVE` and
+  `TOPK.INCRBY` with each item's recorded count. Dragonfly's TopK can still count a colliding
+  item differently from RedisBloom's; see [`verified-behavior.md`](verified-behavior.md).
+- **Bloom (`MBbloom--`), Cuckoo (`MBbloomCF`), Count-Min Sketch (`CMSk-TYPE`) and unknown
+  module types**: copied with `DUMP`/`RESTORE`. This works between Dragonfly instances.
+  Dragonfly rejects these payloads from Redis, so those keys are not copied.
+- **Time series, T-Digest, graph and vector set keys**: not copied. Dragonfly does not support
+  them.
+
+A key that is not copied goes to the `unsupported` relationship with a
+`redis.incompatible.reason` attribute. While `unsupported` has no connection, these keys go
+to `failure` instead.
+
+If **both** source and target are Dragonfly, set **Dragonfly-to-Dragonfly Optimizations** to
+`true` on `ModuleTypeHandler` (and on `RedisTypeDeserializer`). `ModuleTypeHandler` then copies
+ReJSON-RL and TopK keys with `DUMP`/`RESTORE` too: a byte-for-byte copy with about half the
+round trips. If `DUMP` or `RESTORE` fails for a key, it falls back to the rebuild above.
+`DUMP` payloads are not a portable format, so this is **not safe** with a Redis source or
+target, or between Dragonfly versions that differ.
 
 `RedisScanReader` also has optional **Prefix Deny List**/**Prefix Only List** properties
 (comma-separated key prefixes) for narrowing a migration by key name rather than type - a
@@ -50,20 +67,23 @@ key is skipped if it starts with any Prefix Deny List entry, or (if Prefix Only 
 non-empty) if it *doesn't* start with any Prefix Only List entry. Deny is checked first.
 `run-r2dfly.sh` exposes these as `--prefix-deny-list`/`--prefix-only-list`.
 
-By default, `run-r2dfly.sh` also migrates search indexes, via two more processors already in
-the canvas (`SearchIndexExporter`/`SearchIndexRehydrator`, started/stopped by `run-r2dfly.sh`
-itself, not part of the main scan/write pipeline): `SearchIndexExporter` runs `FT._LIST`/
-`FT.INFO` against the source and caches a normalized definition of each index (in the same
-Cursor State Cache `RedisScanReader` uses); `SearchIndexRehydrator` reads that back and
-rebuilds each index with `FT.CREATE` on the target, before the main flow even starts (the
-index just starts out empty/partially populated and gets kept current by the search module's
-own normal indexing as matching documents are written during the migration). Covers
-`TEXT`/`NUMERIC`/`TAG`/`GEO`/`VECTOR` fields, including `ON JSON` indexes and `AS` aliases; a
-`VECTOR` field is skipped only if `FT.INFO` doesn't report a reconstructable algorithm/
-data_type/dim/distance_metric for it, with a warning. Pass `--ignore-search-indexes` to skip
-search index migration entirely. An index the target already has is left as-is unless you pass
-`--index-overwrite true`, which drops it (`FT.DROPINDEX`) and recreates it from the source's
-definition; either way the conflict is logged as an error, since the two definitions may differ.
+By default, `run-r2dfly.sh` also migrates search indexes. It runs two processors from the
+imported flow once each, before it starts the main flow. They are not connected to the
+scan/write pipeline:
+
+1. `SearchIndexExporter` runs `FT._LIST` and `FT.INFO` on the source and saves each index's
+   definition in the Cursor State Cache.
+2. `SearchIndexRehydrator` reads those definitions and creates each index on the target with
+   `FT.CREATE`. The index starts empty and the target's search module fills it as the
+   migration writes matching keys.
+
+It handles `TEXT`, `NUMERIC`, `TAG`, `GEO` and `VECTOR` fields, including `ON JSON` indexes
+and `AS` aliases. It skips a `VECTOR` field, with a warning, when `FT.INFO` does not report
+its algorithm, data type, dimension and distance metric. Pass `--ignore-search-indexes` to
+skip search indexes. An index the target already has is kept unless you pass
+`--index-overwrite true`, which drops it (`FT.DROPINDEX`) and creates it again from the
+source's definition. Either way the conflict is logged as an error, because the two
+definitions may differ.
 
 ## Prerequisites
 
@@ -105,8 +125,12 @@ From the `scripts/` directory:
 ```
 
 This builds `nifi-redis-migration-nar`, starts (or reuses) a `nifi-redis-migration`
-container, and drops the NAR into NiFi's auto-load directory. When it finishes it
-prints the NiFi URL and, on first run only, a generated single-user login:
+container, and copies the NAR into NiFi's auto-load directory (`nar_extensions/`). It also
+turns off NiFi's provenance recording (pass `--no-disable-provenance` to keep it; see
+`quickstart.md`) and imports `r2dfly.json` if the container has no "R2Dfly Migration"
+process group yet. To build a flow by hand as below, work beside that group or delete it
+first with `./reset-r2dfly-flow.sh`. When it finishes, it prints the NiFi URL and, on first
+run only, a generated single-user login:
 
 ```
 ==> NiFi is up: https://localhost:8443/nifi
@@ -116,9 +140,11 @@ Generated Password [xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
 ```
 
 Copy those down — NiFi prints them only once. `deploy-to-nifi.sh` also saves them
-inside the container, at `/tmp/r2dfly-nifi-credentials.env`, so `simple-migration.sh`,
-`simple-troubleshoot.sh`, and `reset-r2dfly-flow.sh` recover them automatically on
-every later run, even once the log line above is gone for good.
+inside the container, at `/tmp/r2dfly-nifi-credentials.env`. `simple-migration.sh`,
+`continuous-migration.sh`, `simple-troubleshoot.sh`, `diagnose-r2dfly.sh`,
+`reset-r2dfly-flow.sh` and `cutover.sh` read them from there on every later run, even after
+the log lines are gone. `run-r2dfly.sh` does not: pass it `--nifi-user`/`--nifi-password`
+or `--nifi-token`.
 
 If you're locked out anyway — this container predates that feature, or its saved
 copy was somehow lost too — run `./update_nifi_credentials.sh` from `scripts/`. It
@@ -292,7 +318,9 @@ auto-terminate its `success` and `failure` relationships for a minimal flow.
 > this minimal flow, auto-terminate every relationship you're *not* wiring
 > above: on `RedisScanReader`, just `failure` (`unknown` is wired to
 > `ModuleTypeHandler`); on `ModuleTypeHandler`, `success` and `failure`; on
-> `RedisTypeDeserializer`, `key_missing`, `module_type`, and `failure`. Each
+> `RedisTypeDeserializer`, `key_missing`, `module_type`, and `failure`.
+> `ModuleTypeHandler`'s `unsupported` and `RedisBatchWriter`'s `restore_rejected` are
+> auto-terminated by default; while they have no connection, their keys go to `failure`. Each
 > processor's **Relationships** tab (double-click the processor → Relationships)
 > has an auto-terminate checkbox per relationship. See "Handling failures"
 > below for the alternative — routing these somewhere durable instead of
@@ -321,7 +349,15 @@ Leave **Concurrent Tasks** (Scheduling tab) at `1` — it must equal Partition C
 | Property | Set to |
 |---|---|
 | Redis Connection Pool | `Source Redis Pool` |
+| RESTORE Probe Target | empty (default) — or `Target Dragonfly Pool`, as the imported flow sets it |
 | (rest) | defaults are fine for a small test dataset |
+
+With **RESTORE Probe Target** empty, every key is read and written type by type. When it
+names the target pool, the processor tests `DUMP`/`RESTORE` against the target once per type
+and encoding. It then copies keys of each type and encoding that passed with `DUMP`/`RESTORE`.
+If the target rejects a payload anyway, `RedisBatchWriter` sends the key out
+`restore_rejected`; connect that back to `RedisTypeDeserializer` and it reads the key type by
+type. `run-r2dfly.sh --no-restore-fast-path` turns this off.
 
 ### 3c. Configure RedisBatchWriter
 
@@ -329,17 +365,23 @@ Leave **Concurrent Tasks** (Scheduling tab) at `1` — it must equal Partition C
 |---|---|
 | Dragonfly Connection Pool | `Target Dragonfly Pool` |
 | Batch Size | `50` (default; fine for small tests) |
-| Batch Timeout (ms) | `1000` (default) |
+| Batch Timeout (ms) | `30000` (default) |
 | TTL Strategy | `PRESERVE` (default) |
 | Key Prefix Separator | `:` (default) |
 | Conflict Strategy | `OVERWRITE` (default — replaces existing target keys) |
 | Write Confirmation | `true` (default — don't disable this) |
 
 `RedisBatchWriter` has no downstream processor in this minimal flow, so open its
-**Relationships** tab and check **auto-terminate** for all four relationships —
-`success`, `skipped`, `failure`, and `retry` — or it won't validate (see the
-note in step 3 above; "Handling failures" below covers routing these somewhere
-durable instead).
+**Relationships** tab and check **auto-terminate** for `success`, `skipped`, `failure`,
+and `retry`, or it won't validate. Its fifth relationship, `restore_rejected`, is
+auto-terminated by default. See the note in step 3 above; "Handling failures" below
+covers routing these somewhere durable instead.
+
+`RedisBatchWriter` (and `ModuleTypeHandler`) also have **Key Prefix Rename**, **Key Prefix**,
+and **TTL Reset Offset (ms)** properties. `TTL Strategy` takes `PRESERVE`, `STRIP` or `RESET`.
+`run-r2dfly.sh` sets these with `--rename-prefix`, `--ttl-strategy` and
+`--ttl-reset-offset-ms`, and `--transform-script` adds a Groovy hook in front of the writer.
+See "Transforms" in `quickstart.md`.
 
 `run-r2dfly.sh` exposes RedisBatchWriter's batch properties as
 `--batch-size`/`--batch-timeout-ms` — raise these for a remote target where a real
@@ -357,7 +399,7 @@ for a type with unusually large values without also shrinking every other type's
 | Source Connection Pool | `Source Redis Pool` |
 | Target Connection Pool | `Target Dragonfly Pool` |
 | Batch Size | `50` (default; fine for small tests) |
-| Batch Timeout (ms) | `10000` (default — higher than RedisBatchWriter's, since each ReJSON-RL/TopK item needs its own `JSON.GET`/`TOPK.INFO` round trip before the write half of the batch) |
+| Batch Timeout (ms) | `10000` (default — applies to one batch's reads, and again to its writes) |
 | Dragonfly-to-Dragonfly Optimizations | `false` (default) — set `true` only when both source and target are Dragonfly |
 
 `run-r2dfly.sh` exposes these as `--module-batch-size`/`--module-batch-timeout-ms`/`--dfly-to-dfly`.
@@ -391,7 +433,8 @@ docker exec target-dragonfly redis-cli HGETALL user:1
 Cache, keyed by **Migration ID**. Running the flow again with the *same*
 Migration ID will find the partition already marked complete and do nothing.
 To re-scan, either stop/restart `MapCacheServer` (clears its in-memory state) or
-change **Migration ID** to a new value.
+change **Migration ID** to a new value. `run-r2dfly.sh` and `simple-migration.sh` use a new
+Migration ID on every run unless you pass `--migration-id`.
 
 ## 6. Tuning parallelism and container resources
 
@@ -402,26 +445,28 @@ plus the container's own resources:
 
 ### Scan/read parallelism (`RedisScanReader` / `RedisTypeDeserializer` / `ModuleTypeHandler`)
 
-Raise this when the source keyspace is large enough that a single-threaded scan is the
-bottleneck (watch the queue *before* `RedisTypeDeserializer`/`ModuleTypeHandler` growing while
-`RedisBatchWriter`'s stays shallow - that's the scan side falling behind, not the write side).
+Raise this when the read side is the bottleneck: the queue in front of
+`RedisTypeDeserializer`/`ModuleTypeHandler` grows while the queue in front of
+`RedisBatchWriter` stays shallow.
 
 1. Double-click **RedisScanReader** → **Properties** tab → set **Partition Count** to `N`.
-2. Same processor → **Scheduling** tab → set **Concurrent Tasks** to the *same* `N`. NiFi
-   validates these must match - each of the `N` concurrent tasks claims one partition (via a
-   hash-slot range assignment, since Redis `SCAN` has no native range-partitioning; see
-   `NIFI_REDIS_MIGRATION_SPEC.md` section 4.1.1) and every partition needs a task running it.
+2. Same processor → **Scheduling** tab → set **Concurrent Tasks** to the *same* `N`. The
+   Partition Count property requires the two to match.
 3. Double-click **RedisTypeDeserializer** → **Scheduling** tab → set **Concurrent Tasks** to
-   the same `N` (it's downstream of the same partitioned queue, so it needs matching
-   throughput to avoid becoming the new bottleneck).
-4. Double-click **ModuleTypeHandler** → **Scheduling** tab → same `N`, for the same reason on
-   the `unknown`-relationship side (ReJSON-RL/TopK keys).
+   `N`. This is where most of the read work happens: it fetches each key's value.
+4. Double-click **ModuleTypeHandler** → **Scheduling** tab → same `N`, for module keys.
 
-Keep `N` at or below the NiFi container's CPU count (see below) and the source Redis's own
-headroom - each task issues its own `SCAN` calls, so raising `N` past what the source can
-serve just adds contention without more real throughput. `NIFI_REDIS_MIGRATION_SPEC.md`
-section 7.1 has a sizing formula if you want to compute a target `N` from key count and CPU
-cores rather than guessing.
+How the scan splits depends on the source:
+
+- **Standalone or Sentinel source**: partition 0 scans the whole keyspace once, whatever
+  Partition Count says. More scans of one keyspace would only add source load. The extra
+  read throughput comes from `RedisTypeDeserializer`'s Concurrent Tasks.
+- **Cluster source**: the masters are dealt out among the partitions, and each master is
+  scanned once, on its own node.
+
+Keep `N` at or below the NiFi container's CPU count (see below) and the source's headroom.
+`NIFI_REDIS_MIGRATION_SPEC.md` section 7.1 has a sizing formula that computes `N` from key
+count and CPU cores.
 
 ### Write parallelism (`RedisBatchWriter`)
 
@@ -430,7 +475,7 @@ Independent of scan parallelism - raise this when the *write* side is the bottle
 remote/slower target can't keep pace with a single writer's pipeline). Double-click
 **RedisBatchWriter** → **Scheduling** tab → set **Concurrent Tasks** to `W`. There's no
 Partition Count to keep in sync here - each writer task just pulls whatever's queued. Don't
-raise `W` past the target Dragonfly's core count (section 7.2) - Dragonfly's thread-per-core
+raise `W` past the target Dragonfly's core count (spec section 7.2) - Dragonfly's thread-per-core
 design already spreads writes across its own shards by key hash, so more NiFi writers beyond
 that just adds contention on the target.
 
@@ -449,30 +494,36 @@ for your case.
 
 All of the above is what `run-r2dfly.sh --parallelism N --writer-concurrency N` and
 `simple-migration.sh`'s interactive resource/parallelism prompt (or its `--cpus`/`--memory`/
-`--parallelism`/`--writer-concurrency` flags) do for you - they set Partition Count and
-Concurrent Tasks together on all three scan-side processors, set RedisBatchWriter's Concurrent
-Tasks independently, and pass the container resource settings through to `deploy-to-nifi.sh`.
+`--parallelism`/`--writer-concurrency` flags) do for you. `--parallelism N` sets
+RedisScanReader's Partition Count and the Concurrent Tasks of RedisScanReader,
+RedisTypeDeserializer and ModuleTypeHandler. `--writer-concurrency W` sets RedisBatchWriter's
+Concurrent Tasks. `simple-migration.sh` passes `--cpus`/`--memory` to `deploy-to-nifi.sh` as
+`NIFI_CPUS`/`NIFI_MEMORY`.
 Building the flow by hand as in this tutorial is for understanding what those flags actually
 change, or for tuning a flow you built manually rather than imported from `r2dfly.json`.
 
 ## Handling failures (optional, but recommended beyond a quick test)
 
-The spec's design principle is "no fire-and-forget" — every relationship should
-land somewhere durable rather than being left unconnected (an unconnected
-relationship with data flowing to it will build up and eventually apply
-back-pressure, which is NiFi's way of forcing you to deal with it). For a real
-test, connect:
+The spec's design principle is "no fire-and-forget": every failed key should land somewhere
+durable instead of being auto-terminated. The project's sink for this is
+**`RedisDeadLetterWriter`**. It writes one JSON record per failed key, with the reason, to its
+**Output Directory**, raises an ERROR bulletin, and adds to the `migration.failures.total`
+counter. The imported `r2dfly.json` wires it like this:
 
-- `RedisScanReader`'s `failure` relationship
-- `ModuleTypeHandler`'s `failure` relationship (module types it doesn't implement,
-  e.g. `MBbloom--`/`CMSk-TYPE` without Dragonfly-to-Dragonfly Optimizations enabled, or a
-  reconstruction that errored)
-- `RedisTypeDeserializer`'s `key_missing`, `module_type`, and `failure`
-- `RedisBatchWriter`'s `skipped`, `failure`, and `retry` (loop `retry` back to
-  `RedisBatchWriter`'s own input)
+- `RedisScanReader` `failure` → `RedisDeadLetterWriter`
+- `RedisTypeDeserializer` `failure` → `RedisDeadLetterWriter`;
+  `module_type` → `ModuleTypeHandler`; `key_missing` auto-terminated (the key expired
+  between scan and read)
+- `RedisBatchWriter` `failure` → `RedisDeadLetterWriter`; `retry` → back to
+  `RedisBatchWriter`; `restore_rejected` → `RedisTypeDeserializer`; `success` and `skipped`
+  auto-terminated
+- `ModuleTypeHandler` `failure` and `unsupported` → `RedisDeadLetterWriter`; `success`
+  auto-terminated
+- `RedisDeadLetterWriter` `failure` → back to itself; `success` auto-terminated
 
-to a `LogAttribute` processor (or a `PutFile` dead-letter sink) so nothing is
-silently dropped.
+The imported flow's Output Directory is `./r2dfly-dead-letter`, which is
+`/opt/nifi/nifi-current/r2dfly-dead-letter` inside the NiFi container. `simple-migration.sh`
+and `continuous-migration.sh` print how many records a run added there.
 
 ## Troubleshooting
 
@@ -494,3 +545,7 @@ silently dropped.
 - **Locked out of NiFi's login**: see "Copy those down" in step 1 - `simple-migration.sh` and
   the other scripts here recover saved credentials automatically, and `./update_nifi_credentials.sh`
   resets them if even that saved copy is gone.
+- **The flow runs but the target stays short, or stops growing**: see
+  [`debugging-help.md`](debugging-help.md). Check the dead-letter directory first: every key
+  that failed, or that the target cannot hold, has a record there with its reason. Keys left
+  out by the Key Type Filter or a prefix list, and keys that expired mid-copy, have none.

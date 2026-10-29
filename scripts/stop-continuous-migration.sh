@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Stops the Live Phase that continuous-migration.sh left running: reports the keyspace-event
-# counters and the live queues as they stand, stops RedisKeyspaceEventConsumer, RedisSingleKeyFetch
-# and DeleteRedisKey (and nothing else), then reports the counters again. Once this has run, source
+# counters and the live queues as they stand, stops the Live Phase processors (RedisReplicationReader,
+# MigrationReconciler, RedisKeyspaceEventConsumer, RedisSingleKeyFetch, the live RedisTypeDeserializer
+# and DeleteRedisKey, and nothing else), then reports the counters again. Once this has run, source
 # changes are no longer applied to the target.
 set -euo pipefail
 

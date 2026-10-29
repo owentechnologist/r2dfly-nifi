@@ -36,10 +36,10 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @Tags({"redis", "migration", "scan", "source"})
-@CapabilityDescription("Scans the source Redis keyspace, partitioned across concurrent tasks by hash-slot "
-        + "range (cluster mode) or CRC16 modulo (standalone/sentinel), emitting one empty FlowFile per key "
+@CapabilityDescription("Scans the source Redis keyspace, emitting one empty FlowFile per key "
         + "with type/TTL metadata attributes. Routes by data type for downstream processing by "
-        + "RedisTypeDeserializer. Spec section 4.1.")
+        + "RedisTypeDeserializer. A cluster's masters are dealt out among the concurrent tasks; a standalone "
+        + "or Sentinel source is scanned once, by partition 0. Spec section 4.1.")
 public class RedisScanReader extends AbstractProcessor {
 
     public static final PropertyDescriptor REDIS_CONNECTION_POOL = new PropertyDescriptor.Builder()

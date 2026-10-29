@@ -2,19 +2,20 @@
 # One-command Redis -> Dragonfly continuous migration: validates source/target connectivity,
 # reports each side's product and version (INFO SERVER) - which also decides whether to enable the
 # --dfly-to-dfly fast path - confirms the source actually emits keyspace notifications, builds and
-# deploys the processor NAR, starts NiFi if needed, wires a keyspace-notification-driven Live
-# Phase into the flow, and then runs the same initial snapshot simple-migration.sh runs - which is
-# what starts the whole flow, Live Phase included. It exits with NiFi still running: the Live
-# Phase keeps applying source changes to the target until stop-continuous-migration.sh stops it.
+# deploys the processor NAR, starts NiFi if needed, wires a Live Phase into the flow (keyspace
+# notifications by default, PSYNC replication with --live-source replication, or reconcile passes
+# alone with --live-source reconcile), and then runs the same initial snapshot simple-migration.sh
+# runs - which is what starts the whole flow, Live Phase included. It exits with NiFi still
+# running: the Live Phase and MigrationReconciler keep applying source changes to the target until
+# stop-continuous-migration.sh stops them.
 #
 # simple-migration.sh is the snapshot-only tool - use that one when a single one-time copy is all
 # you want and nothing should keep running afterward.
 #
-# "Continuous" here means "keeps applying changes", not "guaranteed to lose nothing". If the
-# keyspace pub/sub connection drops, or the consumer's internal queue fills, the events in that
-# window are counted but never replayed, and nothing repairs the gap - the reconciliation pass
-# that would repair it is not built. Read the LIMITATIONS section in --help before planning a
-# cutover around this.
+# With the keyspace live source, events lost while the pub/sub connection is down or the
+# consumer's queue is full are counted but never replayed; MigrationReconciler's passes repair
+# that gap (a SAMPLE pass finds part of it each time, a FULL pass all of it). Read the LIMITATIONS
+# section in --help before planning a cutover, and use cutover.sh to check it is safe to switch.
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

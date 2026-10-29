@@ -7,32 +7,37 @@
 - 16GB RAM and 8 CPU cores free for the containers this spins up (NiFi, the Maven build, and
   a small helper "toolbox" image)
 
-Nothing else needs to be installed on the host: the NAR is built with a containerized
-Maven+JDK21 (`scripts/deploy-to-nifi.sh`), and `redis-cli`/`python3`/`curl` run from a small
-toolbox image (see `artifacts/toolbox/Dockerfile`, built automatically on first use) rather
-than requiring any of those on the host. All scripts are plain bash and run unmodified on
-RHEL/Fedora, Debian/Ubuntu, and macOS alike.
+You do not need Maven, Java, `redis-cli` or `python3` on the host. `deploy-to-nifi.sh` builds
+the NAR in a Maven + JDK 21 container, and `redis-cli`, `python3` and `curl` run from a small
+toolbox image (`artifacts/toolbox/Dockerfile`), built on first use. `headless-migration.sh` is
+the exception: on its first run it downloads NiFi's Stateless engine with the host's `curl`,
+`unzip` and `shasum` (or `sha256sum`). The scripts are plain bash and run unmodified on
+RHEL/Fedora, Debian/Ubuntu and macOS.
 
-The project is laid out as `scripts/` (every `*.sh` file), `docs/` (this file plus
-`TUTORIAL.md`/`debugging-help.md`), and `artifacts/` (the Maven project, `r2dfly.json`, Lua
-helpers, and the toolbox Dockerfile - everything needed to build and run the flow, but nothing
-you run directly). All commands below assume you're in `scripts/` (`cd scripts`).
+The project has three directories:
 
-All container images are fully-qualified `docker.io` (Docker Hub) references, so pulling them
-never pauses for a registry choice (podman in particular will otherwise prompt interactively
-for an unqualified image name if the host has more than one registry configured). Pulling and
-building shows a progress bar rather than raw layer-by-layer/dependency-by-dependency output;
-pass `--verbose` (or set `VERBOSE=true`) to see the real output instead - useful if a
-pull/build actually fails and you want the full log inline rather than only on failure.
-Starting NiFi for the first time can take a few minutes (JVM cold start, generating a
-self-signed cert, extracting NARs) - the script says so and suggests some light desk yoga
-while you wait.
+- `scripts/`: every script you run, plus sample TOML configs in `scripts/config/` and the
+  headless driver in `scripts/headless/`.
+- `docs/`: this file, `TUTORIAL.md`, `debugging-help.md`, the RedisShake guides and the
+  verified-behavior notes.
+- `artifacts/`: the Maven project, `r2dfly.json`, Lua helpers and the toolbox Dockerfile. The
+  scripts use these; you do not run them directly.
+
+All commands below assume you are in `scripts/` (`cd scripts`).
+
+Every container image is a fully qualified `docker.io` reference, so podman never stops to ask
+which registry to use. Pulls and builds show a progress bar. Pass `--verbose` (or set
+`VERBOSE=true`) to see the full output, for example when a pull or build fails. The first NiFi
+start can take a few minutes (JVM cold start, self-signed certificate, NAR extraction).
+
+To build the NAR without touching any container, run `./deploy-to-nifi.sh --build-only`.
+`deploy-to-nifi.sh` rejects any argument it does not know.
 
 ## Run a migration
 
-`simple-migration.sh` runs a snapshot migration: it scans the source once and makes the target
-match that scan, then exits. It does not track changes made on the source after the scan
-starts - that's `--mode snapshot`, the default and only value. For an ongoing sync that keeps
+`simple-migration.sh` runs a snapshot migration: it scans the source once, makes the target
+match that scan, and exits. It does not copy changes made on the source after the scan starts.
+`--mode snapshot` is the default and the only value it accepts. For an ongoing sync that keeps
 applying source changes until you stop it, use `continuous-migration.sh`
 ([below](#run-a-continuous-migration)).
 
@@ -42,22 +47,33 @@ applying source changes until you stop it, use `continuous-migration.sh`
   --target-connection-string rediss://default:password@target-host:6385
 ```
 
-A `rediss://` connection string automatically enables TLS to that side - no separate flag
-needed.
+A `rediss://` connection string turns on TLS to that side. You do not need a separate flag.
 
-This single command:
+The script runs eight stages:
 
-1. Validates the source and target are reachable
-2. Asks whether to use default container resources/parallelism, or customize them (see
-   [Container resources and migration parallelism](#container-resources-and-migration-parallelism)
-   below) - skipped if you already passed `--cpus`/`--memory`/`--parallelism`/
-   `--writer-concurrency`/`--defaults`, or the shell isn't interactive
-3. Builds the processor NAR and starts NiFi (if not already running)
-4. Authenticates with NiFi
-5. Checks for a pre-existing migration still queued from an earlier run, and if found,
-   prompts to stop it and clear its queues before continuing (see below)
-6. Configures and starts the migration
-7. Prints a summary of keys migrated
+1. Checks that the source and target are reachable, and reads each side's product and version.
+   When both sides report the same Dragonfly version, it turns on the DUMP/RESTORE fast path
+   (`--dfly-to-dfly`).
+2. Asks whether to use the default container resources and parallelism, or to set your own (see
+   [Container resources and migration parallelism](#container-resources-and-migration-parallelism)).
+   It skips the question if you passed `--cpus`, `--memory`, `--parallelism`,
+   `--writer-concurrency` or `--defaults`, or if the shell is not interactive.
+3. Builds the processor NAR and starts NiFi if it is not running. It prints the NiFi URL and
+   login, and in an interactive shell waits for you to press Enter.
+4. Rewrites a `localhost` or `127.0.0.1` connection string to an address the NiFi container can
+   reach, if the container cannot reach it as given.
+5. Logs in to NiFi.
+6. Looks for FlowFiles still queued from an earlier run. If it finds any, it asks before it
+   stops that run and clears its queues (see
+   [Re-running against a container with leftover queued data](#re-running-against-a-container-with-leftover-queued-data)).
+7. Configures and starts the copy.
+8. Prints a summary: source and target key counts, keys copied this run, dead-letter records
+   (keys not copied, each with its reason), and keys that `--key-types` or
+   `--disallow-key-types` left out, by type.
+
+If you are moving from RedisShake, `./import-shake.sh shake.toml -o migrate.toml` translates
+its config into an r2dfly TOML file. The first comment line names the script to run it with. See
+[Migrating from RedisShake](migrating-from-redisshake.md).
 
 ## Run a one-time copy without a NiFi server
 
@@ -70,20 +86,39 @@ This single command:
   --target-connection-string rediss://default:password@target-host:6385
 ```
 
-It reads the same TOML keys as `simple-migration.sh`, limited to the connection strings, modes
-and TLS, `key-types`, `disallow-key-types`, `topk-mode`, the prefix lists, `batch-size`,
-`rename-prefix`, the TTL strategy and `migration-id`. Any other key is an error that names
-`simple-migration.sh`, which supports them all. The first run downloads the Stateless engine
-(about 40 MB, checksum-verified) into `~/.cache/r2dfly`. Each run keeps its flow, log and
-dead-letter records in `./r2dfly-headless-<migration-id>`, or in `--work-dir`. A headless run
-does not resume after a crash: run it again, and it copies everything again.
+It takes only `--toml-file`, the two connection strings and `--work-dir`. The TOML file uses the
+same keys as `simple-migration.sh`, limited to these:
+
+- `[source]` and `[target]`: `connection-string`, `connection-mode`, `require-tls`
+- `[migration]`: `key-types`, `disallow-key-types`, `topk-mode`, `prefix-only-list`,
+  `prefix-deny-list`, `batch-size`
+- `[transform]`: `rename-prefix`, `ttl-strategy`, `ttl-reset-offset-ms`
+- `[run]`: `migration-id`
+
+Any other key is an error that names `simple-migration.sh`, which supports them all. Give the
+TOML path as it is; unlike the other scripts, this one does not look in `scripts/config/`.
+
+Things to know about a headless run:
+
+- The first run downloads the Stateless engine (about 40 MB, checksum-verified) into
+  `~/.cache/r2dfly`, and every run builds the NAR (`deploy-to-nifi.sh --build-only`).
+- Each run keeps its flow, log (`headless.log`) and dead-letter records in
+  `./r2dfly-headless-<migration-id>`, or in `--work-dir`.
+- It does not copy search indexes, and it scans with one partition.
+- `localhost` in a connection string means the container runtime's host (on macOS, its VM).
+- `HEADLESS_JVM_OPTS` passes options to the engine's JVM, for example
+  `HEADLESS_JVM_OPTS=-Xmx4g`.
+- It exits 0 when the copy is complete. On a failure it exits non-zero and prints the last
+  lines of the log. If the scan makes no progress and nothing is queued for five minutes, it
+  stops with exit 3.
+- It does not resume after a crash: run it again, and it copies everything again.
 
 ## Run a continuous migration
 
 `continuous-migration.sh` runs the same copy as `simple-migration.sh`, then keeps applying the
-source's changes to the target until you stop it. By default it follows the source's keyspace
-notifications. It takes no file options, and it refuses `--source-read-from replica`, because a
-replica lags its master.
+source's changes to the target until you stop it. It does not take the file options (RDB, AOF,
+`--source-file`, `--target-file`). It refuses `--source-read-from replica`, because a replica
+lags its master.
 
 ```bash
 ./continuous-migration.sh \
@@ -91,24 +126,30 @@ replica lags its master.
   --target-connection-string rediss://default:password@target-host:6385
 ```
 
-By default the live phase follows the source's keyspace notifications, so the source must have
-them on (`CONFIG SET notify-keyspace-events AE`). The script checks this before it changes
-anything and stops with that instruction if the setting is missing. `--live-source replication`
-follows the source as a replica instead (`PSYNC`): it needs no notifications, sees module commands
-that publish none, resumes after a restart, and follows a cluster through failovers and
-resharding. The source must accept `PSYNC` from NiFi, which managed services often block.
+`--live-source` picks how the live phase sees changes:
 
-The script starts the flow and exits. NiFi keeps running unsupervised and keeps applying source
-changes until you stop it:
+- `keyspace` (default) follows the source's keyspace notifications, so the source must have them
+  on (`CONFIG SET notify-keyspace-events AE`). The script checks this before it changes anything
+  and stops with that instruction if the setting lacks `A` or `E`. If the source refuses
+  `CONFIG GET` (as managed services do), it warns and continues; `--require-config-check` makes
+  that an error, and `--skip-keyspace-check` skips the check.
+- `replication` follows the source as a replica (`PSYNC`). It needs no notifications, sees module
+  commands that publish none, resumes after a restart, and follows a cluster through failovers
+  and resharding. The source must accept `PSYNC` from NiFi, which managed services often block.
+- `reconcile` has no change stream: each reconcile pass copies what differs. It is the rollback
+  path after cutover, with Dragonfly as the source; see `./cutover.sh --help`.
+
+The script starts the flow and exits. NiFi keeps applying source changes until you stop it:
 
 ```bash
-./stop-continuous-migration.sh --nifi-container nifi-redis-migration
+./stop-continuous-migration.sh
 ```
 
-Like the migration scripts, it reads the NiFi login from the container; pass `--nifi-user` and
-`--nifi-password` if the container no longer has it. Running `simple-migration.sh` against the
-same NiFi also turns a continuous run's live phase off, and the next `continuous-migration.sh`
-turns it back on.
+It stops only the live-phase processors and MigrationReconciler. It reads the NiFi login from the
+container, like the migration scripts. Pass `--nifi-container` if NiFi runs in a container other
+than `nifi-redis-migration`, and `--nifi-user` and `--nifi-password` if the container no longer
+has the login. Running `simple-migration.sh` against the same NiFi also turns a continuous run's
+live phase off, and the next `continuous-migration.sh` turns it back on.
 
 With keyspace notifications, a dropped pub/sub connection loses the changes made during the
 outage. The stop script prints the `Keyspace Pub/Sub Disconnects` and `Keyspace Pub/Sub Downtime
@@ -127,65 +168,79 @@ keys of those types. The counter `Reconcile Target-Only Keys Spared` counts what
 With `--live-source replication`, the reconciler starts only once the replication reader has
 connected to every source master, and `continuous-migration.sh` waits up to 300 seconds for that.
 
-To switch the application over, run `./cutover.sh`. It says when the live phase has caught up,
-and with `--writes-stopped` it confirms the target with a final full reconcile and prints the
-steps to switch. [Migrating from RedisShake](migrating-from-redisshake.md#cut-over) walks through
-cutover and rollback.
+To switch the application over, run `./cutover.sh`. It waits until the live phase has caught up,
+then tells you to stop application writes. Run it again with `--writes-stopped`: it waits for the
+flow to drain, runs FULL reconcile passes until one finds no difference, and prints the steps to
+switch. `./cutover.sh --status` checks once and exits 0 when it is safe to cut over.
+[Migrating from RedisShake](migrating-from-redisshake.md#cut-over) walks through cutover and
+rollback.
 
 ## Options
 
-These options apply to `simple-migration.sh` and `continuous-migration.sh` alike.
-`continuous-migration.sh` takes no `--mode` and no file options, and adds `--live-source`,
+These options apply to `simple-migration.sh` and `continuous-migration.sh` alike, except where
+noted. `continuous-migration.sh` takes no `--mode` and no file options. It adds `--live-source`,
 `--reconcile-mode`, `--reconcile-interval-ms`, `--reconcile-sample-size`,
-`--reconcile-spare-target-keys`, `--reconcile-spared-prefixes`, `--reconcile-spared-types`, `--keyspace-pattern`,
-`--event-types`, `--max-queue-depth`, `--skip-keyspace-check`, `--require-config-check` and
-`--reconciliation-signals`; see its `--help`.
+`--reconcile-spare-target-keys`, `--reconcile-spared-prefixes`, `--reconcile-spared-types`,
+`--keyspace-pattern`, `--event-types`, `--max-queue-depth`, `--skip-keyspace-check`,
+`--require-config-check` and `--reconciliation-signals`; see its `--help`. Each script's
+`--help` also lists the environment variable for every option.
 
 ```
---source-connection-string S  redis://[:password@]host:port[/db] (or rediss:// for TLS -
-                               a rediss:// scheme automatically enables TLS to that side)
+--source-connection-string S  redis://[:password@]host:port[/db], or rediss:// for TLS
 --target-connection-string S  same format, for the Dragonfly target
---source-require-tls          force TLS to the source (implied by a rediss:// source string)
---target-require-tls          force TLS to the target (implied by a rediss:// target string)
+--source-connection-mode M    standalone (default), sentinel or cluster
+--target-connection-mode M    same, for the target
+--source-require-tls          force TLS to the source (implied by a rediss:// string)
+--target-require-tls          force TLS to the target (implied by a rediss:// string)
 --nifi-container NAME         container to run NiFi in (default: nifi-redis-migration)
---nifi-user USER              use existing NiFi credentials instead of reading the
---nifi-password PASSWORD      auto-generated ones from the container's logs
+--nifi-user USER              NiFi login; by default the script reads it from the
+--nifi-password PASSWORD      container's logs, or from the copy saved inside the container
+--migration-id ID             checkpoint id (default: a fresh r2dfly-<epoch seconds> per run)
 --cpus N                      CPU limit for the NiFi container (default: none)
 --memory SIZE                 memory limit for the NiFi container, e.g. 4g (default: none)
---parallelism N                concurrent tasks for the scan/read side of the flow, and
-                               RedisScanReader's Partition Count (default: 1)
---writer-concurrency N          concurrent tasks for the write side of the flow (default: 1)
---key-types LIST               comma-separated Redis types to scan/migrate (default: every core
-                               type and every module type; each key is copied or dead-lettered
-                               with its reason. See run-r2dfly.sh --help for the aliases and
-                               the TopK/dfly-to-dfly interaction notes)
---disallow-key-types LIST       comma-separated Redis types to exclude from whatever
-                               --key-types would otherwise include (accepts the same
-                               type strings/aliases; see run-r2dfly.sh --help for exactly
-                               when this is applied relative to --topk-mode/--dfly-to-dfly).
-                               The summary counts the keys these filters leave out, by type.
---prefix-deny-list LIST         comma-separated key prefixes to exclude (see run-r2dfly.sh --help)
---prefix-only-list LIST         comma-separated key prefixes to exclusively migrate (see
-                               run-r2dfly.sh --help)
---topk-mode MODE               exact (default) or off (see run-r2dfly.sh --help)
---dfly-to-dfly                 force-enable the DUMP/RESTORE fast path (normally auto-detected)
---no-dfly-to-dfly              force-disable it
---toml-file FILE               load any/all of the above from a TOML config file - see
-                               [Using a TOML config file](#using-a-toml-config-file) below
---disable-provenance           turn NiFi's provenance recording off (default: on) - see [Disk space and
-                               --disable-provenance](#disk-space-and---disable-provenance) below
---no-disable-provenance        restore this project's own provenance defaults (1GB, full lineage/audit
-                               history) instead, if you actually want that and have the disk
---defaults                    skip the resource/parallelism prompt and use the defaults above
---verbose                     show real container image pull/build/download output instead of
-                               a progress bar
--y, --yes                     don't prompt before stopping/clearing a pre-existing migration
+--parallelism N               concurrent tasks for the scan/read side of the flow, and
+                              RedisScanReader's Partition Count (default: 1)
+--writer-concurrency N        concurrent tasks for the write side of the flow (default: 1)
+--key-types LIST              comma-separated Redis types to copy (default: every core type
+                              and every module type; each key is copied or dead-lettered with
+                              its reason). See run-r2dfly.sh --help for the aliases and the
+                              TopK and --dfly-to-dfly notes
+--disallow-key-types LIST     comma-separated types to remove from what --key-types would
+                              otherwise include (same names and aliases). The summary counts
+                              the keys these two filters leave out, by type
+--prefix-deny-list LIST       comma-separated key prefixes to skip (checked first)
+--prefix-only-list LIST       comma-separated key prefixes to copy, and nothing else
+--topk-mode MODE              exact (default) or off
+--dfly-to-dfly                force the DUMP/RESTORE fast path on (normally auto-detected)
+--no-dfly-to-dfly             force it off
+--no-restore-fast-path        copy every core-type key with the typed read and write, instead
+                              of probing the target and using DUMP/RESTORE where it works
+--source-read-from WHERE      master (default) or replica; replica is for one-time copies
+                              only, and continuous-migration.sh refuses it
+--max-source-latency-ms N     pause the scan while a page takes longer than N ms (default: 0, off)
+--max-source-ops-per-sec N    pause the scan while the source is above N ops/s (default: 0, off)
+--no-read-encoding            skip OBJECT ENCODING for each scanned key
+--claim-timeout-ms N          take over a dead node's scan partition after N ms (default: 300000)
+--batch-size N                RedisBatchWriter's batch size (default: 50); --batch-size-string,
+                              -hash, -list, -set, -zset and -stream override it per type
+--module-batch-size N         ModuleTypeHandler's batch size (default: 50); --batch-size-json,
+                              --batch-size-topk and --batch-size-bloom-cms override it per type
+--toml-file FILE              load any of these from a TOML file (see "Using a TOML config
+                              file" below)
+--disable-provenance          turn NiFi's provenance recording off (the default; see "Disk
+                              space and --disable-provenance" below)
+--no-disable-provenance       keep provenance recording on, with this project's own limits
+                              (1 GB of full lineage history)
+--defaults                    skip the resource and parallelism question and use the defaults
+--verbose                     show full image pull and build output instead of a progress bar
+-y, --yes                     do not ask before stopping and clearing a pre-existing migration
 ```
 
 ## Transforms
 
 These options change what lands on the target. `simple-migration.sh` and
 `continuous-migration.sh` both take them, and each has a key in the `[transform]` TOML section.
+`headless-migration.sh` takes all but the script, through its TOML file.
 
 ```
 --rename-prefix RULES        comma-separated old=new key prefix rules, e.g. user:=account:
@@ -210,10 +265,12 @@ already sits under a new prefix would be overwritten by a renamed key, so it is 
 with that reason instead of copied. The prefix filters (`--prefix-only-list`,
 `--prefix-deny-list`) match the source names, before the rename.
 
-**TTL strategy.** `preserve` copies the TTL each key has left. `strip` writes every key without
-a TTL. `reset` adds `--ttl-reset-offset-ms` to each remaining TTL, which gives the application
-time to settle after cutover. A key without a TTL gets none either way. The reconciler expects
-the TTLs the strategy produces, so it does not report them as differences.
+**TTL strategy.** `preserve` copies the TTL each key has left, less the time the key spent in
+the flow, so a copy never outlives its source key. A key whose TTL ran out on the way gets 1 ms
+and expires on the target too. `strip` writes every key without a TTL. `reset` adds
+`--ttl-reset-offset-ms` to each remaining TTL, which gives the application time to settle after
+cutover. A key without a TTL gets none either way. The reconciler expects the TTLs the strategy
+produces, so it does not report them as differences.
 
 **Database remap.** A run copies one database. Give each side's connection string its database,
 `redis://source:6379/3` and `redis://target:6379/5`, to copy database 3 into database 5. A
@@ -320,7 +377,12 @@ would write.
 Things to know about writing to a file:
 
 - Only string, hash, list, set, sorted set and stream keys are written. Module keys (JSON, TopK,
-  Bloom) are skipped, and NiFi counts them under "Scan Keys Skipped by Type Filter".
+  Bloom) are skipped. NiFi counts them under "Scan Keys Skipped by Type Filter", and the
+  summary lists them as keys left out by the key-type filter.
+- `--target-file` writes keys as the source holds them, so it refuses `--rename-prefix`,
+  `--transform-script` and any `--ttl-strategy` other than `preserve`. Give those when you load
+  the file with `--source-file`.
+- An existing file is never overwritten; the script stops instead.
 - TTLs are stored as time remaining, so they count from when the file is loaded, not from when
   it was written. Stream delivery times are absolute.
 - A big hash or list that the flow splits into chunks is joined back into one line.
@@ -336,44 +398,52 @@ readable, and switches to base64 only where the bytes are not valid UTF-8:
 - A key record whose key name is not UTF-8 has `"key_base64": true`, and its `key` is base64.
 - A key record with any value that is not UTF-8 has `"base64": true`, and every byte string in
   its value is base64: a string's value, hash fields and values, list, set and sorted-set
-  members, and stream field names and values. Stream entry ids, scores and TTLs stay as they are.
+  members, stream field names and values, and stream consumer group and consumer names. Stream
+  entry ids, scores and TTLs stay as they are.
 - A FlowFile whose key name is not UTF-8 carries the exact bytes in `redis.key.base64`;
   `redis.key` then shows the name with replacement characters, for people only.
 
-Stream consumer group and consumer names are carried as UTF-8 text, so a name that is not valid
-UTF-8 is not copied exactly.
+Dragonfly cuts a stream consumer name at its first zero byte (Redis keeps it), so two consumers
+whose names differ only after a zero byte become one consumer on Dragonfly. Group names keep
+every byte.
 
 ## Using a TOML config file
 
-Instead of (or alongside) flags, `--toml-file FILE` loads settings from a TOML file. `FILE` is
-looked up as given first (a path relative to the current directory, or absolute); if that
-doesn't exist, `scripts/config/FILE` is tried next - that's where the sample configs below
-live, and the natural place to keep your own.
+`--toml-file FILE` loads settings from a TOML file, in place of flags or alongside them.
+`simple-migration.sh` and `continuous-migration.sh` look for `FILE` as given (relative to the
+current directory, or absolute), then in `scripts/config/`, where the sample configs live.
+`headless-migration.sh` takes a subset of the keys and looks only where you point it (see
+[above](#run-a-one-time-copy-without-a-nifi-server)).
 
 ```bash
 ./simple-migration.sh --toml-file source-cluster-hefty-box-config.toml
 ```
 
-Any flag also given on the command line overrides the corresponding TOML setting, regardless
-of where `--toml-file` appears among the other flags - so a config file can hold your usual
-settings while a flag overrides just one of them for a single run:
+A flag on the command line overrides the same TOML setting, wherever `--toml-file` appears. So a
+config file can hold your usual settings while a flag changes one of them for a single run:
 
 ```bash
 ./simple-migration.sh --toml-file source-cluster-hefty-box-config.toml --parallelism 8
 ```
 
-Every flag has a TOML key, grouped into sections, and most keys are the flag's name without
-`--`. The exceptions are the on/off flags, whose key takes `true` or `false`
-(`restore-fast-path = false` for `--no-restore-fast-path`), and a few renamed under their section:
-`[transform] script` is `--transform-script`, `[live] source` is `--live-source`, and
-`[run] migration-id` is `--migration-id`. An unknown key is reported as a warning. You don't
-need to set every key - anything left out falls back to the script's own default:
+Every flag has a TOML key in a section. Most keys are the flag's name without `--` and without
+the section's name: `[source] connection-string` is `--source-connection-string`, and
+`[migration] batch-size` is `--batch-size`. The exceptions:
+
+- On/off flags take `true` or `false`: `restore-fast-path = false` is `--no-restore-fast-path`,
+  and `read-encoding = false` is `--no-read-encoding`.
+- `[transform] script` is `--transform-script`, and `[live] source` is `--live-source`.
+- The other live-phase flags keep their full name under `[live]`, for example
+  `[live] reconcile-mode` (`continuous-migration.sh` only).
+
+Leave out any key you do not need; it falls back to the script's default:
 
 ```toml
 [source]
 connection-string = "redis://source-host:6379"   # --source-connection-string
 connection-mode = "standalone"                    # --source-connection-mode
 require-tls = false                               # --source-require-tls
+read-from = "master"                              # --source-read-from
 
 # Files instead of a server (simple-migration.sh only); give one source and one target.
 # rdb-file = "dump.rdb"                           # --source-rdb-file
@@ -406,6 +476,12 @@ prefix-deny-list = ""                              # --prefix-deny-list
 prefix-only-list = ""                              # --prefix-only-list
 topk-mode = "exact"                                # --topk-mode
 dfly-to-dfly = true                                # --dfly-to-dfly / --no-dfly-to-dfly
+batch-size = 50                                    # --batch-size
+
+# continuous-migration.sh only
+[live]
+source = "keyspace"                                # --live-source
+reconcile-mode = "SAMPLE"                          # --reconcile-mode
 
 [run]
 defaults = true                                    # --defaults
@@ -415,8 +491,8 @@ migration-id = "r2dfly-orders"                     # --migration-id
 disable-provenance = true                          # --disable-provenance / --no-disable-provenance
 ```
 
-An unrecognized section or key is a warning (likely a typo), not a silent no-op or a hard
-error. Several annotated samples ship in `scripts/config/`:
+An unknown section or key, usually a typo, prints a warning and is ignored. These annotated
+samples ship in `scripts/config/`:
 
 - `source-cluster-hefty-box-config.toml` - a real Redis Cluster source, migrated onto a bigger
   host with parallelism/resources turned up
@@ -432,47 +508,42 @@ error. Several annotated samples ship in `scripts/config/`:
 
 ## Disk space and --disable-provenance
 
-NiFi's provenance repository logs a fine-grained lineage event (CREATE, ATTRIBUTES_MODIFIED,
-etc.) for every FlowFile that passes through the flow - its disk usage grows with FlowFile
-**count**, entirely independent of whether the migration is actually making progress writing to
-the target. The default cap (`nifi.provenance.repository.max.storage.size`) is 10GB - larger
-than the entire disk on a small host.
+NiFi's provenance repository logs a lineage event (CREATE, ATTRIBUTES_MODIFIED and so on) for
+every FlowFile in the flow. Its disk use grows with the number of FlowFiles, whether or not the
+migration is writing to the target. NiFi's default cap
+(`nifi.provenance.repository.max.storage.size`) is 10 GB, larger than the whole disk on a small
+host.
 
-This was confirmed directly as the root cause of a real stuck migration: on a 7.6GB host, the
-provenance repository's Lucene index grew until the disk filled completely, after which *every*
-write path in NiFi - provenance indexing, FlowFile repository checkpointing, and eventually
-`RedisBatchWriter`'s own writes to the target - started failing with `IOException: No space
-left on device` in a loop. The visible symptom was silent and confusing: the target sat at 0
-keys/0 bytes written the whole time, with no clearer error surfaced anywhere in this tool's own
-output (only `nifi-app.log` showed the real cause).
+This stalled real migrations in two ways:
 
-A cap alone did not prevent the second way it stalls: the repository still indexes every event
-in Lucene, and after about 25 million keys over several runs on NiFi 2.11 its index queue filled until every
-session commit in the flow blocked, and stayed blocked after the flow was stopped.
+- On a 7.6 GB host, the repository's Lucene index filled the disk. Every write path in NiFi then
+  failed with `IOException: No space left on device` in a loop, including RedisBatchWriter's
+  writes. The target stayed at 0 keys, and only `nifi-app.log` showed the cause.
+- With a cap, the repository still indexes every event. After about 25 million keys over several
+  runs on NiFi 2.11, its index queue filled until every session commit in the flow blocked, and
+  stayed blocked after the flow was stopped.
 
-**So provenance is off by default** - `--disable-provenance` is on unless you say otherwise. It
-sets `nifi.provenance.repository.implementation` to NiFi's own `NoOpProvenanceRepository`, which
-records nothing, restarting the NiFi container to apply it if it isn't already set (a no-op,
-safe to pass on every run, once it is). Failures stay visible without it: every failed key has
-a dead-letter record with its reason, and processors raise bulletins.
+**So provenance is off by default.** `--disable-provenance` sets
+`nifi.provenance.repository.implementation` to NiFi's `NoOpProvenanceRepository`, which records
+nothing. It restarts the NiFi container to apply the change, and does nothing when the setting
+is already in place, so it is safe on every run. Failures stay visible: every key that is not
+copied has a dead-letter record with its reason, and processors raise bulletins.
 
-Pass `--no-disable-provenance` instead if you actually want NiFi's fine-grained lineage/audit
-history for the migration and the host has the disk for it (this project's own default is a 1GB
-cap, well under NiFi's own 10GB shipped default) - this also restarts the container if a
-previous default-on run turned it off, restoring the WriteAheadProvenanceRepository with this
-project's own defaults.
+Pass `--no-disable-provenance` if you want lineage history and the host has the disk. It
+restores `WriteAheadProvenanceRepository` with a 1 GB cap, and restarts the container if an
+earlier run turned provenance off.
 
 ## Re-running against a container with leftover queued data
 
-If a previous run left FlowFiles queued (e.g. it was interrupted), the next run detects
-this, prints what it found, and asks:
+If an earlier run left FlowFiles queued (for example, it was interrupted), the next run lists
+them and asks:
 
 ```
 Any pre-existing migration will be stopped and its queued data cleared. Proceed? [Y/n]
 ```
 
-Answering `n` aborts without changing anything. Pass `-y`/`--yes` to skip the prompt (e.g.
-for non-interactive/scripted runs - a non-interactive shell also proceeds automatically).
+Answer `n` to stop without changing anything. Pass `-y` or `--yes` to skip the question. A
+non-interactive shell proceeds without asking.
 
 ## Examples
 
@@ -484,8 +555,7 @@ Local test containers, no TLS:
   --target-connection-string redis://target-dragonfly:6379
 ```
 
-Cloud target requiring TLS (the `rediss://` scheme takes care of it, no `--target-require-tls`
-needed):
+Cloud target that requires TLS (the `rediss://` scheme turns it on):
 
 ```bash
 ./simple-migration.sh \
@@ -493,7 +563,8 @@ needed):
   --target-connection-string rediss://default:mypassword@my-instance.dragonflydb.cloud:6385
 ```
 
-Re-running against a container you already have NiFi credentials for:
+A container whose NiFi login the script cannot read any more (normally it reads the login
+itself):
 
 ```bash
 ./simple-migration.sh \
@@ -504,10 +575,9 @@ Re-running against a container you already have NiFi credentials for:
 
 ## Migrating a Redis/Dragonfly Cluster
 
-`--source-connection-mode`/`--target-connection-mode` select `standalone` (default), `sentinel`,
-or `cluster` independently per side - either side, or both, can be a real Redis/Valkey/Dragonfly
-Cluster. In `cluster` mode, the corresponding `--*-connection-string` is a comma-separated list
-of seed nodes instead of a single host:port:
+`--source-connection-mode` and `--target-connection-mode` each take `standalone` (default),
+`sentinel` or `cluster`, so either side or both can be a Redis, Valkey or Dragonfly cluster. In
+`cluster` mode, that side's connection string is a comma-separated list of seed nodes:
 
 ```bash
 ./simple-migration.sh \
@@ -516,36 +586,34 @@ of seed nodes instead of a single host:port:
   --target-connection-string redis://target-dragonfly:6379
 ```
 
-Migrating into a clustered Dragonfly target ("swarm") works the same way - just set
-`--target-connection-mode cluster` and pass its seed nodes. **The target cluster's slot layout
-must already be assigned before you run this** (via DragonflyDB Cloud, or a manual
-`DFLYCLUSTER CONFIG` push) - this tool only verifies that's already true, it never provisions
-or bootstraps a cluster's slots itself.
+For a clustered Dragonfly target ("swarm"), set `--target-connection-mode cluster` and pass its
+seed nodes. **Assign the target cluster's slots before you run this** (through Dragonfly Cloud,
+or a manual `DFLYCLUSTER CONFIG` push). The tool checks that the slots are assigned; it never
+assigns them.
 
-Before configuring or starting anything, each `cluster` side gets a pre-flight check:
+Before it configures or starts anything, the script checks each `cluster` side:
 
 - `CLUSTER INFO` must report `cluster_state:ok`.
-- Every master's slot ranges must union to full coverage (0-16383) with no gaps or overlaps,
-  no node flagged `fail`/`fail?`, and no slot caught mid-migration (an importing/migrating
-  marker) - any of these aborts the run with the specific problem named, before anything is
-  touched.
-- A cluster-aware key count: `DBSIZE` summed across every master node (not just the one seed
-  node you passed), printed per-node and as a total, so the pre-migration count is accurate for
-  a clustered side instead of reflecting only one shard.
+- The masters' slot ranges must cover 0-16383 with no gaps. No node may be flagged
+  `fail` or `fail?`, and no slot may be mid-migration (importing or migrating). Any of these
+  stops the run, with the problem named, before anything changes.
+- It sums `DBSIZE` over every master, not just the seed node you passed, and prints each node's
+  count and the total.
 
-This is a safety gate, not a fix-it tool - if a target cluster isn't fully slot-covered and
-healthy, the run aborts and tells you to provision it first.
+If a target cluster is not fully covered and healthy, the run stops and tells you to fix it
+first.
 
 ## Container resources and migration parallelism
 
 The default configuration runs everything single-threaded with no CPU/memory limit on the
 NiFi container - fine for a quick test or a small dataset. Change it when:
 
-- **The source keyspace is large** (many millions of keys) and a single-threaded scan is too
-  slow. Raise `--parallelism N` to drive N concurrent RedisScanReader/RedisTypeDeserializer/
-  ModuleTypeHandler tasks - each scans the full keyspace but only processes the fraction that
-  hashes to its own partition, so more of the scan happens in parallel. `N` should stay under
-  the NiFi container's CPU count (see `--cpus` below) and the source Redis's own headroom.
+- **The source keyspace is large** (many millions of keys) and reading values is too slow.
+  Raise `--parallelism N` to run N concurrent RedisScanReader, RedisTypeDeserializer and
+  ModuleTypeHandler tasks. A standalone or Sentinel source is still scanned once, by one task;
+  the extra tasks read and decode values in parallel. On a cluster source the masters are dealt
+  out among the N scan tasks, each scanned once. Keep `N` under the NiFi container's CPU count
+  (see `--cpus` below) and within the source's headroom.
 - **The target is remote or otherwise slower to write to than to scan from**, and the
   connection queues between RedisScanReader and RedisBatchWriter keep growing. Raise
   `--writer-concurrency N` independently of `--parallelism` - there's no benefit setting it
@@ -559,18 +627,19 @@ NiFi container - fine for a quick test or a small dataset. Change it when:
   `NIFI_JVM_HEAP_MAX` yourself - otherwise the container gets more RAM but NiFi's heap stays at
   its small image default and can't use it.
 
-`simple-migration.sh` asks for these interactively the first time (or use `--defaults` /
-pass any of the flags directly to skip the prompt, e.g. for scripted runs). Once NiFi is
-already running, `run-r2dfly.sh --parallelism N --writer-concurrency N` re-applies new values
-to an in-place flow without recreating the container - see `artifacts/NIFI_REDIS_MIGRATION_SPEC.md`
-section 7 for the underlying sizing formulas, or `TUTORIAL.md`'s "Tuning parallelism and
-container resources" section for how to change the same settings by hand in the NiFi canvas.
+`simple-migration.sh` asks for these when you run it interactively. Pass `--defaults`, or any of
+the flags, to skip the question. Once NiFi is running,
+`run-r2dfly.sh --parallelism N --writer-concurrency N` applies new values to the existing flow
+without recreating the container. Unlike the other scripts, `run-r2dfly.sh` does not read the
+NiFi login itself: pass `--nifi-user` and `--nifi-password`, or `--nifi-token`. For the sizing
+formulas, see section 7 of `artifacts/NIFI_REDIS_MIGRATION_SPEC.md`. To change the same settings
+by hand in the NiFi canvas, see "Tuning parallelism and container resources" in `TUTORIAL.md`.
 
 ## Advanced usage
 
-For anything beyond the default migration - custom key-type filters, TopK modes, batch
-tuning, Dragonfly-to-Dragonfly optimizations, prefix filters, search index migration
-control, etc. - use `run-r2dfly.sh` directly:
+`run-r2dfly.sh` configures and starts the flow that the migration scripts set up, and takes
+options they do not pass on, such as search index control and progress polling. It needs the
+NiFi login (`--nifi-user` and `--nifi-password`, or `--nifi-token`). See its help:
 
 ```bash
 ./run-r2dfly.sh --help
@@ -593,16 +662,19 @@ non-Redis data into Dragonfly as a hash or a native JSON document, so search ind
   `SELECT * FROM orders WHERE id > ${cursor} ORDER BY id`). Unlike the bundled
   `QueryDatabaseTableRecord`, this isn't limited to one whole table - any query shape works,
   including joins. Set `Cursor Column` to enable cursor tracking; leave it unset to just
-  rerun the same query on a schedule. **The processor persists the last fetched row's value
-  for that column, not a computed maximum, so the query itself must `ORDER BY` that column
-  ascending** or rows get silently skipped. A numeric cursor also needs a guard against the
-  empty string it starts as, e.g. `CAST(COALESCE(NULLIF('${cursor}', ''), '0') AS INT)`.
+  rerun the same query on a schedule. **The processor saves the last fetched row's value for
+  that column, not a computed maximum, so the query must `ORDER BY` that column ascending**, or
+  rows are skipped without warning. On the first run `${cursor}` is the `Initial Cursor Value`
+  property, or an empty string when that is unset. A numeric cursor with no initial value needs
+  a guard, for example `CAST(COALESCE(NULLIF('${cursor}', ''), '0') AS INT)`.
 
-Wire them as `ExecuteSQLIncremental` (or `ConsumeKafka`/`FetchFile`/`GetMongoRecord`/any other
-NiFi source with a Record Reader) → `RecordToKeyRecord` → the existing `RedisBatchWriter`.
+Wire them as `ExecuteSQLIncremental` (or `ConsumeKafka`, `FetchFile`, `GetMongoRecord` or any
+other NiFi source with a Record Reader) → `RecordToKeyRecord` → `RedisBatchWriter`.
 
-**There is no one-command script for this yet** - no `--source-connection-string`-style
-wrapper, and `r2dfly.json` doesn't include these processors. Build the flow by hand in the
-NiFi canvas or via its REST API today; `deploy-to-nifi.sh` still builds and loads the NAR
-containing both processors, so they're available to drag onto the canvas as soon as NiFi is
-up.
+For delimited files (TSV, CSV or a custom delimiter), `simple-ingest-file.sh --toml-file FILE`
+builds this flow for you through NiFi's REST API, reading from a local path or an S3-compatible
+bucket. `scripts/config/simple-ingest-file-example.toml` shows its settings.
+
+For other sources there is no script, and `r2dfly.json` does not include these processors.
+Build the flow in the NiFi canvas or through its REST API. `deploy-to-nifi.sh` loads the NAR
+that holds both processors, so they are on the canvas palette once NiFi is up.

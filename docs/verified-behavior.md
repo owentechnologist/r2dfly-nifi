@@ -5,7 +5,8 @@ library. Each fact on this page was tested rather than assumed, in October 2026.
 what was tested, on which versions, what happened, and which test keeps checking it. Where a
 fact is checked by the code at run time rather than by a test, the entry says so.
 
-The target is Dragonfly v2.0.2 throughout. "Typed path" means r2dfly reads a key's value with
+The target is Dragonfly v2.0.2 unless an entry names another; two entries use Dragonfly Cloud
+`df-i1.40.8`. "Typed path" means r2dfly reads a key's value with
 type-specific commands and writes it back the same way. "RESTORE path" means it copies the key's
 `DUMP` payload.
 
@@ -53,9 +54,10 @@ Guarded by `StreamHashFidelityIT`, which compares `XINFO STREAM`, `XINFO GROUPS`
 A stream read while the source keeps adding entries can return entries newer than the
 `last-generated-id` that `XINFO STREAM` reported a moment earlier. Dragonfly then refuses the
 record's `XSETID` ("The ID specified in XSETID is equal or smaller than the target stream top
-item") on every attempt, so the key used to end in the dead-letter directory. r2dfly now raises the
+item") on every attempt, and the key ends in the dead-letter directory. So r2dfly raises the
 last id to the newest entry it read. Guarded by `ReplicationReaderIT`, whose test pipeline loops
-writer retries back the way the flow does instead of dropping them, which had hidden this.
+writer retries back the way the flow does. An earlier version of the pipeline dropped them, which
+hid this.
 
 ## Module types on Dragonfly
 
@@ -178,7 +180,6 @@ Tested end to end on scratch containers, a Redis Stack 7.4 source and a Dragonfl
   The older `groovyx-script-file` names are taken as dynamic properties without an error, which
   leaves the processor invalid with "At least one parameter required". `run-r2dfly.sh` therefore
   checks that the hook is valid before starting the flow.
-
 - The example hook in the quickstart, run by `continuous-migration.sh --transform-script`,
   upper-cased the `order:` strings and dropped the `tmp:` keys in the copy and in the keyspace
   live phase. A record whose script threw was dead-lettered with the script's reason, and the
@@ -208,14 +209,13 @@ argument.
   source (Redis 7.4) and the replication live source (Redis 8.10), live writes included. Before
   base64, the typed path wrote U+FFFD in place of the invalid bytes and could not find keys whose
   names were not text.
-
-- Stream consumer group and consumer names are byte strings too. The typed path used to read them
-  as text: a group name that was not UTF-8 failed the read, and a consumer name lost its bytes.
-  r2dfly now reads them raw (`XPENDING` dispatched without Lettuce's text model) and stores them
-  like every other byte string in the record. Dragonfly keeps a group name exactly, zero bytes
-  included, but cuts a consumer name at its first zero byte, through `XGROUP CREATECONSUMER` and
-  `XREADGROUP` alike (Redis 7.4 keeps it), so two consumers whose names differ only after a zero
-  byte become one on Dragonfly.
+- Stream consumer group and consumer names are byte strings too. r2dfly reads them raw
+  (`XPENDING` dispatched without Lettuce's text model) and stores them like every other byte
+  string in the record. Before that, a group name that was not UTF-8 failed the read, and a
+  consumer name lost its bytes.
+- Dragonfly keeps a group name exactly, zero bytes included, but cuts a consumer name at its first
+  zero byte, through `XGROUP CREATECONSUMER` and `XREADGROUP` alike. Redis 7.4 keeps it. So two
+  consumers whose names differ only after a zero byte become one on Dragonfly.
 
 Guarded by `BinaryDataIT`: the typed copy, the RESTORE path, a JSON-lines file, the replication
 live phase, the reconciler, a prefix rename, and stream group and consumer names.
@@ -227,11 +227,13 @@ with no SELECT before them, including to a new replica after its full resync: a 
 `master_repl_offset` by the 32 bytes of the `SET` alone. A real replica's connection to its master
 starts in database 0. The replication reader used to treat the database as unknown until the
 first SELECT, so it skipped every write in that state: in one run, the first `DEL` after startup
-never reached the target. It now starts a full-resync stream in database 0. Seen on scratch
-containers; an integration test with a fresh master did not reproduce it, since that master sent
-the SELECT. Redis 8.10.3 also sent `SELECT 0` to a second replica's full resync after a first
-replica had seen `SELECT 0`, both with the first replica disconnected and with it still connected,
-so the trigger on the scratch containers is still unknown and nothing guards the fix.
+never reached the target. It now starts a full-resync stream in database 0.
+
+This was seen only on scratch containers. Three setups did not reproduce it, because the master
+sent the SELECT each time: an integration test with a fresh master, and Redis 8.10.3 with a second
+replica's full resync after a first replica had seen `SELECT 0`, once with the first replica
+disconnected and once with it still connected. The trigger is unknown, and no test guards the
+fix.
 
 ## NiFi's Stateless engine
 
@@ -284,9 +286,12 @@ type, value and TTL.
   Bad data format" and `BF.LOADCHUNK` of `BF.SCANDUMP` chunks gives "ERR INVALIDOBJ invalid bloom
   dump payload". A Bloom filter does not keep its items, so no tool can rebuild one. r2dfly
   copied the other 12,000 keys. Its default key types then left Bloom out, so the Bloom keys were
-  skipped with only a NiFi counter to show it; they now include every module type, so each Bloom
-  key is dead-lettered with "no lossless copy path for MBbloom-- on this Dragonfly version; RESTORE
-  was rejected: ERR Bad data format", and the summary reports keys a user's type filter leaves out.
+  skipped with only a NiFi counter to show it.
+- Since b8a8f75 the default key types include every module type. On the AWS VM into Dragonfly
+  Cloud with 13,500 keys of nine types, the headless and NiFi runs copied 12,000 keys and dead-lettered
+  each of the 1,500 Bloom keys with "no lossless copy path for MBbloom-- on this Dragonfly version;
+  RESTORE was rejected: ERR Bad data format". With Bloom excluded by the user's type filter, the
+  summary reported "keys left out by the key-type filter: 1500 (MBbloom-- 1500)".
 
 ## NiFi 2.11
 
