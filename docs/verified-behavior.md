@@ -209,8 +209,16 @@ argument.
   base64, the typed path wrote U+FFFD in place of the invalid bytes and could not find keys whose
   names were not text.
 
+- Stream consumer group and consumer names are byte strings too. The typed path used to read them
+  as text: a group name that was not UTF-8 failed the read, and a consumer name lost its bytes.
+  r2dfly now reads them raw (`XPENDING` dispatched without Lettuce's text model) and stores them
+  like every other byte string in the record. Dragonfly keeps a group name exactly, zero bytes
+  included, but cuts a consumer name at its first zero byte, through `XGROUP CREATECONSUMER` and
+  `XREADGROUP` alike (Redis 7.4 keeps it), so two consumers whose names differ only after a zero
+  byte become one on Dragonfly.
+
 Guarded by `BinaryDataIT`: the typed copy, the RESTORE path, a JSON-lines file, the replication
-live phase, the reconciler and a prefix rename.
+live phase, the reconciler, a prefix rename, and stream group and consumer names.
 
 ## Writes with no SELECT after a full resync
 

@@ -175,6 +175,64 @@ class BinaryDataIT {
         pipeline.reader.run(1, true, false);
     }
 
+    @Test
+    void streamGroupAndConsumerNamesKeepEveryByte() throws Exception {
+        RedisCommands<byte[], byte[]> s = sourceConnection.sync();
+        // No zero byte in the consumer name: Dragonfly cuts a consumer name at the first one (verified behavior).
+        byte[] consumer = join(bytes("c-"), new byte[] {(byte) 0xff, (byte) 0xfe, (byte) 0x80, 'v'});
+        s.xadd(bytes("sg"), new XAddArgs().id("1-0"), Map.of(bytes("f"), bytes("v")));
+        s.xadd(bytes("sg"), new XAddArgs().id("2-0"), Map.of(bytes("f"), bytes("w")));
+        s.xgroupCreate(io.lettuce.core.XReadArgs.StreamOffset.from(bytes("sg"), "0"), BINARY);
+        s.xreadgroup(io.lettuce.core.Consumer.from(BINARY, consumer), io.lettuce.core.XReadArgs.Builder.count(1),
+                io.lettuce.core.XReadArgs.StreamOffset.lastConsumed(bytes("sg")));
+
+        write(read(List.of(streamFlowFile("sg")), d -> d.setProperty(RedisTypeDeserializer.INCLUDE_CONSUMER_GROUPS, "true")), w -> { });
+
+        RedisCommands<byte[], byte[]> t = targetConnection.sync();
+        assertEquals(groupNames(s, "sg"), groupNames(t, "sg"));
+        assertEquals(List.of(hex(BINARY)), groupNames(t, "sg"));
+        assertEquals(List.of(hex(consumer)), t.xinfoConsumers(bytes("sg"), BINARY).stream().map(c -> hex(field(c, "name"))).toList());
+        assertEquals(List.of("1-0 " + hex(consumer)), pendingConsumers(s, "sg", BINARY), "the source's pending entry, read raw");
+        assertEquals(pendingConsumers(s, "sg", BINARY), pendingConsumers(t, "sg", BINARY));
+    }
+
+    private static MockFlowFile streamFlowFile(String key) {
+        MockFlowFile flowFile = new MockFlowFile(1);
+        flowFile.putAttributes(Map.of("redis.key", key, "redis.type", "stream"));
+        return flowFile;
+    }
+
+    private static List<String> groupNames(RedisCommands<byte[], byte[]> c, String key) {
+        return c.xinfoGroups(bytes(key)).stream().map(g -> hex(field(g, "name"))).toList();
+    }
+
+    /** "id consumer-hex" for each pending entry, read with the raw XPENDING reply so the consumer keeps its bytes. */
+    private static List<String> pendingConsumers(RedisCommands<byte[], byte[]> c, String key, byte[] group) {
+        List<Object> reply = c.dispatch(io.lettuce.core.protocol.CommandType.XPENDING,
+                new io.lettuce.core.output.ArrayOutput<>(io.lettuce.core.codec.ByteArrayCodec.INSTANCE),
+                new io.lettuce.core.protocol.CommandArgs<>(io.lettuce.core.codec.ByteArrayCodec.INSTANCE)
+                        .addKey(bytes(key)).addValue(group).add("-").add("+").add(10));
+        return reply.stream().map(e -> (List<?>) e).map(e -> new String((byte[]) e.get(0), java.nio.charset.StandardCharsets.US_ASCII) + " " + hex((byte[]) e.get(1))).toList();
+    }
+
+    /** A field of an XINFO reply entry, which Lettuce gives as a flat list or a map depending on the protocol. */
+    private static byte[] field(Object entry, String name) {
+        if (entry instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> e : map.entrySet()) {
+                if (name.equals(new String((byte[]) e.getKey(), java.nio.charset.StandardCharsets.US_ASCII))) {
+                    return (byte[]) e.getValue();
+                }
+            }
+        }
+        List<?> flat = (List<?>) entry;
+        for (int i = 0; i + 1 < flat.size(); i += 2) {
+            if (name.equals(new String((byte[]) flat.get(i), java.nio.charset.StandardCharsets.US_ASCII))) {
+                return (byte[]) flat.get(i + 1);
+            }
+        }
+        throw new AssertionError("no " + name + " in " + entry);
+    }
+
     private static List<MockFlowFile> scanAndRead(Consumer<TestRunner> deserializerSetup) throws Exception {
         TestRunner scan = TestRunners.newTestRunner(RedisScanReader.class);
         scan.setAllowSynchronousSessionCommits(true);

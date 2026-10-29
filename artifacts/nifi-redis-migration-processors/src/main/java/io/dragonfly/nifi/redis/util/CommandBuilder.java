@@ -358,11 +358,11 @@ public final class CommandBuilder {
         for (Map<String, Object> group : groups) {
             String lastDeliveredId = String.valueOf(group.getOrDefault("last-delivered-id", "0"));
             XReadArgs.StreamOffset<byte[]> offset = XReadArgs.StreamOffset.from(key, lastDeliveredId);
-            futures.add(toCf(target.xgroupCreate(offset, utf8(group.get("name")), new XGroupCreateArgs().mkstream(true))));
+            futures.add(toCf(target.xgroupCreate(offset, record.bytes(group.get("name")), new XGroupCreateArgs().mkstream(true))));
             // Through SETID rather than CREATE's own ENTRIESREAD, which Dragonfly 2.0.2 accepts and ignores.
             if (group.get("entries-read") instanceof Number entriesRead) {
                 futures.add(toCf(target.dispatch(RawCommand.XGROUP, new StatusOutput<>(ByteArrayCodec.INSTANCE),
-                        new CommandArgs<>(ByteArrayCodec.INSTANCE).add("SETID").addKey(key).add(utf8(group.get("name")))
+                        new CommandArgs<>(ByteArrayCodec.INSTANCE).add("SETID").addKey(key).add(record.bytes(group.get("name")))
                                 .add(lastDeliveredId).add("ENTRIESREAD").add(entriesRead.longValue()))));
             }
         }
@@ -374,11 +374,11 @@ public final class CommandBuilder {
         }
         boolean anyPending = false;
         for (Map<String, Object> group : groups) {
-            byte[] groupName = utf8(group.get("name"));
+            byte[] groupName = record.bytes(group.get("name"));
             if (group.get("consumers") instanceof List<?> consumers) {
                 for (Object c : consumers) {
                     if (c instanceof Map<?, ?> consumer && consumer.get("name") != null) {
-                        futures.add(toCf(target.xgroupCreateconsumer(key, io.lettuce.core.Consumer.from(groupName, utf8(consumer.get("name"))))));
+                        futures.add(toCf(target.xgroupCreateconsumer(key, io.lettuce.core.Consumer.from(groupName, record.bytes(consumer.get("name"))))));
                     }
                 }
             }
@@ -389,7 +389,7 @@ public final class CommandBuilder {
             // Raw, because Dragonfly answers TIME with integers where Redis sends bulk strings, which
             // Lettuce's typed time() cannot parse.
             written = written.thenCompose(v -> toCf(target.dispatch(RawCommand.TIME, new ArrayOutput<>(ByteArrayCodec.INSTANCE), new CommandArgs<>(ByteArrayCodec.INSTANCE))))
-                    .thenCompose(time -> claimPending(target, key, groups, targetClockOffsetMs(time)));
+                    .thenCompose(time -> claimPending(target, key, record, groups, targetClockOffsetMs(time)));
         }
         return written.thenCompose(v -> applyTtl(target, key, ttlMs));
     }
@@ -406,13 +406,13 @@ public final class CommandBuilder {
 
     @SuppressWarnings("unchecked")
     private static CompletableFuture<Void> claimPending(
-            RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, List<Map<String, Object>> groups, long clockOffsetMs) {
+            RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, KeyRecord record, List<Map<String, Object>> groups, long clockOffsetMs) {
         List<CompletableFuture<?>> claims = new ArrayList<>();
         for (Map<String, Object> group : groups) {
             if (group.get("pending") instanceof List<?> pending) {
                 for (Object p : pending) {
                     if (p instanceof Map<?, ?> entry) {
-                        claims.add(toCf(target.xclaim(key, io.lettuce.core.Consumer.from(utf8(group.get("name")), utf8(entry.get("consumer"))),
+                        claims.add(toCf(target.xclaim(key, io.lettuce.core.Consumer.from(record.bytes(group.get("name")), record.bytes(entry.get("consumer"))),
                                 claimArgs((Map<String, Object>) entry, clockOffsetMs), String.valueOf(entry.get("id")))));
                     }
                 }
@@ -430,10 +430,6 @@ public final class CommandBuilder {
     }
 
     /** Group and consumer names, which are carried as UTF-8 text. */
-    private static byte[] utf8(Object value) {
-        return String.valueOf(value).getBytes(StandardCharsets.UTF_8);
-    }
-
     private static CompletableFuture<Void> applyTtl(
             RedisClusterAsyncCommands<byte[], byte[]> target, byte[] key, Long ttlMs) {
         if (ttlMs == null) {

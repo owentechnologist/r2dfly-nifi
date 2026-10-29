@@ -8,8 +8,10 @@ import io.lettuce.core.ScoredValue;
 import io.lettuce.core.StreamMessage;
 import io.lettuce.core.cluster.api.async.RedisClusterAsyncCommands;
 import io.lettuce.core.codec.ByteArrayCodec;
+import io.lettuce.core.output.ArrayOutput;
 import io.lettuce.core.output.IntegerListOutput;
 import io.lettuce.core.protocol.CommandArgs;
+import io.lettuce.core.protocol.CommandType;
 import io.lettuce.core.protocol.ProtocolKeyword;
 
 import java.nio.charset.StandardCharsets;
@@ -282,6 +284,11 @@ public final class RedisValueFetcher {
             all.add(k);
             all.add(v);
         }));
+        // Group and consumer names are bytes too: read first, so a name that is not text sets base64 as well.
+        List<Object> groups = includeConsumerGroups ? fetchConsumerGroups(cmds, key) : null;
+        if (groups != null) {
+            all.addAll(groupNames(groups));
+        }
         boolean base64 = KeyRecord.needsBase64(all);
         List<Object> entries = new ArrayList<>();
         for (StreamMessage<byte[], byte[]> message : messages) {
@@ -297,8 +304,9 @@ public final class RedisValueFetcher {
         // refuses an XSETID below its top entry; the stream's last id was at least that entry's.
         record.lastGeneratedId = lastId != null && (lastGeneratedId == null || compareStreamIds(lastId, lastGeneratedId) > 0)
                 ? lastId : lastGeneratedId;
-        if (includeConsumerGroups) {
-            record.consumerGroups = fetchConsumerGroups(cmds, key);
+        if (groups != null) {
+            textifyGroupNames(groups, base64);
+            record.consumerGroups = groups;
         }
         return Optional.of(List.of(record));
     }
@@ -313,27 +321,32 @@ public final class RedisValueFetcher {
             if (nameObj == null) {
                 continue;
             }
-            byte[] groupName = String.valueOf(nameObj).getBytes(StandardCharsets.UTF_8);
+            byte[] groupName = (byte[]) nameObj;
             group.put("consumers", normalizeInfoReply(cmds.xinfoConsumers(key, groupName).get()));
             List<Object> pendingList = new ArrayList<>();
             String afterId = null;
             while (true) {
                 Range<String> pageRange = afterId == null ? Range.unbounded()
                         : Range.from(Range.Boundary.excluding(afterId), Range.Boundary.unbounded());
-                List<io.lettuce.core.models.stream.PendingMessage> page =
-                        cmds.xpending(key, groupName, pageRange, Limit.from(PENDING_PAGE)).get();
+                // Dispatched raw: Lettuce's PendingMessage gives the consumer as text, losing bytes that are not.
+                List<Object> page = cmds.dispatch(CommandType.XPENDING, new ArrayOutput<>(ByteArrayCodec.INSTANCE),
+                        new CommandArgs<>(ByteArrayCodec.INSTANCE).addKey(key).addValue(groupName)
+                                .add(afterId == null ? "-" : "(" + afterId).add("+").add(PENDING_PAGE)).get();
                 // The idle time is relative to now; an absolute time stays right however long the
                 // record waits before it is written.
                 long readAtMs = System.currentTimeMillis();
-                for (io.lettuce.core.models.stream.PendingMessage pm : page) {
+                for (Object item : page) {
+                    List<?> pm = (List<?>) item;
+                    String id = new String((byte[]) pm.get(0), StandardCharsets.US_ASCII);
+                    long idleMs = (Long) pm.get(2);
                     Map<String, Object> pendingEntry = new LinkedHashMap<>();
-                    pendingEntry.put("id", pm.getId());
-                    pendingEntry.put("consumer", pm.getConsumer());
-                    pendingEntry.put("ms_since_last_delivery", pm.getMsSinceLastDelivery());
-                    pendingEntry.put("delivered_at_ms", readAtMs - pm.getMsSinceLastDelivery());
-                    pendingEntry.put("redelivery_count", pm.getRedeliveryCount());
+                    pendingEntry.put("id", id);
+                    pendingEntry.put("consumer", pm.get(1));
+                    pendingEntry.put("ms_since_last_delivery", idleMs);
+                    pendingEntry.put("delivered_at_ms", readAtMs - idleMs);
+                    pendingEntry.put("redelivery_count", pm.get(3));
                     pendingList.add(pendingEntry);
-                    afterId = pm.getId();
+                    afterId = id;
                 }
                 if (page.size() < PENDING_PAGE) {
                     break;
@@ -365,18 +378,47 @@ public final class RedisValueFetcher {
         return result;
     }
 
+    /** A group's or consumer's "name" stays bytes; textifyGroupNames encodes it once the record's base64 is known. */
     private static Map<String, Object> flattenToMap(List<Object> flat) {
         Map<String, Object> map = new LinkedHashMap<>();
         for (int i = 0; i + 1 < flat.size(); i += 2) {
-            map.put(plain(flat.get(i)).toString(), plain(flat.get(i + 1)));
+            String field = plain(flat.get(i)).toString();
+            map.put(field, field.equals("name") ? flat.get(i + 1) : plain(flat.get(i + 1)));
         }
         return map;
     }
 
     private static Map<String, Object> normalizeMap(Map<Object, Object> raw) {
         Map<String, Object> map = new LinkedHashMap<>();
-        raw.forEach((k, v) -> map.put(plain(k).toString(), plain(v)));
+        raw.forEach((k, v) -> {
+            String field = plain(k).toString();
+            map.put(field, field.equals("name") ? v : plain(v));
+        });
         return map;
+    }
+
+    /** Every group, consumer and pending-entry consumer name, as fetchConsumerGroups read them. */
+    @SuppressWarnings("unchecked")
+    private static List<byte[]> groupNames(List<Object> groups) {
+        List<byte[]> names = new ArrayList<>();
+        for (Object g : groups) {
+            Map<String, Object> group = (Map<String, Object>) g;
+            names.add((byte[]) group.get("name"));
+            ((List<Object>) group.get("consumers")).forEach(c -> names.add((byte[]) ((Map<String, Object>) c).get("name")));
+            ((List<Object>) group.get("pending")).forEach(p -> names.add((byte[]) ((Map<String, Object>) p).get("consumer")));
+        }
+        return names;
+    }
+
+    /** The names as the record stores every other byte string: UTF-8 text, or base64 when the record is. */
+    @SuppressWarnings("unchecked")
+    private static void textifyGroupNames(List<Object> groups, boolean base64) {
+        for (Object g : groups) {
+            Map<String, Object> group = (Map<String, Object>) g;
+            group.put("name", KeyRecord.text((byte[]) group.get("name"), base64));
+            ((List<Object>) group.get("consumers")).forEach(c -> ((Map<String, Object>) c).computeIfPresent("name", (k, v) -> KeyRecord.text((byte[]) v, base64)));
+            ((List<Object>) group.get("pending")).forEach(p -> ((Map<String, Object>) p).computeIfPresent("consumer", (k, v) -> KeyRecord.text((byte[]) v, base64)));
+        }
     }
 
     private static Object plain(Object o) {
