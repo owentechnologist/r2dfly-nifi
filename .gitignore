@@ -28,3 +28,6 @@ replay_pid*
 
 # Maven build output
 target/
+
+# Release zips (build-release.sh)
+dist/

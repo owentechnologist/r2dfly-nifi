@@ -4,12 +4,17 @@
 
 - A recent Linux distro (RHEL/Fedora, Debian/Ubuntu, etc.) or macOS
 - Docker or Podman
-- 16GB RAM and 8 CPU cores free for the containers this spins up (NiFi, the Maven build, and
-  a small helper "toolbox" image)
+- 16GB RAM and 8 CPU cores free for the containers this spins up (NiFi and a small helper
+  "toolbox" image)
+- Internet access, to pull the container images
 
-You do not need Maven, Java, `redis-cli` or `python3` on the host. `deploy-to-nifi.sh` builds
-the NAR in a Maven + JDK 21 container, and `redis-cli`, `python3` and `curl` run from a small
-toolbox image (`artifacts/toolbox/Dockerfile`), built on first use. `headless-migration.sh` is
+Get r2dfly from the [Releases page](https://github.com/owentechnologist/r2dfly-nifi/releases)
+(see [Get it](../README.md#get-it)). A release includes the built processor NAR. A clone of the
+repository does not: its first run builds the NAR in a Maven + JDK 21 container, so you do not
+need Maven or Java on the host either way.
+
+You do not need `redis-cli` or `python3` on the host. `redis-cli`, `python3` and `curl` run from
+a small toolbox image (`artifacts/toolbox/Dockerfile`), built on first use. `headless-migration.sh` is
 the exception: on its first run it downloads NiFi's Stateless engine with the host's `curl`,
 `unzip` and `shasum` (or `sha256sum`). The scripts are plain bash and run unmodified on
 RHEL/Fedora, Debian/Ubuntu and macOS.

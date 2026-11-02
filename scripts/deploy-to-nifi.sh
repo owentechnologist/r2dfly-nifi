@@ -89,12 +89,14 @@ sha256_stdin() {
 # everything that actually affects the built NAR: the reactor root pom (nifi.version etc.),
 # the processors module (real Java source) and its pom, and the NAR module's own pom
 # (packaging descriptor - it has no src/ of its own). target/ is deliberately excluded, it's
-# build OUTPUT, not input - including it would make this hash never match twice.
+# build OUTPUT, not input - including it would make this hash never match twice. LC_ALL=C: a
+# release zip ships a NAR built on one host with this hash, and it must match on a host whose
+# locale sorts file names differently, or the user pays for a Maven build they don't need.
 compute_source_hash() {
   {
     cat "$ARTIFACTS_DIR/pom.xml"
     cat "$ARTIFACTS_DIR/$PROCESSORS_MODULE/pom.xml"
-    find "$ARTIFACTS_DIR/$PROCESSORS_MODULE/src" -type f | sort | xargs cat
+    find "$ARTIFACTS_DIR/$PROCESSORS_MODULE/src" -type f | LC_ALL=C sort | xargs cat
     cat "$ARTIFACTS_DIR/$NAR_MODULE/pom.xml"
   } | sha256_stdin
 }

@@ -14,6 +14,28 @@ Migrates data from Redis or Valkey to Dragonfly. It runs on Apache NiFi, driven 
 * Reads RDB and AOF files, and writes backups as JSON-lines or RESP files
 * Needs only normal client read and write access to source and target. The default live source also needs keyspace notifications enabled on the source; the opt-in replication live source needs `PSYNC`
 
+## Get it
+Docker or Podman is the only thing the host needs. Download a release from the
+[Releases page](https://github.com/owentechnologist/r2dfly-nifi/releases), check it, and unzip it:
+
+```bash
+V=r2dfly-A-013   # the release you want
+curl -LO https://github.com/owentechnologist/r2dfly-nifi/releases/download/$V/$V.zip
+curl -LO https://github.com/owentechnologist/r2dfly-nifi/releases/download/$V/$V.zip.sha256
+shasum -a 256 -c $V.zip.sha256   # or: sha256sum -c $V.zip.sha256
+unzip $V.zip && cd $V/scripts
+./simple-migration.sh \
+  --source-connection-string redis://source-host:6379 \
+  --target-connection-string rediss://default:password@target-host:6385
+```
+
+A release includes the built processor NAR, so nothing is compiled on your host. A clone of
+this repository works too: its first run builds the NAR in a Maven container.
+
+Maintainers: bump `R2DFLY_VERSION` in `scripts/version.sh`, commit and push, then run
+`./build-release.sh --publish`.
+
+## Docs
 [Quickstart](./docs/quickstart.md)
 
 [Tutorial](./docs/TUTORIAL.md)

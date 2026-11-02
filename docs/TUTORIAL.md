@@ -89,8 +89,9 @@ definitions may differ.
 
 - A source Redis (or Valkey/Redis Stack) instance reachable from the NiFi container.
 - A target Dragonfly instance reachable from the NiFi container.
-- Docker or Podman — the only thing you need on the host. `deploy-to-nifi.sh` builds the NAR
-  with a containerized Maven+JDK21 and never needs those installed locally.
+- Docker or Podman — the only thing you need on the host. A release zip includes the built
+  NAR; from a clone of the repository, `deploy-to-nifi.sh` builds it with a containerized
+  Maven+JDK21 and never needs those installed locally.
 
 This project is laid out as `scripts/` (every `*.sh` file, including `deploy-to-nifi.sh`),
 `docs/` (this file), and `artifacts/` (the Maven project, `r2dfly.json`, and everything else
